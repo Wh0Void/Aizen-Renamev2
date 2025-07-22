@@ -13,7 +13,7 @@ from bot.database import (
 import requests
 
 # 🧠 CONSTANTS
-TOKEN_DURATION = timedelta(hours=Config.TOKEN_DURATION_HOURS)
+TOKEN_DURATION = timedelta(hours=Config.TOKEN_TIME)
 
 # ⚡ /gettoken command
 @Client.on_message(filters.command("gettoken") & filters.private)
