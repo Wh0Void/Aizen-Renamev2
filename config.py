@@ -28,7 +28,7 @@ class Config(object):
 
     # 🔐 TOKEN SYSTEM
     TOKEN_TIME = 12   # ⏰ 12 hours in seconds
-    SHORTLINK_API = os.getenv("SHORTLINK_API", "your_seturl_api_key_here")
+    SHORTLINK_API = os.getenv("SHORTLINK_API", "242fb1e2951cdf981a8725048e7abafa3cf868ae")
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
 
 
