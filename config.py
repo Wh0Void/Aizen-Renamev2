@@ -26,6 +26,12 @@ class Config(object):
     WEBHOOK = bool(os.environ.get("WEBHOOK", True))
 
 
+    # 🔐 TOKEN SYSTEM
+    TOKEN_TIME = 12 * 60 * 60   # ⏰ 12 hours in seconds
+    SHORTLINK_API = os.getenv("SHORTLINK_API", "your_seturl_api_key_here")
+    SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
+
+
 
 class Txt(object):
     # part of text configuration
