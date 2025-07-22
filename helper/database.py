@@ -9,7 +9,7 @@ class Database:
 
 
 # ⛓ Connect to MongoDB
-client = MongoClient(Config.MONGO_URL)
+client = MongoClient(Config.DB_URL)
 db = client["Rename"]  # Use your actual DB name
 token_col = db["token_access"]
 
