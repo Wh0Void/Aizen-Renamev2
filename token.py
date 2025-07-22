@@ -1,66 +1,78 @@
 # ⚙️ token.py – Handles token creation, shortlink, and verification
 
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime, timedelta
 from config import Config
-from bot.database import save_token, is_token_valid
+from bot.database import (
+    is_user_verified,
+    save_token,
+    is_token_valid,
+    verify_user
+)
 import requests
-import time
 
+# 🧠 CONSTANTS
+TOKEN_DURATION = timedelta(hours=Config.TOKEN_DURATION_HOURS)
 
-# 🧠 Command: /gettoken → generate shortlink
+# ⚡ /gettoken command
 @Client.on_message(filters.command("gettoken") & filters.private)
-async def get_token(client, message: Message):
+async def get_token_handler(client, message: Message):
     user_id = message.from_user.id
-    verify_link = f"https://t.me/{client.me.username}?start=verify_{user_id}"
 
+    # Make shortlink
     try:
-        short_url = create_shortlink(verify_link)
+        link = f"https://t.me/{client.me.username}?start=verify_{user_id}"
+        api_key = Config.SHORTLINK_API
+        api_url = Config.SHORTLINK_DOMAIN
+
+        res = requests.get(f"{api_url}?api={api_key}&url={link}")
+        data = res.json()
+
+        if data.get("status") == "success":
+            short_url = data["shortenedUrl"]
+        else:
+            short_url = link  # fallback
+
     except Exception as e:
-        return await message.reply(f"❌ Error generating shortlink:\n`{e}`")
+        short_url = link  # fallback on failure
 
-    # 📩 Send shortlink button
+    # Save token timestamp
+    await save_token(user_id)
+
     await message.reply(
-        text="🔐 **To get access for 12 hours, click below and complete the shortlink**:",
+        text="🔐 **Token Generated!**\n\nPlease click the button below and complete the verification to unlock 12 hours of unlimited access!",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔗 Get 12H Access", url=short_url)]]
+            [[InlineKeyboardButton("✅ Verify Now", url=short_url)]]
         )
     )
 
+# 🧠 /verify command (manually or via redirect)
+@Client.on_message(filters.command("verify") & filters.private)
+async def verify_command(client, message: Message):
+    user_id = message.from_user.id
 
-# 🧠 Start command handler for verifying token
-@Client.on_message(filters.command("start") & filters.private)
-async def start_verify(client, message: Message):
-    args = message.text.split(" ", 1)
-    if len(args) == 2 and args[1].startswith("verify_"):
-        user_id_str = args[1].split("_")[1]
+    if await is_user_verified(user_id):
+        await message.reply("✅ You are already verified! You have access for 12 hours.")
+        return
 
-        if str(message.from_user.id) != user_id_str:
-            return await message.reply("🚫 Invalid verification link. Please request a new token.")
+    if await is_token_valid(user_id):
+        await verify_user(user_id)
+        await message.reply("🎉 **Verification Successful!**\n\nYou now have 12-hour premium access.")
+    else:
+        await message.reply("❌ Your token is invalid or expired.\nUse /gettoken to generate a new one.")
 
-        # ✅ Store token timestamp
-        await save_token(message.from_user.id)
-        await message.reply(
-            "✅ **Token Verified!**\nYou now have 12-hour access to use the bot.",
+# ⚠️ Auto file-block: Intercept incoming files
+@Client.on_message(filters.document | filters.video | filters.audio)
+async def block_if_unverified(client, message: Message):
+    user_id = message.from_user.id
+
+    if not await is_user_verified(user_id):
+        await message.reply_text(
+            "**🔒 Access Denied!**\nYou must verify using /gettoken before using the bot.",
+            quote=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Verify Access", callback_data="token_verify_help")]
+            ])
         )
-    elif message.text == "/start":
-        await message.reply("👋 Welcome! Use /gettoken to access bot features.")
-
-
-# 🛠️ Create shortlink via SetURL.in API
-def create_shortlink(destination_url: str) -> str:
-    api_key = Config.SHORTLINK_API
-    domain = Config.SHORTLINK_DOMAIN
-
-    response = requests.get(
-        f"{domain}/api",
-        params={
-            "api": api_key,
-            "url": destination_url
-        }
-    )
-    result = response.json()
-    if result["status"] != "success":
-        raise Exception(result.get("message", "Unknown error"))
-
-    return result["shortenedUrl"]
+        return
