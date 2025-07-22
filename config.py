@@ -29,27 +29,32 @@ class Config(object):
 
 class Txt(object):
     # part of text configuration
-    START_TXT = """<b>👋 Hello {},</b>
+    START_TXT = """<b>👋 Hello ➤ {},</b>
 
+<blockquote>
 <b>❝ Rename, Customize & Share — All in One Place ❞</b>
+</blockquote>
 
-Using this bot, you can:
+✨ With this bot, you can:
 ➤ <b>Rename</b> files with a custom name  
-➤ <b>Set or change thumbnails</b> for videos  
-➤ <b>Convert</b> video to file & file to video  
-➤ Apply <b>custom captions</b>, <b>prefix</b>, and <b>suffix</b>
+➤ <b>Set or change thumbnails</b> for your media  
+➤ <b>Convert</b> file ↔️ video (and vice versa)  
+➤ Add <b>custom captions</b>, <b>prefix</b>, and <b>suffix</b>
 
-<b>⚙️ Features You’ll Love:</b>  
-📌 Auto Thumbnail Generator  
-✏️ Caption Editor  
-🔗 Filename Formatter  
+<b>⚙️ Features You’ll Love:</b>
+🔧 Auto Thumbnail Generator  
+📝 Caption Editor  
+📁 Filename Formatter  
 📤 Inline Upload Options
 
 <b>🚫 Note:</b>  
 Renaming or sharing <u>adult content</u> is <b>strictly prohibited</b>.  
-Doing so will result in an <b>immediate and permanent ban</b>.
+Violation will lead to an <b>immediate and permanent ban</b>.
 
-<b>✨ Stay safe, stay creative, and enjoy the bot!</b>"""
+<blockquote>
+<b>✨ Stay safe, stay creative, and enjoy the bot!</b>
+</blockquote>
+"""
 
     ABOUT_TXT = """
 <b>❍ ᴍʏ ɴᴀᴍᴇ : <a href='https://telegram.me/TechifyBots'>ʀᴇɴᴀᴍᴇ ɢᴇɴɪᴇ ʙᴏᴛ</a>
