@@ -144,6 +144,15 @@ class Database:
             print(f"Failed to unban: {e}")
             return f"Error: {e}"
 
+# ✅ Set Premium True/False
+    async def set_premium(self, user_id: int, value: bool = True):
+        await self.col.update_one({'_id': int(user_id)}, {'$set': {'is_premium': value}})
+
+# ✅ Check if user is Premium
+    async def is_premium(self, user_id: int) -> bool:
+        user = await self.col.find_one({'_id': int(user_id)})
+        return user.get("is_premium", False) if user else False
+
 
 # Create instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
