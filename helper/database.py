@@ -1,8 +1,41 @@
 import motor.motor_asyncio
 from config import Config
 from .utils import send_log
+from pymongo import MongoClient
+from datetime import datetime, timedelta
 
 class Database:
+
+
+
+# ⛓ Connect to MongoDB
+client = MongoClient(Config.MONGO_URL)
+db = client["Rename"]  # Use your actual DB name
+token_col = db["token_access"]
+
+# ✅ Save token with expiry (12 hours)
+async def save_token(user_id: int):
+    expiry_time = datetime.utcnow() + timedelta(hours=12)
+    token_data = {
+        "user_id": user_id,
+        "expires_at": expiry_time
+    }
+    await token_col.update_one(
+        {"user_id": user_id},
+        {"$set": token_data},
+        upsert=True
+    )
+
+# ✅ Check if token is valid
+async def is_token_valid(user_id: int) -> bool:
+    user_token = await token_col.find_one({"user_id": user_id})
+    if not user_token:
+        return False
+    return user_token["expires_at"] > datetime.utcnow()
+
+# ✅ (Optional) Cleanup expired tokens
+async def remove_expired_tokens():
+    await token_col.delete_many({"expires_at": {"$lt": datetime.utcnow()}})
 
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
