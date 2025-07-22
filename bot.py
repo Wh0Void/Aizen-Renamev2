@@ -8,6 +8,7 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
+from bot import token_handler  # 👈 Ensures /gettoken & /verify are registered
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
