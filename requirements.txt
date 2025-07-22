@@ -1,5 +1,4 @@
-pyromod
-pyrofork 
+pyromod 
 TgCrypto
 motor
 dnspython
@@ -10,4 +9,4 @@ pytz
 Flask
 gunicorn
 aiohttp
-
+pyrogram
