@@ -26,7 +26,7 @@ async def rename_start(client, message):
     # 🪙 Token limit check (if not premium)
     is_premium = await jishubotz.is_premium(user_id)
     if not is_premium:
-        tokens = await jishubotz.get_token(user_id)
+        tokens = await get_token(user_id)
         if tokens <= 0:
             return await message.reply(
                 "🚫 **Token Limit Reached!**\nYou have no tokens left.\n\n💎 Upgrade to Premium or refer friends to earn tokens.",
