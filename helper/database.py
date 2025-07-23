@@ -1,48 +1,44 @@
 import motor.motor_asyncio
 from config import Config
-from .utils import send_log
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 
-# ⛓ Sync client for separate token DB
+# 🔗 Synchronous client for shortlink tokens (optional if using separately)
 client = MongoClient(Config.DB_URL)
 db = client["Rename"]
 token_col = db["token_access"]
 
+# ========================= TOKEN UTILITIES ========================= #
 
-# ======================= TOKEN ACCESS METHODS ======================= #
-# ✅ Save 12 hour token
-async def save_token(user_id: int):
-    expiry_time = datetime.utcnow() + timedelta(hours=12)
-    token_data = {
-        "user_id": user_id,
-        "expires_at": expiry_time
-    }
+# ✅ Add tokens manually (e.g., after shortlink verification)
+async def add_token(user_id: int, amount: int = 1):
     await token_col.update_one(
         {"user_id": user_id},
-        {"$set": token_data},
+        {"$inc": {"tokens": amount}},
         upsert=True
     )
 
-# ✅ Check if token is valid (not expired)
-async def is_token_valid(user_id: int) -> bool:
-    user_token = await token_col.find_one({"user_id": user_id})
-    if not user_token:
-        return False
-    return user_token["expires_at"] > datetime.utcnow()
+# ✅ Reduce token after rename
+async def reduce_token(user_id: int) -> bool:
+    user = await token_col.find_one({"user_id": user_id})
+    if user and user.get("tokens", 0) > 0:
+        await token_col.update_one({"user_id": user_id}, {"$inc": {"tokens": -1}})
+        return True
+    return False
 
-# ✅ Clean expired tokens
-async def remove_expired_tokens():
-    await token_col.delete_many({"expires_at": {"$lt": datetime.utcnow()}})
+# ✅ Get token count
+async def get_token(user_id: int) -> int:
+    user = await token_col.find_one({"user_id": user_id})
+    return user.get("tokens", 0) if user else 0
 
+# ===================== USER DATABASE CLASS ===================== #
 
-# ======================= USER DATABASE CLASS ======================= #
 class Database:
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
-        self.jishubotz = self._client[database_name]
-        self.col = self.jishubotz.user
-        self.bannedList = self.jishubotz.bannedList
+        self.db = self._client[database_name]
+        self.col = self.db.user
+        self.banned = self.db.banned
 
     def new_user(self, id):
         return dict(
@@ -60,11 +56,9 @@ class Database:
         if not await self.is_user_exist(u.id):
             user = self.new_user(u.id)
             await self.col.insert_one(user)
-            await send_log(b, u)
 
     async def is_user_exist(self, id):
-        user = await self.col.find_one({'_id': int(id)})
-        return bool(user)
+        return bool(await self.col.find_one({"_id": int(id)}))
 
     async def total_users_count(self):
         return await self.col.count_documents({})
@@ -115,7 +109,6 @@ class Database:
         user = await self.col.find_one({'_id': int(id)})
         return user.get('metadata', None)
 
-    # ============= Metadata Code ============= #
     async def set_metadata_code(self, id, metadata_code):
         await self.col.update_one({'_id': int(id)}, {'$set': {'metadata_code': metadata_code}})
 
@@ -123,29 +116,7 @@ class Database:
         user = await self.col.find_one({'_id': int(id)})
         return user.get('metadata_code', None)
 
-    # ============= Ban Management ============= #
-    async def ban_user(self, user_id):
-        user = await self.bannedList.find_one({'banId': int(user_id)})
-        if user:
-            return False
-        await self.bannedList.insert_one({'banId': int(user_id)})
-        return True
-
-    async def is_banned(self, user_id):
-        user = await self.bannedList.find_one({'banId': int(user_id)})
-        return bool(user)
-
-    async def is_unbanned(self, user_id):
-        try:
-            if await self.bannedList.find_one({'banId': int(user_id)}):
-                await self.bannedList.delete_one({'banId': int(user_id)})
-                return True
-            return False
-        except Exception as e:
-            print(f"Failed to unban: {e}")
-            return f"Error: {e}"
-
-    # ============= Premium User ============= #
+    # ============= Premium ============= #
     async def set_premium(self, user_id: int, value: bool = True):
         await self.col.update_one({'_id': int(user_id)}, {'$set': {'is_premium': value}})
 
@@ -153,6 +124,26 @@ class Database:
         user = await self.col.find_one({'_id': int(user_id)})
         return user.get("is_premium", False) if user else False
 
+    # ============= Ban System ============= #
+    async def ban_user(self, user_id):
+        if await self.banned.find_one({'banId': int(user_id)}):
+            return False
+        await self.banned.insert_one({'banId': int(user_id)})
+        return True
 
-# ✅ Instance
+    async def is_banned(self, user_id):
+        return bool(await self.banned.find_one({'banId': int(user_id)}))
+
+    async def is_unbanned(self, user_id):
+        try:
+            if await self.banned.find_one({'banId': int(user_id)}):
+                await self.banned.delete_one({'banId': int(user_id)})
+                return True
+            return False
+        except Exception as e:
+            print(f"Failed to unban: {e}")
+            return f"Error: {e}"
+
+
+# ✅ Global Instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
