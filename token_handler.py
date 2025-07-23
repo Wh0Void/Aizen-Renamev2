@@ -4,7 +4,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta
 from config import Config
-from helper.database import jishubotz, save_token, is_token_valid, verify_user  # Updated imports
+from helper.database import jishubotz, add_token, reduce_token, get_token  # Updated imports
 import requests
 
 # 🧠 CONSTANTS
