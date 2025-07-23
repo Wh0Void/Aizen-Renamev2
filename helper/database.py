@@ -12,6 +12,27 @@ token_col = db["token_access"]
 
 # ========================= TOKEN UTILITIES ========================= #
 
+# ✅ Save token with expiry time
+async def save_token(user_id: int):
+    expiry = datetime.utcnow() + timedelta(hours=Config.TOKEN_TIME)
+    await token_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"expires_at": expiry}},
+        upsert=True
+    )
+
+# ✅ Check if token is valid
+async def is_token_valid(user_id: int) -> bool:
+    user_token = await token_col.find_one({"user_id": user_id})
+    if not user_token:
+        return False
+    return user_token["expires_at"] > datetime.utcnow()
+
+# ✅ Promote user to premium temporarily (after shortlink is verified)
+async def verify_user(user_id: int):
+    await jishubotz.set_premium(user_id, True)
+
+
 # ✅ Add tokens manually (after shortlink verification)
 async def add_token(user_id: int, amount: int = 1):
     await token_col.update_one(
