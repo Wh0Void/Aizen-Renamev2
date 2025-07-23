@@ -27,9 +27,9 @@ async def reduce_token(user_id: int) -> bool:
     return False
 
 # ✅ Get token count
-async def get_token(user_id: int) -> int:
-    user = await token_col.find_one({"user_id": user_id})
-    return user.get("tokens", 0) if user else 0
+#async def get_token(user_id: int) -> int:
+    #user = await token_col.find_one({"user_id": #user_id})
+    #return user.get("tokens", 0) if user else 0
 
 # ===================== USER DATABASE CLASS ===================== #
 
