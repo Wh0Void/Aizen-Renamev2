@@ -4,13 +4,14 @@ from .utils import send_log
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 
-# ⛓ Synchronous MongoClient for token DB
+# ⛓ Sync client for separate token DB
 client = MongoClient(Config.DB_URL)
 db = client["Rename"]
 token_col = db["token_access"]
 
 
-# ✅ Save token with expiry (12 hours)
+# ======================= TOKEN ACCESS METHODS ======================= #
+# ✅ Save 12 hour token
 async def save_token(user_id: int):
     expiry_time = datetime.utcnow() + timedelta(hours=12)
     token_data = {
@@ -23,14 +24,14 @@ async def save_token(user_id: int):
         upsert=True
     )
 
-# ✅ Check if token is valid
+# ✅ Check if token is valid (not expired)
 async def is_token_valid(user_id: int) -> bool:
     user_token = await token_col.find_one({"user_id": user_id})
     if not user_token:
         return False
     return user_token["expires_at"] > datetime.utcnow()
 
-# ✅ (Optional) Cleanup expired tokens
+# ✅ Clean expired tokens
 async def remove_expired_tokens():
     await token_col.delete_many({"expires_at": {"$lt": datetime.utcnow()}})
 
@@ -144,15 +145,14 @@ class Database:
             print(f"Failed to unban: {e}")
             return f"Error: {e}"
 
-# ✅ Set Premium True/False
+    # ============= Premium User ============= #
     async def set_premium(self, user_id: int, value: bool = True):
         await self.col.update_one({'_id': int(user_id)}, {'$set': {'is_premium': value}})
 
-# ✅ Check if user is Premium
     async def is_premium(self, user_id: int) -> bool:
         user = await self.col.find_one({'_id': int(user_id)})
         return user.get("is_premium", False) if user else False
 
 
-# Create instance
+# ✅ Instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
