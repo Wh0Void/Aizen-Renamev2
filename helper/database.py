@@ -1,16 +1,18 @@
-import motor.motor_asyncio
-from config import Config
-from pymongo import MongoClient
-from datetime import datetime, timedelta
+# helper/database.py
 
-# 🔗 Synchronous client for shortlink tokens (optional if using separately)
+from config import Config
+from datetime import datetime, timedelta
+import motor.motor_asyncio
+from pymongo import MongoClient
+
+# 🔗 Mongo sync client (used only for tokens)
 client = MongoClient(Config.DB_URL)
 db = client["Rename"]
 token_col = db["token_access"]
 
 # ========================= TOKEN UTILITIES ========================= #
 
-# ✅ Add tokens manually (e.g., after shortlink verification)
+# ✅ Add tokens manually (after shortlink verification)
 async def add_token(user_id: int, amount: int = 1):
     await token_col.update_one(
         {"user_id": user_id},
@@ -18,7 +20,7 @@ async def add_token(user_id: int, amount: int = 1):
         upsert=True
     )
 
-# ✅ Reduce token after rename
+# ✅ Reduce token by 1 (after rename)
 async def reduce_token(user_id: int) -> bool:
     user = await token_col.find_one({"user_id": user_id})
     if user and user.get("tokens", 0) > 0:
@@ -27,11 +29,11 @@ async def reduce_token(user_id: int) -> bool:
     return False
 
 # ✅ Get token count
-#async def get_token(user_id: int) -> int:
-    #user = await token_col.find_one({"user_id": #user_id})
-    #return user.get("tokens", 0) if user else 0
+async def get_token(user_id: int) -> int:
+    user_token = await token_col.find_one({"user_id": user_id})
+    return user_token.get("tokens", 0) if user_token else 0
 
-# ===================== USER DATABASE CLASS ===================== #
+# ========================= USER DATABASE CLASS ========================= #
 
 class Database:
     def __init__(self, uri, database_name):
@@ -124,16 +126,6 @@ class Database:
         user = await self.col.find_one({'_id': int(user_id)})
         return user.get("is_premium", False) if user else False
 
-# ✅ Get token validity (returns 1 if valid, else 0)
-async def get_token(user_id: int) -> int:
-    user_token = await token_col.find_one({"user_id": user_id})
-    if not user_token:
-        return 0
-    if user_token["expires_at"] > datetime.utcnow():
-        return 1  # Valid token
-    return 0
-
-
     # ============= Ban System ============= #
     async def ban_user(self, user_id):
         if await self.banned.find_one({'banId': int(user_id)}):
@@ -154,6 +146,5 @@ async def get_token(user_id: int) -> int:
             print(f"Failed to unban: {e}")
             return f"Error: {e}"
 
-
-# ✅ Global Instance
+# ✅ Global instance to access DB functions
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
