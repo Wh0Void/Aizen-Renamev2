@@ -14,6 +14,8 @@ from helper.database import (
     verify_user
 )  # Updated imports
 import requests
+from pyrogram.types import CallbackQuery
+
 
 # 🧠 CONSTANTS
 TOKEN_DURATION = timedelta(hours=Config.TOKEN_TIME)
@@ -79,3 +81,14 @@ async def block_if_unverified(client, message: Message):
             ])
         )
         return
+
+
+@Client.on_callback_query(filters.regex("token_verify_help"))
+async def token_help(client, query: CallbackQuery):
+    await query.answer()
+    await query.message.edit(
+        "**⚠️ To unlock access:**\n\n1. Use /gettoken\n2. Complete the shortlink\n3. Use /verify\n\nYou’ll get 12-hour premium access.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Get Token", callback_data="get_token_command")]
+        ])
+    )
