@@ -6,7 +6,7 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
 from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
-from helper.database import jishubotz
+from helper.database import jishubotz, get_token, reduce_token
 from asyncio import sleep
 from PIL import Image
 from config import Config
