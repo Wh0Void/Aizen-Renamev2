@@ -124,6 +124,16 @@ class Database:
         user = await self.col.find_one({'_id': int(user_id)})
         return user.get("is_premium", False) if user else False
 
+# ✅ Get token validity (returns 1 if valid, else 0)
+async def get_token(user_id: int) -> int:
+    user_token = await token_col.find_one({"user_id": user_id})
+    if not user_token:
+        return 0
+    if user_token["expires_at"] > datetime.utcnow():
+        return 1  # Valid token
+    return 0
+
+
     # ============= Ban System ============= #
     async def ban_user(self, user_id):
         if await self.banned.find_one({'banId': int(user_id)}):
