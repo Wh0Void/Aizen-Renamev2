@@ -4,23 +4,18 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta
 from config import Config
-from bot.database import (
-    is_user_verified,
-    save_token,
-    is_token_valid,
-    verify_user
-)
+from helper.database import jishubotz, save_token, is_token_valid, verify_user  # Updated imports
 import requests
 
 # 🧠 CONSTANTS
 TOKEN_DURATION = timedelta(hours=Config.TOKEN_TIME)
 
-# ⚡ /gettoken command
+# ⚡ /gettoken command – Generates and sends shortlink for verification
 @Client.on_message(filters.command("gettoken") & filters.private)
 async def get_token_handler(client, message: Message):
     user_id = message.from_user.id
 
-    # Make shortlink
+    # Make shortlink for verification
     try:
         link = f"https://t.me/{client.me.username}?start=verify_{user_id}"
         api_key = Config.SHORTLINK_API
@@ -33,11 +28,10 @@ async def get_token_handler(client, message: Message):
             short_url = data["shortenedUrl"]
         else:
             short_url = link  # fallback
-
     except Exception as e:
         short_url = link  # fallback on failure
 
-    # Save token timestamp
+    # Save token expiration and user access timestamp
     await save_token(user_id)
 
     await message.reply(
@@ -52,22 +46,23 @@ async def get_token_handler(client, message: Message):
 async def verify_command(client, message: Message):
     user_id = message.from_user.id
 
-    if await is_user_verified(user_id):
-        await message.reply("✅ You are already verified! You have access for 12 hours.")
+    # Check if already verified
+    if await jishubotz.is_premium(user_id):
+        await message.reply("✅ You are already verified and have Premium access!")
         return
 
     if await is_token_valid(user_id):
-        await verify_user(user_id)
+        await verify_user(user_id)  # Updating user's premium status
         await message.reply("🎉 **Verification Successful!**\n\nYou now have 12-hour premium access.")
     else:
         await message.reply("❌ Your token is invalid or expired.\nUse /gettoken to generate a new one.")
 
-# ⚠️ Auto file-block: Intercept incoming files
+# ⚠️ Auto file-block: Intercept incoming files from unverified users
 @Client.on_message(filters.document | filters.video | filters.audio)
 async def block_if_unverified(client, message: Message):
     user_id = message.from_user.id
 
-    if not await is_user_verified(user_id):
+    if not await jishubotz.is_premium(user_id):
         await message.reply_text(
             "**🔒 Access Denied!**\nYou must verify using /gettoken before using the bot.",
             quote=True,
