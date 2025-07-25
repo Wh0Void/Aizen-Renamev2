@@ -55,11 +55,11 @@ async def refunc(client, message):
 
         await reply_message.delete()
 
-        buttons = [[InlineKeyboardButton("📁 Document", callback_data="upload_document")]]
+        buttons = [[InlineKeyboardButton("\ud83d\udcc1 Document", callback_data="upload_document")]]
         if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
-            buttons.append([InlineKeyboardButton("🎥 Video", callback_data="upload_video")])
+            buttons.append([InlineKeyboardButton("\ud83c\udfa5 Video", callback_data="upload_video")])
         elif file.media == MessageMediaType.AUDIO:
-            buttons.append([InlineKeyboardButton("🎵 Audio", callback_data="upload_audio")])
+            buttons.append([InlineKeyboardButton("\ud83c\udfb5 Audio", callback_data="upload_audio")])
 
         await message.reply(
             text=f"**Select The Output File Type**\n\n**File Name :-** `{new_name}`",
@@ -82,34 +82,32 @@ async def doc(bot, update):
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
         return await update.message.edit(
-            f"Something went wrong while applying prefix/suffix 😓\n\n**Error:** `{e}`"
+            f"Something went wrong while applying prefix/suffix \ud83d\ude13\n\n**Error:** `{e}`"
         )
 
     file_path = f"downloads/{update.from_user.id}/{new_filename}"
     file = update.message.reply_to_message
     media = getattr(file, file.media.value)
 
-    ms = await update.message.edit("🚀 Downloading... ⚡")
+    ms = await update.message.edit("\ud83d\ude80 Downloading... \u26a1")
     try:
         path = await bot.download_media(
             message=file,
             file_name=file_path,
             progress=progress_for_pyrogram,
-            progress_args=("🚀 Downloading... ⚡", ms, time.time())
+            progress_args=("\ud83d\ude80 Downloading... \u26a1", ms, time.time())
         )
     except Exception as e:
-        return await ms.edit(f"❌ Download failed: `{e}`")
+        return await ms.edit(f"\u274c Download failed: `{e}`")
 
-    # 🔧 Add metadata if enabled
     _bool_metadata = await jishubotz.get_metadata(update.message.chat.id)
     if _bool_metadata:
         metadata_code = await jishubotz.get_metadata_code(update.message.chat.id)
         metadata_path = f"Metadata/{new_filename}"
         await add_metadata(path, metadata_path, metadata_code, ms)
     else:
-        await ms.edit("⏳ Preparing Upload... ⚡")
+        await ms.edit("\u23f3 Preparing Upload... \u26a1")
 
-    # 🕒 Duration (for video/audio)
     duration = 0
     try:
         parser = createParser(file_path)
@@ -120,7 +118,6 @@ async def doc(bot, update):
     except:
         pass
 
-    # 🖼️ Thumbnail
     ph_path = None
     c_thumb = await jishubotz.get_thumbnail(update.message.chat.id)
     if media.thumbs or c_thumb:
@@ -134,7 +131,6 @@ async def doc(bot, update):
         except:
             ph_path = None
 
-    # 📝 Caption
     c_caption = await jishubotz.get_caption(update.message.chat.id)
     try:
         caption = c_caption.format(
@@ -143,9 +139,9 @@ async def doc(bot, update):
             duration=convert(duration)
         ) if c_caption else f"**{new_filename}**"
     except Exception as e:
-        return await ms.edit(f"❌ Caption format error: `{e}`")
+        return await ms.edit(f"\u274c Caption format error: `{e}`")
 
-    await ms.edit("💠 Uploading... ⚡")
+    await ms.edit("\ud83d\udd20 Uploading... \u26a1")
     type = update.data.split("_")[1]
     sent_message = None
 
@@ -157,7 +153,7 @@ async def doc(bot, update):
                 thumb=ph_path,
                 caption=caption,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading... ⚡", ms, time.time())
+                progress_args=("\ud83d\udcc4 Uploading... \u26a1", ms, time.time())
             )
         elif type == "video":
             sent_message = await bot.send_video(
@@ -167,7 +163,7 @@ async def doc(bot, update):
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading... ⚡", ms, time.time())
+                progress_args=("\ud83c\udfa5 Uploading... \u26a1", ms, time.time())
             )
         elif type == "audio":
             sent_message = await bot.send_audio(
@@ -177,10 +173,9 @@ async def doc(bot, update):
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading... ⚡", ms, time.time())
+                progress_args=("\ud83c\udfb5 Uploading... \u26a1", ms, time.time())
             )
 
-        # ✅ Forward to bin
         await bot.forward_messages(
             chat_id=Config.BIN_CHANNEL,
             from_chat_id=update.message.chat.id,
@@ -188,19 +183,19 @@ async def doc(bot, update):
         )
 
         deletion_msg = await sent_message.reply(
-            "**🗑 This file will auto-delete in 30 minutes. Save it now!**"
+            "**\ud83d\uddd1 This file will auto-delete in 30 minutes. Save it now!**"
         )
 
     except Exception as e:
         os.remove(file_path)
         if ph_path: os.remove(ph_path)
-        return await ms.edit(f"❌ Upload failed: `{e}`")
+        return await ms.edit(f"\u274c Upload failed: `{e}`")
 
     await ms.delete()
     if file_path: os.remove(file_path)
     if ph_path: os.remove(ph_path)
 
-    await asyncio.sleep(1800)  # 30 minutes
+    await asyncio.sleep(1800)
     try:
         await sent_message.delete()
         await deletion_msg.delete()
