@@ -81,16 +81,23 @@ async def main():
         print("🚀 Starting bot...")
         await bot.start()
         print("✅ Bot started successfully!")
-        await bot.idle()  # Keep the bot running
+        print("📡 Bot is now running... Press Ctrl+C to stop")
+        
+        # Simple method to keep bot running - works with all Pyrogram versions
+        while True:
+            await asyncio.sleep(1)
+            
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
         print(f"❌ Error running bot: {e}")
     finally:
         try:
+            print("🔄 Stopping bot...")
             await bot.stop()
-        except:
-            pass
+            print("✅ Bot stopped successfully!")
+        except Exception as e:
+            print(f"⚠️ Error during shutdown: {e}")
 
 
 # ✅ FIXED: Only run if this file is executed directly
