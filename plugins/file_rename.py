@@ -12,7 +12,6 @@ from PIL import Image
 from config import Config
 import os, time, re, random, asyncio
 from bot.helper.database import jishubotz
-await jishubotz.increment_rename_count(user_id)
 
 
 @Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
