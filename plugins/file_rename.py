@@ -1,425 +1,222 @@
-# file_rename.py
-
-import os
-import time
-import asyncio
-from typing import Dict, List, Optional
-
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, CallbackQuery
-
-# Import config and utils properly to avoid circular imports
-try:
-    from config import Config
-except ImportError:
-    # Fallback if config import fails
-    class Config:
-        BIN_CHANNEL = None
-
-try:
-    from bot.utils import get_file_name, human_readable_size
-except ImportError:
-    # Fallback functions if utils import fails
-    def get_file_name(message):
-        if message.document:
-            return message.document.file_name or "unnamed_file"
-        elif message.video:
-            return message.video.file_name or "unnamed_video.mp4"
-        elif message.audio:
-            return message.audio.file_name or "unnamed_audio.mp3"
-        return "unnamed_file"
-    
-    def human_readable_size(size_bytes):
-        if size_bytes == 0:
-            return "0B"
-        size_names = ["B", "KB", "MB", "GB", "TB"]
-        import math
-        i = int(math.floor(math.log(size_bytes, 1024)))
-        p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_names[i]}"
-
-try:
-    from bot.database import update_user_token, is_user_premium
-except ImportError:
-    # Fallback functions if database import fails
-    def update_user_token(user_id, token):
-        pass
-    
-    def is_user_premium(user_id):
-        return True
-
-# ✅ Simple queue system - just track files, no complex states
-user_queues = {}
-
-# ✅ Handle ALL media files (documents, videos, audio, photos)
-@Client.on_message(filters.document | filters.video | filters.audio | filters.photo)
-async def handle_media(client: Client, message: Message):
-    user_id = message.from_user.id
-    
-    # Initialize user queue if not exists
-    if user_id not in user_queues:
-        user_queues[user_id] = []
-    
-    # Get file info
-    file_info = {
-        "message": message,
-        "original_name": get_file_name(message),
-        "file_type": get_file_type(message)
-    }
-    
-    # Simple choice: Single rename or add to batch
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 Rename Now", callback_data=f"single_{user_id}"),
-            InlineKeyboardButton("📦 Add to Batch", callback_data=f"batch_{user_id}")
-        ],
-        [
-            InlineKeyboardButton("📋 View Batch", callback_data=f"view_{user_id}"),
-            InlineKeyboardButton("🗑️ Clear Batch", callback_data=f"clear_{user_id}")
-        ]
-    ])
-    
-    # Store the current file temporarily
-    client.temp_file = {user_id: file_info}
-    
-    batch_count = len(user_queues[user_id])
-    batch_info = f"\n📦 Current Batch: {batch_count} files" if batch_count > 0 else ""
-    
-    await message.reply_text(
-        f"📁 **{file_info['file_type']} Received!**\n"
-        f"📄 Name: `{file_info['original_name']}`{batch_info}\n\n"
-        f"🤔 **Choose an option:**\n"
-        f"• **Rename Now** - Process immediately\n"
-        f"• **Add to Batch** - Process multiple files together",
-        reply_markup=keyboard
-    )
+from pyrogram.enums import MessageMediaType
+from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from hachoir.metadata import extractMetadata
+from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
+from hachoir.parser import createParser
+from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
+from helper.database import jishubotz
+from asyncio import sleep
+from PIL import Image
+from config import Config
+import os, time, re, random, asyncio
 
 
-def get_file_type(message):
-    """Get file type for display"""
-    if message.document:
-        return "Document"
-    elif message.video:
-        return "Video"
-    elif message.audio:
-        return "Audio"
-    elif message.photo:
-        return "Photo"
-    return "File"
-
-
-# ✅ Handle callback queries
-@Client.on_callback_query()
-async def handle_callback(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    
-    try:
-        if data.startswith("single_"):
-            await handle_single_rename(client, callback_query)
-        elif data.startswith("batch_"):
-            await add_to_batch(client, callback_query)
-        elif data.startswith("view_"):
-            await view_batch(client, callback_query)
-        elif data.startswith("clear_"):
-            await clear_batch(client, callback_query)
-        elif data.startswith("process_"):
-            await process_batch(client, callback_query)
-        elif data.startswith("remove_"):
-            await remove_from_batch(client, callback_query)
-    except Exception as e:
-        await callback_query.answer(f"❌ Error: {str(e)}", show_alert=True)
-
-
-# ✅ Single file rename (immediate)
-async def handle_single_rename(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
-        await callback_query.answer("❌ No file to rename!", show_alert=True)
-        return
-    
-    file_info = client.temp_file[user_id]
-    original_name = file_info["original_name"]
-    ext = os.path.splitext(original_name)[1] if original_name else ""
-    
-    # Mark as single rename mode
-    client.rename_mode = {user_id: "single"}
-    
-    await callback_query.answer("📝 Single rename mode...")
-    await callback_query.edit_message_text(
-        f"📝 **Single File Rename**\n"
-        f"📄 {file_info['file_type']}: `{original_name}`\n\n"
-        f"💡 Reply with new filename{f' (without {ext})' if ext else ''}:",
-        reply_markup=ForceReply(True)
-    )
-
-
-# ✅ Add file to batch
-async def add_to_batch(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
-        await callback_query.answer("❌ No file to add!", show_alert=True)
-        return
-    
-    file_info = client.temp_file[user_id]
-    user_queues[user_id].append(file_info)
-    
-    # Clear temp file
-    del client.temp_file[user_id]
-    
-    batch_count = len(user_queues[user_id])
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🚀 Process Batch", callback_data=f"process_{user_id}"),
-            InlineKeyboardButton("📋 View Batch", callback_data=f"view_{user_id}")
-        ],
-        [
-            InlineKeyboardButton("🗑️ Clear Batch", callback_data=f"clear_{user_id}")
-        ]
-    ])
-    
-    await callback_query.answer("✅ Added to batch!")
-    await callback_query.edit_message_text(
-        f"✅ **Added to Batch!**\n"
-        f"📄 File: `{file_info['original_name']}`\n"
-        f"📦 Batch Size: **{batch_count}** files\n\n"
-        f"📤 Send more files or process the batch:",
-        reply_markup=keyboard
-    )
-
-
-# ✅ View batch contents
-async def view_batch(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in user_queues or not user_queues[user_id]:
-        await callback_query.answer("📭 Batch is empty!", show_alert=True)
-        return
-    
-    files = user_queues[user_id]
-    
-    text = f"📋 **Batch Contents ({len(files)} files):**\n\n"
-    for i, file_info in enumerate(files, 1):
-        text += f"{i}. {file_info['file_type']}: `{file_info['original_name']}`\n"
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🚀 Process All", callback_data=f"process_{user_id}"),
-            InlineKeyboardButton("❌ Remove Last", callback_data=f"remove_{user_id}")
-        ],
-        [
-            InlineKeyboardButton("🗑️ Clear All", callback_data=f"clear_{user_id}")
-        ]
-    ])
-    
-    await callback_query.edit_message_text(text, reply_markup=keyboard)
-
-
-# ✅ Clear batch
-async def clear_batch(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id in user_queues:
-        user_queues[user_id] = []
-    
-    await callback_query.answer("🗑️ Batch cleared!")
-    await callback_query.edit_message_text("✅ **Batch Cleared!**\nSend files to start a new batch.")
-
-
-# ✅ Remove last file from batch
-async def remove_from_batch(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in user_queues or not user_queues[user_id]:
-        await callback_query.answer("📭 Batch is empty!", show_alert=True)
-        return
-    
-    removed = user_queues[user_id].pop()
-    remaining = len(user_queues[user_id])
-    
-    await callback_query.answer(f"🗑️ Removed: {removed['original_name']}")
-    
-    if remaining == 0:
-        await callback_query.edit_message_text("✅ **Batch is now empty!**\nSend files to start over.")
-    else:
-        await callback_query.edit_message_text(f"✅ **File Removed!**\n📦 Remaining: {remaining} files")
-
-
-# ✅ Process entire batch
-async def process_batch(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in user_queues or not user_queues[user_id]:
-        await callback_query.answer("📭 No files to process!", show_alert=True)
-        return
-    
-    files = user_queues[user_id]
-    
-    # Mark as batch rename mode
-    client.rename_mode = {user_id: "batch"}
-    client.batch_index = {user_id: 0}
-    
-    await callback_query.answer("🚀 Starting batch processing...")
-    await process_next_in_batch(client, user_id)
-
-
-# ✅ Process next file in batch
-async def process_next_in_batch(client: Client, user_id: int):
-    if user_id not in user_queues or not user_queues[user_id]:
-        return
-    
-    files = user_queues[user_id]
-    index = client.batch_index.get(user_id, 0)
-    
-    if index >= len(files):
-        # Batch complete
-        await client.send_message(
-            user_id,
-            f"🎉 **Batch Processing Complete!**\n"
-            f"✅ Processed {len(files)} files successfully!\n"
-            f"📤 Send more files to start a new batch."
+@Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
+async def rename_start(client, message):
+    file = getattr(message, message.media.value)
+    filename = file.file_name
+    ban_chk = await jishubotz.is_banned(int(message.from_user.id))
+    if ban_chk:
+        return await message.reply(
+            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CallOwnerBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
         )
-        user_queues[user_id] = []  # Clear batch
-        return
-    
-    current_file = files[index]
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭️ Skip This File", callback_data=f"skip_{user_id}")]
-    ])
-    
-    ext = os.path.splitext(current_file["original_name"])[1] if current_file["original_name"] else ""
-    
-    await client.send_message(
-        user_id,
-        f"📝 **File {index + 1}/{len(files)}**\n"
-        f"📄 {current_file['file_type']}: `{current_file['original_name']}`\n\n"
-        f"💡 Reply with new filename{f' (without {ext})' if ext else ''}:",
-        reply_markup=ForceReply(True)
-    )
+    if file.file_size > 2000 * 1024 * 1024:
+        return await message.reply_text("Sorry, this bot doesn't support files larger than 2GB.")
 
+    try:
+        await message.reply_text(
+            text=f"**Please Enter New Filename...**\n\n**Old File Name** :- `{filename}`",
+            reply_to_message_id=message.id,  
+            reply_markup=ForceReply(True)
+        )       
+        await sleep(30)
+    except FloodWait as e:
+        await sleep(e.value)
+        await message.reply_text(
+            text=f"**Please Enter New Filename**\n\n**Old File Name** :- `{filename}`",
+            reply_to_message_id=message.id,  
+            reply_markup=ForceReply(True)
+        )
+    except Exception as e:
+        print(f"Error in rename_start: {e}")
 
-# ✅ Handle text replies (filenames)
-@Client.on_message(filters.text & filters.reply)
-async def handle_rename_reply(client: Client, message: Message):
-    user_id = message.from_user.id
-    
-    if not hasattr(client, 'rename_mode') or user_id not in client.rename_mode:
-        return
-    
-    mode = client.rename_mode[user_id]
-    new_name = message.text.strip()
-    
-    if mode == "single":
-        # Handle single file rename
-        if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
-            return await message.reply("❌ No file to rename!")
-        
-        file_info = client.temp_file[user_id]
-        await rename_file(client, message, file_info, new_name, 1, 1)
-        
-        # Clean up
-        del client.temp_file[user_id]
-        del client.rename_mode[user_id]
-        
-    elif mode == "batch":
-        # Handle batch file rename
-        if user_id not in user_queues or not user_queues[user_id]:
-            return await message.reply("❌ No files in batch!")
-        
-        files = user_queues[user_id]
-        index = client.batch_index.get(user_id, 0)
-        
-        if index >= len(files):
-            return await message.reply("✅ Batch processing complete!")
-        
-        current_file = files[index]
-        await rename_file(client, message, current_file, new_name, index + 1, len(files))
-        
-        # Move to next file
-        client.batch_index[user_id] = index + 1
-        await asyncio.sleep(1)
-        await process_next_in_batch(client, user_id)
+    await asyncio.sleep(600)
+    await message.delete()
 
+@Client.on_message(filters.private & filters.reply)
+async def refunc(client, message):
+    reply_message = message.reply_to_message
+    if (reply_message.reply_markup) and isinstance(reply_message.reply_markup, ForceReply):
+        new_name = message.text 
+        await message.delete() 
+        msg = await client.get_messages(message.chat.id, reply_message.id)
+        file = msg.reply_to_message
+        media = getattr(file, file.media.value)
+        if not "." in new_name:
+            if "." in media.file_name:
+                extn = media.file_name.rsplit('.', 1)[-1]
+            else:
+                extn = "mkv"
+            new_name = new_name + "." + extn
+        await reply_message.delete()
 
-# ✅ Actual file renaming function
-async def rename_file(client: Client, message: Message, file_info: dict, new_name: str, current: int, total: int):
-    user_id = message.from_user.id
-    file_message = file_info["message"]
-    original_name = file_info["original_name"]
+        button = [[InlineKeyboardButton("📁 Document", callback_data="upload_document")]]
+        if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
+            button.append([InlineKeyboardButton("🎥 Video", callback_data="upload_video")])
+        elif file.media == MessageMediaType.AUDIO:
+            button.append([InlineKeyboardButton("🎵 Audio", callback_data="upload_audio")])
+        await message.reply(
+            text=f"**Select The Output File Type**\n\n**File Name :-** `{new_name}`",
+            reply_to_message_id=file.id,
+            reply_markup=InlineKeyboardMarkup(button)
+        )
+
+@Client.on_callback_query(filters.regex("upload"))
+async def doc(bot, update):    
+    if not os.path.isdir("Metadata"):
+        os.mkdir("Metadata")
+        
+    prefix = await jishubotz.get_prefix(update.message.chat.id)
+    suffix = await jishubotz.get_suffix(update.message.chat.id)
+    new_name = update.message.text
+    new_filename_ = new_name.split(":-")[1]
+
+    try:
+        new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
+    except Exception as e:
+        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`")
     
-    # Add extension if not provided
-    ext = os.path.splitext(original_name)[1] if original_name else ""
-    if ext and not new_name.endswith(ext):
-        new_name += ext
-    
-    progress_msg = await message.reply(f"⏳ **Processing {current}/{total}**\n📁 Renaming to: `{new_name}`...")
+    file_path = f"downloads/{update.from_user.id}/{new_filename}"
+    file = update.message.reply_to_message
+
+    try:
+        if update.message.text != "🚀 Try To Download...  ⚡":
+            ms = await update.message.edit("🚀 Try To Download...  ⚡")
+    except Exception as e:
+        print(f"Error editing message: {e}")
     
     try:
-        # Download file
-        file_path = await file_message.download(file_name=new_name)
-        
-        # Upload to bin channel if configured
-        if hasattr(Config, 'BIN_CHANNEL') and Config.BIN_CHANNEL and Config.BIN_CHANNEL != "None":
-            try:
-                await client.send_document(
-                    chat_id=int(Config.BIN_CHANNEL),
-                    document=file_path,
-                    caption=f"👤 User: [{message.from_user.first_name}](tg://user?id={user_id})\n📦 File: `{new_name}` ({current}/{total})",
-                    file_name=new_name
-                )
-            except Exception as e:
-                print(f"⚠️ Could not upload to bin channel: {e}")
-        
-        # Send renamed file to user
-        file_size = human_readable_size(os.path.getsize(file_path))
-        
-        if file_info["file_type"] == "Photo":
-            await file_message.reply_photo(
-                photo=file_path,
-                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
-            )
-        elif file_info["file_type"] == "Video":
-            await file_message.reply_video(
-                video=file_path,
-                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
-            )
-        elif file_info["file_type"] == "Audio":
-            await file_message.reply_audio(
-                audio=file_path,
-                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
-            )
-        else:
-            await file_message.reply_document(
-                document=file_path,
-                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
-            )
-        
-        await progress_msg.delete()
-        
+        path = await bot.download_media(
+            message=file, 
+            file_name=file_path, 
+            progress=progress_for_pyrogram, 
+            progress_args=("🚀 Downloading...  ⚡", ms, time.time())
+        )                    
     except Exception as e:
-        await progress_msg.edit(f"❌ Error renaming file: {str(e)}")
+        return await ms.edit(e)
+
+    _bool_metadata = await jishubotz.get_metadata(update.message.chat.id) 
     
-    finally:
-        # Clean up downloaded file
-        if 'file_path' in locals() and os.path.exists(file_path):
+    if _bool_metadata:
+        metadata = await jishubotz.get_metadata_code(update.message.chat.id)
+        metadata_path = f"Metadata/{new_filename}"
+        await add_metadata(path, metadata_path, metadata, ms)
+    else:
+        await ms.edit("⏳ Mode Changing...  ⚡")
+
+    duration = 0
+    try:
+        parser = createParser(file_path)
+        metadata = extractMetadata(parser)
+        if metadata.has("duration"):
+            duration = metadata.get('duration').seconds
+        parser.close()   
+    except:
+        pass
+        
+    ph_path = None
+    user_id = int(update.message.chat.id) 
+    user_name = update.message.chat.first_name
+    media = getattr(file, file.media.value)
+    c_caption = await jishubotz.get_caption(update.message.chat.id)
+    c_thumb = await jishubotz.get_thumbnail(update.message.chat.id)
+
+    if c_caption:
+        try:
+            caption = c_caption.format(filename=new_filename, filesize=humanbytes(media.file_size), duration=convert(duration))
+        except Exception as e:
+            return await ms.edit(text=f"Your Caption Error: ({e})")             
+    else:
+        caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
+
+    if (media.thumbs or c_thumb):
+        if c_thumb:
+            ph_path = await bot.download_media(c_thumb)
+            width, height, ph_path = await fix_thumb(ph_path)
+        else:
             try:
-                os.remove(file_path)
+                ph_path_ = await take_screen_shot(file_path, os.path.dirname(os.path.abspath(file_path)), random.randint(0, duration - 1))
+                width, height, ph_path = await fix_thumb(ph_path_)
             except Exception as e:
-                print(f"⚠️ Could not remove temp file: {e}")
+                ph_path = None
+                print(e)  
 
+    try:
+        if update.message.text != "💠 Try To Upload...  ⚡":
+            await ms.edit("💠 Try To Upload...  ⚡")
+    except Exception as e:
+        print(f"Error editing message: {e}")
+    
+    type = update.data.split("_")[1]
+    try:
+        if type == "document":
+            sent_message = await bot.send_document(
+                update.message.chat.id,
+                document=metadata_path if _bool_metadata else file_path,
+                thumb=ph_path, 
+                caption=caption, 
+                progress=progress_for_pyrogram,
+                progress_args=("💠 Uploading...  ⚡", ms, time.time())
+            )
+        elif type == "video": 
+            sent_message = await bot.send_video(
+                update.message.chat.id,
+                video=metadata_path if _bool_metadata else file_path,
+                caption=caption,
+                thumb=ph_path,
+                duration=duration,
+                progress=progress_for_pyrogram,
+                progress_args=("💠 Uploading...  ⚡", ms, time.time())
+            )
+        elif type == "audio": 
+            sent_message = await bot.send_audio(
+                update.message.chat.id,
+                audio=metadata_path if _bool_metadata else file_path,
+                caption=caption,
+                thumb=ph_path,
+                duration=duration,
+                progress=progress_for_pyrogram,
+                progress_args=("💠 Uploading...  ⚡", ms, time.time())
+            )
 
-# ✅ Initialize plugin
-def init(client: Client):
-    """Initialize the rename plugin"""
-    if not hasattr(client, "temp_file"):
-        client.temp_file = {}
-    if not hasattr(client, "rename_mode"):
-        client.rename_mode = {}
-    if not hasattr(client, "batch_index"):
-        client.batch_index = {}
-    print("✅ File rename plugin initialized successfully!")
+        forwarded_message = await bot.forward_messages(
+            Config.BIN_CHANNEL, 
+            update.message.chat.id, 
+            sent_message.id
+        )
+
+        deletion_msg = await sent_message.reply(
+            text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
+        )
+
+    except Exception as e:          
+        os.remove(file_path)
+        if ph_path:
+            os.remove(ph_path)
+        return await ms.edit(f"**Error:** `{e}`")    
+
+    await ms.delete() 
+    if ph_path:
+        os.remove(ph_path)
+    if file_path:
+        os.remove(file_path)
+
+    await asyncio.sleep(1800)
+    try:
+        await sent_message.delete()
+        await forwarded_message.delete()
+        await deletion_msg.delete()
+    except Exception as e:
+        print(f"Error deleting messages after 30 minutes: {e}")
