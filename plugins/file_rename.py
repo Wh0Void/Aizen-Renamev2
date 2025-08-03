@@ -5,7 +5,8 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from config import Config
-from helper.utils import get_readable_file_size, progress_for_pyrogram, time_formatter, get_file_name
+from helper.utils import progress_for_pyrogram, time_formatter, get_file_name
+from helper.utils import humanbytes as get_readable_file_size
 from bot.database import increase_rename_count
 from pyrogram.enums import ChatAction
 
