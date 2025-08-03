@@ -147,3 +147,23 @@ async def cb_handler(client, query: CallbackQuery):
         user_id =(data.split("_")[1])
         user_id = int(user_id.replace(' ' , ''))
         await query.message.edit(f"Tʜᴇ ᴜɴʙᴀɴ ᴏɴ <code>{user_id}</code> ᴡᴀs ᴇxᴇᴄᴜᴛᴇᴅ sɪʟᴇɴᴛʟʏ.")
+
+
+# ========== leaderboard system ==============#
+@Client.on_message(filters.command("leaderboard") & filters.private)
+async def leaderboard_handler(client, message):
+    top_users = await jishubotz.get_leaderboard(limit=10)
+    
+    if not top_users:
+        return await message.reply("🏆 Leaderboard is currently empty.")
+
+    text = "🏆 <b>Top 10 Renamers:</b>\n\n"
+    for i, user in enumerate(top_users, start=1):
+        try:
+            mention = f"<a href='tg://user?id={user['_id']}'>User</a>"
+        except Exception:
+            mention = f"<code>{user['_id']}</code>"
+        count = user.get('rename_count', 0)
+        text += f"{i}. {mention} — <b>{count}</b> renames\n"
+
+    await message.reply(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
