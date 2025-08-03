@@ -127,3 +127,18 @@ class Database:
 
 # Create a Database instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
+
+# ======================= Rename Count & Leaderboard ======================== #
+
+    async def increment_rename_count(self, user_id: int):
+        await self.col.update_one(
+            {'_id': int(user_id)},
+            {'$inc': {'rename_count': 1}},
+            upsert=True
+        )
+
+    async def get_leaderboard(self, limit: int = 10):
+        cursor = self.col.find(
+            {'rename_count': {'$gt': 0}}
+        ).sort('rename_count', -1).limit(limit)
+        return [user async for user in cursor]
