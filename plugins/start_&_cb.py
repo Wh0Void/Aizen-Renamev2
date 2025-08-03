@@ -167,3 +167,26 @@ async def leaderboard_handler(client, message):
         text += f"{i}. {mention} — <b>{count}</b> renames\n"
 
     await message.reply(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+    elif data == "leaderboard":
+        leaderboard = await jishubotz.get_leaderboard()
+    if not leaderboard:
+        return await query.message.edit("🏆 No leaderboard data found yet.")
+
+    text = "🏆 **Top Renamers Leaderboard** 🏆\n\n"
+    for rank, (user_id, count) in enumerate(leaderboard, start=1):
+        try:
+            user = await client.get_users(user_id)
+            name = user.mention
+        except:
+            name = f"[User](tg://user?id={user_id})"
+        text += f"**{rank}.** {name} — `{count}` renames\n"
+
+    await query.message.edit(
+        text,
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data="help")]
+        ])
+    )
