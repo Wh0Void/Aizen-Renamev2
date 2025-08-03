@@ -49,478 +49,377 @@ except ImportError:
     def is_user_premium(user_id):
         return True
 
-# ✅ Queue status constants
-QUEUE_IDLE = "idle"
-QUEUE_WAITING_NAME = "waiting_name"
-QUEUE_PROCESSING = "processing"
+# ✅ Simple queue system - just track files, no complex states
+user_queues = {}
 
-# ✅ Handle media files sent (Give user choice)
-@Client.on_message(filters.document | filters.video | filters.audio)
+# ✅ Handle ALL media files (documents, videos, audio, photos)
+@Client.on_message(filters.document | filters.video | filters.audio | filters.photo)
 async def handle_media(client: Client, message: Message):
     user_id = message.from_user.id
     
     # Initialize user queue if not exists
-    if not hasattr(client, 'user_queues'):
-        client.user_queues = {}
+    if user_id not in user_queues:
+        user_queues[user_id] = []
     
-    if user_id not in client.user_queues:
-        client.user_queues[user_id] = {
-            "files": [],
-            "status": QUEUE_IDLE,
-            "current_index": 0,
-            "start_time": time.time(),
-            "temp_file": None  # Store file temporarily
-        }
-    
-    # Store file temporarily (don't add to queue yet)
+    # Get file info
     file_info = {
         "message": message,
         "original_name": get_file_name(message),
-        "new_name": None,
-        "processed": False
+        "file_type": get_file_type(message)
     }
     
-    client.user_queues[user_id]["temp_file"] = file_info
-    current_queue_size = len(client.user_queues[user_id]["files"])
-    
-    # Create choice keyboard
+    # Simple choice: Single rename or add to batch
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📝 Rename Now", callback_data=f"rename_now_{user_id}"),
-            InlineKeyboardButton("➕ Add to Queue", callback_data=f"add_to_queue_{user_id}")
+            InlineKeyboardButton("📝 Rename Now", callback_data=f"single_{user_id}"),
+            InlineKeyboardButton("📦 Add to Batch", callback_data=f"batch_{user_id}")
+        ],
+        [
+            InlineKeyboardButton("📋 View Batch", callback_data=f"view_{user_id}"),
+            InlineKeyboardButton("🗑️ Clear Batch", callback_data=f"clear_{user_id}")
         ]
     ])
     
-    queue_info = f"\n📊 Current Queue: **{current_queue_size}** files" if current_queue_size > 0 else ""
+    # Store the current file temporarily
+    client.temp_file = {user_id: file_info}
+    
+    batch_count = len(user_queues[user_id])
+    batch_info = f"\n📦 Current Batch: {batch_count} files" if batch_count > 0 else ""
     
     await message.reply_text(
-        f"📁 **File Received!**\n"
-        f"📄 File: `{file_info['original_name']}`\n"
-        f"{queue_info}\n\n"
-        f"🤔 **What would you like to do?**\n"
-        f"• **Rename Now** - Process this file immediately\n"
-        f"• **Add to Queue** - Add to batch processing queue",
+        f"📁 **{file_info['file_type']} Received!**\n"
+        f"📄 Name: `{file_info['original_name']}`{batch_info}\n\n"
+        f"🤔 **Choose an option:**\n"
+        f"• **Rename Now** - Process immediately\n"
+        f"• **Add to Batch** - Process multiple files together",
         reply_markup=keyboard
     )
 
 
-# ✅ Handle callback queries for queue management
+def get_file_type(message):
+    """Get file type for display"""
+    if message.document:
+        return "Document"
+    elif message.video:
+        return "Video"
+    elif message.audio:
+        return "Audio"
+    elif message.photo:
+        return "Photo"
+    return "File"
+
+
+# ✅ Handle callback queries
 @Client.on_callback_query()
 async def handle_callback(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     
-    # Initialize user_queues if not exists
-    if not hasattr(client, 'user_queues'):
-        client.user_queues = {}
-    
     try:
-        if data.startswith("rename_now_"):
-            await rename_single_file(client, callback_query)
-        elif data.startswith("add_to_queue_"):
-            await add_file_to_queue(client, callback_query)
-        elif data.startswith("start_rename_"):
-            await start_renaming_process(client, callback_query)
-        elif data.startswith("view_queue_"):
-            await show_queue_status(client, callback_query)
-        elif data.startswith("clear_queue_"):
-            await clear_user_queue(client, callback_query)
-        elif data.startswith("remove_last_"):
-            await remove_last_file(client, callback_query)
-        elif data.startswith("skip_file_"):
-            await skip_current_file(client, callback_query)
-        elif data.startswith("stop_queue_"):
-            await stop_queue_processing(client, callback_query)
+        if data.startswith("single_"):
+            await handle_single_rename(client, callback_query)
+        elif data.startswith("batch_"):
+            await add_to_batch(client, callback_query)
+        elif data.startswith("view_"):
+            await view_batch(client, callback_query)
+        elif data.startswith("clear_"):
+            await clear_batch(client, callback_query)
+        elif data.startswith("process_"):
+            await process_batch(client, callback_query)
+        elif data.startswith("remove_"):
+            await remove_from_batch(client, callback_query)
     except Exception as e:
         await callback_query.answer(f"❌ Error: {str(e)}", show_alert=True)
 
 
-# ✅ Rename single file immediately
-async def rename_single_file(client: Client, callback_query: CallbackQuery):
+# ✅ Single file rename (immediate)
+async def handle_single_rename(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
-    if user_id not in client.user_queues or not client.user_queues[user_id]["temp_file"]:
+    if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
         await callback_query.answer("❌ No file to rename!", show_alert=True)
         return
     
-    file_info = client.user_queues[user_id]["temp_file"]
+    file_info = client.temp_file[user_id]
     original_name = file_info["original_name"]
-    ext = os.path.splitext(original_name)[1]
+    ext = os.path.splitext(original_name)[1] if original_name else ""
     
-    # Set status to waiting for single rename
-    client.user_queues[user_id]["status"] = "single_rename"
+    # Mark as single rename mode
+    client.rename_mode = {user_id: "single"}
     
-    await callback_query.answer("📝 Starting single file rename...")
+    await callback_query.answer("📝 Single rename mode...")
     await callback_query.edit_message_text(
         f"📝 **Single File Rename**\n"
-        f"📄 File: `{original_name}`\n"
-        f"💡 Send new filename (without `{ext}` extension):",
+        f"📄 {file_info['file_type']}: `{original_name}`\n\n"
+        f"💡 Reply with new filename{f' (without {ext})' if ext else ''}:",
         reply_markup=ForceReply(True)
     )
 
 
-# ✅ Add file to queue
-async def add_file_to_queue(client: Client, callback_query: CallbackQuery):
+# ✅ Add file to batch
+async def add_to_batch(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
-    if user_id not in client.user_queues or not client.user_queues[user_id]["temp_file"]:
+    if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
         await callback_query.answer("❌ No file to add!", show_alert=True)
         return
     
-    # Move file from temp to queue
-    file_info = client.user_queues[user_id]["temp_file"]
-    client.user_queues[user_id]["files"].append(file_info)
-    client.user_queues[user_id]["temp_file"] = None
+    file_info = client.temp_file[user_id]
+    user_queues[user_id].append(file_info)
     
-    queue_length = len(client.user_queues[user_id]["files"])
+    # Clear temp file
+    del client.temp_file[user_id]
     
-    # Create queue management keyboard
+    batch_count = len(user_queues[user_id])
+    
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📝 Start Renaming", callback_data=f"start_rename_{user_id}"),
-            InlineKeyboardButton("📋 View Queue", callback_data=f"view_queue_{user_id}")
+            InlineKeyboardButton("🚀 Process Batch", callback_data=f"process_{user_id}"),
+            InlineKeyboardButton("📋 View Batch", callback_data=f"view_{user_id}")
         ],
         [
-            InlineKeyboardButton("🗑️ Clear Queue", callback_data=f"clear_queue_{user_id}"),
-            InlineKeyboardButton("❌ Remove Last", callback_data=f"remove_last_{user_id}")
+            InlineKeyboardButton("🗑️ Clear Batch", callback_data=f"clear_{user_id}")
         ]
     ])
     
-    await callback_query.answer("✅ File added to queue!")
+    await callback_query.answer("✅ Added to batch!")
     await callback_query.edit_message_text(
-        f"✅ **File Added to Queue!**\n"
+        f"✅ **Added to Batch!**\n"
         f"📄 File: `{file_info['original_name']}`\n"
-        f"📊 Queue Position: **{queue_length}**\n"
-        f"📈 Total Files: **{queue_length}**\n\n"
-        f"➕ Send more files to add them to queue, or start renaming process below:",
+        f"📦 Batch Size: **{batch_count}** files\n\n"
+        f"📤 Send more files or process the batch:",
         reply_markup=keyboard
     )
 
 
-# ✅ Start the renaming process
-async def start_renaming_process(client: Client, callback_query: CallbackQuery):
+# ✅ View batch contents
+async def view_batch(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     
-    if user_id not in client.user_queues or not client.user_queues[user_id]["files"]:
-        await callback_query.answer("❌ No files in queue!", show_alert=True)
+    if user_id not in user_queues or not user_queues[user_id]:
+        await callback_query.answer("📭 Batch is empty!", show_alert=True)
         return
     
-    queue = client.user_queues[user_id]
+    files = user_queues[user_id]
     
-    if queue["status"] == QUEUE_PROCESSING:
-        await callback_query.answer("⚠️ Queue is already being processed!", show_alert=True)
-        return
-    
-    queue["status"] = QUEUE_WAITING_NAME
-    queue["current_index"] = 0
-    
-    await callback_query.answer("🚀 Starting rename process...")
-    await process_next_file(client, user_id)
-
-
-# ✅ Process the next file in queue
-async def process_next_file(client: Client, user_id: int):
-    if user_id not in client.user_queues:
-        return
-    
-    queue = client.user_queues[user_id]
-    files = queue["files"]
-    current_index = queue["current_index"]
-    
-    # Check if all files are processed
-    if current_index >= len(files):
-        await send_completion_message(client, user_id)
-        return
-    
-    current_file = files[current_index]
-    
-    # Skip if already processed
-    if current_file["processed"]:
-        queue["current_index"] += 1
-        await process_next_file(client, user_id)
-        return
-    
-    # Ask for new filename
-    original_name = current_file["original_name"]
-    ext = os.path.splitext(original_name)[1]
+    text = f"📋 **Batch Contents ({len(files)} files):**\n\n"
+    for i, file_info in enumerate(files, 1):
+        text += f"{i}. {file_info['file_type']}: `{file_info['original_name']}`\n"
     
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏭️ Skip This File", callback_data=f"skip_file_{user_id}"),
-            InlineKeyboardButton("⏹️ Stop Queue", callback_data=f"stop_queue_{user_id}")
+            InlineKeyboardButton("🚀 Process All", callback_data=f"process_{user_id}"),
+            InlineKeyboardButton("❌ Remove Last", callback_data=f"remove_{user_id}")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Clear All", callback_data=f"clear_{user_id}")
         ]
     ])
+    
+    await callback_query.edit_message_text(text, reply_markup=keyboard)
+
+
+# ✅ Clear batch
+async def clear_batch(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id in user_queues:
+        user_queues[user_id] = []
+    
+    await callback_query.answer("🗑️ Batch cleared!")
+    await callback_query.edit_message_text("✅ **Batch Cleared!**\nSend files to start a new batch.")
+
+
+# ✅ Remove last file from batch
+async def remove_from_batch(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id not in user_queues or not user_queues[user_id]:
+        await callback_query.answer("📭 Batch is empty!", show_alert=True)
+        return
+    
+    removed = user_queues[user_id].pop()
+    remaining = len(user_queues[user_id])
+    
+    await callback_query.answer(f"🗑️ Removed: {removed['original_name']}")
+    
+    if remaining == 0:
+        await callback_query.edit_message_text("✅ **Batch is now empty!**\nSend files to start over.")
+    else:
+        await callback_query.edit_message_text(f"✅ **File Removed!**\n📦 Remaining: {remaining} files")
+
+
+# ✅ Process entire batch
+async def process_batch(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    
+    if user_id not in user_queues or not user_queues[user_id]:
+        await callback_query.answer("📭 No files to process!", show_alert=True)
+        return
+    
+    files = user_queues[user_id]
+    
+    # Mark as batch rename mode
+    client.rename_mode = {user_id: "batch"}
+    client.batch_index = {user_id: 0}
+    
+    await callback_query.answer("🚀 Starting batch processing...")
+    await process_next_in_batch(client, user_id)
+
+
+# ✅ Process next file in batch
+async def process_next_in_batch(client: Client, user_id: int):
+    if user_id not in user_queues or not user_queues[user_id]:
+        return
+    
+    files = user_queues[user_id]
+    index = client.batch_index.get(user_id, 0)
+    
+    if index >= len(files):
+        # Batch complete
+        await client.send_message(
+            user_id,
+            f"🎉 **Batch Processing Complete!**\n"
+            f"✅ Processed {len(files)} files successfully!\n"
+            f"📤 Send more files to start a new batch."
+        )
+        user_queues[user_id] = []  # Clear batch
+        return
+    
+    current_file = files[index]
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭️ Skip This File", callback_data=f"skip_{user_id}")]
+    ])
+    
+    ext = os.path.splitext(current_file["original_name"])[1] if current_file["original_name"] else ""
     
     await client.send_message(
         user_id,
-        f"📝 **File {current_index + 1}/{len(files)}**\n"
-        f"📄 Current: `{original_name}`\n"
-        f"📝 Send new filename (without `{ext}` extension):",
+        f"📝 **File {index + 1}/{len(files)}**\n"
+        f"📄 {current_file['file_type']}: `{current_file['original_name']}`\n\n"
+        f"💡 Reply with new filename{f' (without {ext})' if ext else ''}:",
         reply_markup=ForceReply(True)
     )
-    
-    # Also send the file preview with controls
-    await current_file["message"].reply_text(
-        f"📁 **Renaming this file ({current_index + 1}/{len(files)})**\n"
-        f"📄 Original: `{original_name}`\n"
-        f"💡 Reply to the message above with new name",
-        reply_markup=keyboard
-    )
 
 
-# ✅ Handle rename after ForceReply
+# ✅ Handle text replies (filenames)
 @Client.on_message(filters.text & filters.reply)
-async def handle_rename(client: Client, message: Message):
+async def handle_rename_reply(client: Client, message: Message):
     user_id = message.from_user.id
     
-    # Initialize user_queues if not exists
-    if not hasattr(client, 'user_queues'):
-        client.user_queues = {}
+    if not hasattr(client, 'rename_mode') or user_id not in client.rename_mode:
+        return
     
-    # Check if user has active queue
-    if user_id not in client.user_queues:
-        return await message.reply("⚠️ No active rename process. Send a file first.")
+    mode = client.rename_mode[user_id]
+    new_name = message.text.strip()
     
-    queue = client.user_queues[user_id]
-    
-    try:
+    if mode == "single":
         # Handle single file rename
-        if queue["status"] == "single_rename":
-            if not queue["temp_file"]:
-                return await message.reply("❌ No file to rename!")
-            
-            file_info = queue["temp_file"]
-            original_name = file_info["original_name"]
-            ext = os.path.splitext(original_name)[1]
-            new_name = message.text.strip() + ext
-            
-            file_info["new_name"] = new_name
-            
-            # Process single file
-            await process_file_rename(client, message, file_info, 1, 1)
-            
-            # Clear temp file and reset status
-            queue["temp_file"] = None
-            queue["status"] = QUEUE_IDLE
-            return
+        if not hasattr(client, 'temp_file') or user_id not in client.temp_file:
+            return await message.reply("❌ No file to rename!")
         
-        # Handle queue rename
-        if queue["status"] != QUEUE_WAITING_NAME:
-            return
+        file_info = client.temp_file[user_id]
+        await rename_file(client, message, file_info, new_name, 1, 1)
         
-        files = queue["files"]
-        current_index = queue["current_index"]
+        # Clean up
+        del client.temp_file[user_id]
+        del client.rename_mode[user_id]
         
-        if current_index >= len(files):
-            return await message.reply("✅ All files processed!")
+    elif mode == "batch":
+        # Handle batch file rename
+        if user_id not in user_queues or not user_queues[user_id]:
+            return await message.reply("❌ No files in batch!")
         
-        current_file = files[current_index]
-        original_name = current_file["original_name"]
-        ext = os.path.splitext(original_name)[1]
-        new_name = message.text.strip() + ext
+        files = user_queues[user_id]
+        index = client.batch_index.get(user_id, 0)
         
-        current_file["new_name"] = new_name
-        queue["status"] = QUEUE_PROCESSING
+        if index >= len(files):
+            return await message.reply("✅ Batch processing complete!")
         
-        # Process the file
-        await process_file_rename(client, message, current_file, current_index + 1, len(files))
+        current_file = files[index]
+        await rename_file(client, message, current_file, new_name, index + 1, len(files))
         
-        # Mark as processed and move to next
-        current_file["processed"] = True
-        queue["current_index"] += 1
-        queue["status"] = QUEUE_WAITING_NAME
-        
-        # Process next file after a short delay
+        # Move to next file
+        client.batch_index[user_id] = index + 1
         await asyncio.sleep(1)
-        await process_next_file(client, user_id)
-        
-    except Exception as e:
-        await message.reply(f"❌ Error processing rename: {str(e)}")
+        await process_next_in_batch(client, user_id)
 
 
-# ✅ Process individual file rename
-async def process_file_rename(client: Client, message: Message, file_info: dict, current: int, total: int):
+# ✅ Actual file renaming function
+async def rename_file(client: Client, message: Message, file_info: dict, new_name: str, current: int, total: int):
     user_id = message.from_user.id
     file_message = file_info["message"]
-    new_name = file_info["new_name"]
+    original_name = file_info["original_name"]
     
-    sent_msg = await message.reply(f"⏳ **Processing {current}/{total}**\n📁 Renaming to: `{new_name}`...")
+    # Add extension if not provided
+    ext = os.path.splitext(original_name)[1] if original_name else ""
+    if ext and not new_name.endswith(ext):
+        new_name += ext
+    
+    progress_msg = await message.reply(f"⏳ **Processing {current}/{total}**\n📁 Renaming to: `{new_name}`...")
     
     try:
         # Download file
         file_path = await file_message.download(file_name=new_name)
         
-        # Forward to bin channel (if configured)
+        # Upload to bin channel if configured
         if hasattr(Config, 'BIN_CHANNEL') and Config.BIN_CHANNEL and Config.BIN_CHANNEL != "None":
             try:
                 await client.send_document(
-                    chat_id=int(Config.BIN_CHANNEL),  # Ensure it's an integer
+                    chat_id=int(Config.BIN_CHANNEL),
                     document=file_path,
-                    caption=f"👤 Uploaded by: [{message.from_user.first_name}](tg://user?id={user_id})\n📦 File: `{new_name}` ({current}/{total})",
+                    caption=f"👤 User: [{message.from_user.first_name}](tg://user?id={user_id})\n📦 File: `{new_name}` ({current}/{total})",
                     file_name=new_name
                 )
-                print(f"✅ File backed up to bin channel: {new_name}")
             except Exception as e:
-                print(f"⚠️ Warning: Could not upload to bin channel: {e}")
+                print(f"⚠️ Could not upload to bin channel: {e}")
         
-        # Upload to user
-        try:
-            file_size = human_readable_size(os.path.getsize(file_path))
+        # Send renamed file to user
+        file_size = human_readable_size(os.path.getsize(file_path))
+        
+        if file_info["file_type"] == "Photo":
+            await file_message.reply_photo(
+                photo=file_path,
+                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
+            )
+        elif file_info["file_type"] == "Video":
+            await file_message.reply_video(
+                video=file_path,
+                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
+            )
+        elif file_info["file_type"] == "Audio":
+            await file_message.reply_audio(
+                audio=file_path,
+                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
+            )
+        else:
             await file_message.reply_document(
                 document=file_path,
-                caption=f"✅ **Renamed Successfully! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
+                caption=f"✅ **Renamed! ({current}/{total})**\n📁 `{new_name}`\n📦 Size: `{file_size}`"
             )
-            await sent_msg.delete()
-        except Exception as e:
-            await sent_msg.edit(f"❌ Failed to send file: {e}")
-    
+        
+        await progress_msg.delete()
+        
     except Exception as e:
-        await sent_msg.edit(f"❌ Error processing file: {e}")
+        await progress_msg.edit(f"❌ Error renaming file: {str(e)}")
     
     finally:
+        # Clean up downloaded file
         if 'file_path' in locals() and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except Exception as e:
-                print(f"Warning: Could not remove file {file_path}: {e}")
+                print(f"⚠️ Could not remove temp file: {e}")
 
 
-# ✅ Show queue status
-async def show_queue_status(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in client.user_queues or not client.user_queues[user_id]["files"]:
-        await callback_query.answer("📭 Queue is empty!", show_alert=True)
-        return
-    
-    queue = client.user_queues[user_id]
-    files = queue["files"]
-    current_index = queue["current_index"]
-    
-    status_text = f"📋 **Queue Status**\n\n"
-    status_text += f"📊 Total Files: **{len(files)}**\n"
-    status_text += f"✅ Processed: **{len([f for f in files if f['processed']])}**\n"
-    status_text += f"⏳ Remaining: **{len(files) - current_index}**\n"
-    status_text += f"🔄 Status: **{queue['status'].replace('_', ' ').title()}**\n\n"
-    
-    status_text += "📁 **Files in Queue:**\n"
-    for i, file_info in enumerate(files):
-        status = "✅" if file_info["processed"] else ("🔄" if i == current_index else "⏳")
-        status_text += f"{status} {i+1}. `{file_info['original_name']}`\n"
-    
-    await callback_query.edit_message_text(status_text)
-
-
-# ✅ Clear user queue
-async def clear_user_queue(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id in client.user_queues:
-        client.user_queues[user_id] = {
-            "files": [],
-            "status": QUEUE_IDLE,
-            "current_index": 0,
-            "start_time": time.time(),
-            "temp_file": None
-        }
-    
-    await callback_query.answer("🗑️ Queue cleared!", show_alert=True)
-    await callback_query.edit_message_text("✅ **Queue Cleared!**\nSend new files to start over.")
-
-
-# ✅ Remove last file from queue
-async def remove_last_file(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in client.user_queues or not client.user_queues[user_id]["files"]:
-        await callback_query.answer("📭 Queue is empty!", show_alert=True)
-        return
-    
-    queue = client.user_queues[user_id]
-    if queue["status"] == QUEUE_PROCESSING:
-        await callback_query.answer("⚠️ Cannot remove files while processing!", show_alert=True)
-        return
-    
-    removed_file = queue["files"].pop()
-    await callback_query.answer(f"🗑️ Removed: {removed_file['original_name']}", show_alert=True)
-    
-    remaining = len(queue["files"])
-    if remaining == 0:
-        await callback_query.edit_message_text("✅ **Queue is now empty!**\nSend files to start over.")
-    else:
-        await callback_query.edit_message_text(f"✅ **File Removed!**\n📊 Remaining files: **{remaining}**")
-
-
-# ✅ Skip current file
-async def skip_current_file(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id not in client.user_queues:
-        await callback_query.answer("❌ No active queue!", show_alert=True)
-        return
-    
-    queue = client.user_queues[user_id]
-    files = queue["files"]
-    current_index = queue["current_index"]
-    
-    if current_index < len(files):
-        files[current_index]["processed"] = True  # Mark as skipped
-        queue["current_index"] += 1
-        
-        await callback_query.answer("⏭️ File skipped!", show_alert=True)
-        await process_next_file(client, user_id)
-    else:
-        await callback_query.answer("✅ No more files to skip!", show_alert=True)
-
-
-# ✅ Stop queue processing
-async def stop_queue_processing(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id in client.user_queues:
-        queue = client.user_queues[user_id]
-        processed_count = len([f for f in queue["files"] if f["processed"]])
-        total_count = len(queue["files"])
-        
-        client.user_queues[user_id]["status"] = QUEUE_IDLE
-        
-        await callback_query.answer("⏹️ Queue processing stopped!", show_alert=True)
-        await callback_query.edit_message_text(
-            f"⏹️ **Queue Processing Stopped!**\n\n"
-            f"📊 Progress: **{processed_count}/{total_count}** files processed\n"
-            f"💡 You can resume by clicking 'Start Renaming' again."
-        )
-
-
-# ✅ Send completion message
-async def send_completion_message(client: Client, user_id: int):
-    queue = client.user_queues[user_id]
-    files = queue["files"]
-    total_files = len(files)
-    processed_files = len([f for f in files if f["processed"]])
-    
-    completion_text = f"🎉 **Queue Processing Complete!**\n\n"
-    completion_text += f"📊 **Summary:**\n"
-    completion_text += f"✅ Processed: **{processed_files}/{total_files}** files\n"
-    completion_text += f"⏭️ Skipped: **{total_files - processed_files}** files\n"
-    completion_text += f"⏱️ Total Time: **{int(time.time() - queue['start_time'])}** seconds\n\n"
-    completion_text += f"🔄 Send more files to start a new queue!"
-    
-    # Clear the queue
-    client.user_queues[user_id] = {
-        "files": [],
-        "status": QUEUE_IDLE,
-        "current_index": 0,
-        "start_time": time.time(),
-        "temp_file": None
-    }
-    
-    await client.send_message(user_id, completion_text)
-
-
-# ✅ Initialize client-specific storage
+# ✅ Initialize plugin
 def init(client: Client):
-    """Initialize the rename plugin for the client"""
-    if not hasattr(client, "user_queues"):
-        client.user_queues = {}
+    """Initialize the rename plugin"""
+    if not hasattr(client, "temp_file"):
+        client.temp_file = {}
+    if not hasattr(client, "rename_mode"):
+        client.rename_mode = {}
+    if not hasattr(client, "batch_index"):
+        client.batch_index = {}
     print("✅ File rename plugin initialized successfully!")
