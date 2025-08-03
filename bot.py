@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime
 from pytz import timezone
 from pyrogram import Client, __version__
@@ -73,38 +72,7 @@ class Bot(Client):
         print(f"{self.mention} is stopped.")
 
 
-# ✅ FIXED: Use proper async main function instead of Bot().run()
-async def main():
-    """Main function to run the bot properly"""
-    bot = Bot()
-    try:
-        print("🚀 Starting bot...")
-        await bot.start()
-        print("✅ Bot started successfully!")
-        print("📡 Bot is now running... Press Ctrl+C to stop")
-        
-        # Simple method to keep bot running - works with all Pyrogram versions
-        while True:
-            await asyncio.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
-    except Exception as e:
-        print(f"❌ Error running bot: {e}")
-    finally:
-        try:
-            print("🔄 Stopping bot...")
-            await bot.stop()
-            print("✅ Bot stopped successfully!")
-        except Exception as e:
-            print(f"⚠️ Error during shutdown: {e}")
-
-
-# ✅ FIXED: Only run if this file is executed directly
+# ✅ SIMPLE FIX: Use main guard to prevent circular import issues
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
+    # Only run the bot if this file is executed directly
+    Bot().run()
