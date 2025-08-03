@@ -115,7 +115,11 @@ def makedir(name: str):
         shutil.rmtree(name)
     os.mkdir(name)
 
+# 📁 helper/utils.py
 
+def get_file_name(message):
+    media = message.document or message.video or message.audio
+    return media.file_name if media else "Unknown_File"
 
 
 # Jishu Developer 
