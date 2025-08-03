@@ -169,7 +169,7 @@ async def leaderboard_handler(client, message):
     await message.reply(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-    elif data == "leaderboard":
+     elif data == "leaderboard":
         leaderboard = await jishubotz.get_leaderboard()
     if not leaderboard:
         return await query.message.edit("🏆 No leaderboard data found yet.")
