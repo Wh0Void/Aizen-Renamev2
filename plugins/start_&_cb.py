@@ -11,7 +11,7 @@ async def start(client, message):
     await jishubotz.add_user(client, message)                
     button = InlineKeyboardMarkup([
         [InlineKeyboardButton('• ᴀʙᴏᴜᴛ •', callback_data='about'),
-        InlineKeyboardButton('• ʜᴇʟᴘ •', callback_data='help')],
+         InlineKeyboardButton('• ʜᴇʟᴘ •', callback_data='help')],
         [InlineKeyboardButton("♻ ᴅᴇᴠᴇʟᴏᴘᴇʀ ♻", url='https://telegram.me/VoidXTora')]
     ])
     if Config.START_PIC:
@@ -23,27 +23,29 @@ async def start(client, message):
 @Client.on_callback_query()
 async def cb_handler(client, query: CallbackQuery):
     data = query.data 
+
     if data == "start":
         await query.message.edit_text(
             text=Txt.START_TXT.format(query.from_user.mention),
             disable_web_page_preview=True,
             reply_markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton('• ᴀʙᴏᴜᴛ •', callback_data='about'),
-                InlineKeyboardButton('• ʜᴇʟᴘ •', callback_data='help')],
+                 InlineKeyboardButton('• ʜᴇʟᴘ •', callback_data='help')],
                 [InlineKeyboardButton("♻ ᴅᴇᴠᴇʟᴏᴘᴇʀ ♻", url='https://telegram.me/TechifyRahul')]
             ])
         )
+
     elif data == "help":
         await query.message.edit_text(
             text=Txt.HELP_TXT,
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("sᴇᴛ ᴍᴇᴛᴀᴅᴀᴛᴀ", callback_data = "meta")],
-                [InlineKeyboardButton("ᴘʀᴇꜰɪx", callback_data = "prefix"),
-                InlineKeyboardButton("sᴜꜰꜰɪx", callback_data = "suffix")],
-                [InlineKeyboardButton("ᴄᴀᴘᴛɪᴏɴ", callback_data = "caption"),
-                InlineKeyboardButton("ᴛʜᴜᴍʙɴᴀɪʟ", callback_data = "thumbnail")],
-                [InlineKeyboardButton("ʜᴏᴍᴇ", callback_data = "start")]
+                [InlineKeyboardButton("sᴇᴛ ᴍᴇᴛᴀᴅᴀᴛᴀ", callback_data="meta")],
+                [InlineKeyboardButton("ᴘʀᴇꜰɪx", callback_data="prefix"),
+                 InlineKeyboardButton("sᴜꜰꜰɪx", callback_data="suffix")],
+                [InlineKeyboardButton("ᴄᴀᴘᴛɪᴏɴ", callback_data="caption"),
+                 InlineKeyboardButton("ᴛʜᴜᴍʙɴᴀɪʟ", callback_data="thumbnail")],
+                [InlineKeyboardButton("ʜᴏᴍᴇ", callback_data="start")]
             ])            
         )
 
@@ -90,10 +92,10 @@ async def cb_handler(client, query: CallbackQuery):
     elif data == "about":
         await query.message.edit_text(
             text=Txt.ABOUT_TXT,
-            disable_web_page_preview = True,
+            disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👨‍💻  ʀᴇᴘᴏ", url="https://github.com/TechifyBots"),
-                InlineKeyboardButton("💥  ᴅᴏɴᴀᴛᴇ", callback_data="donate")],
+                 InlineKeyboardButton("💥  ᴅᴏɴᴀᴛᴇ", callback_data="donate")],
                 [InlineKeyboardButton("ʜᴏᴍᴇ", callback_data="start")]
             ])            
         )
@@ -101,81 +103,76 @@ async def cb_handler(client, query: CallbackQuery):
     elif data == "donate":
         await query.message.edit_text(
             text=Txt.DONATE_TXT,
-            disable_web_page_preview = True,
+            disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🤖 ᴍᴏʀᴇ ʙᴏᴛs", url="https://telegram.me/TechifyBots/8")],
-                [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data = "about"),
-                InlineKeyboardButton("ᴄʟᴏsᴇ", callback_data = "close")]
+                [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data="about"),
+                 InlineKeyboardButton("ᴄʟᴏsᴇ", callback_data="close")]
             ])            
         )
 
     elif data == "leaderboard":
-       leaderboard = await jishubotz.get_leaderboard()
-       if not leaderboard:
-        return await query.message.edit("🏆 No leaderboard data found yet.")
+        leaderboard = await jishubotz.get_leaderboard()
+        if not leaderboard:
+            return await query.message.edit("🏆 No leaderboard data found yet.")
 
-    text = "🏆 **Top Renamers Leaderboard** 🏆\n\n"
-    for rank, (user_id, count) in enumerate(leaderboard, start=1):
-        try:
-            user = await client.get_users(user_id)
-            name = user.mention
-        except:
-            name = f"[User](tg://user?id={user_id})"
-        text += f"**{rank}.** {name} — `{count}` renames\n"
+        text = "🏆 **Top Renamers Leaderboard** 🏆\n\n"
+        for rank, (user_id, count) in enumerate(leaderboard, start=1):
+            try:
+                user = await client.get_users(user_id)
+                name = user.mention
+            except:
+                name = f"[User](tg://user?id={user_id})"
+            text += f"**{rank}.** {name} — `{count}` renames\n"
 
-    await query.message.edit(
-        text,
-        disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data="help")]
-        ])
-    )
+        await query.message.edit(
+            text,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data="help")]
+            ])
+        )
 
     elif data == "close":
         try:
             await query.message.delete()
-            await query.message.reply_to_message.delete()
-            await query.message.continue_propagation()
+            if query.message.reply_to_message:
+                await query.message.reply_to_message.delete()
         except:
-            await query.message.delete()
-            await query.message.continue_propagation()
+            pass
 
     elif data.startswith("sendAlert"):
-        user_id =(data.split("_")[1])
-        user_id = int(user_id.replace(' ' , ''))
+        user_id = int(data.split("_")[1].strip())
         reason = str(data.split("_")[2])
         try:
-            await client.send_message(user_id , f"<b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ʙʏ [ʀᴀʜᴜʟ](https://telegram.me/callownerbot)\nʀᴇᴀsᴏɴ : {reason}</b>")
+            await client.send_message(user_id, f"<b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ʙʏ [ʀᴀʜᴜʟ](https://telegram.me/callownerbot)\nʀᴇᴀsᴏɴ : {reason}</b>")
             await query.message.edit(f"<b>Aʟᴇʀᴛ sᴇɴᴛ ᴛᴏ <code>{user_id}</code>\nʀᴇᴀsᴏɴ : {reason}</b>")
         except Exception as e:
             await query.message.edit(f"<b>sʀʏ ɪ ɢᴏᴛ ᴛʜɪs ᴇʀʀᴏʀ : {e}</b>")
 
     elif data.startswith('noAlert'):
-        user_id =(data.split("_")[1])
-        user_id = int(user_id.replace(' ' , ''))
+        user_id = int(data.split("_")[1].strip())
         await query.message.edit(f"<b>Tʜᴇ ʙᴀɴ ᴏɴ <code>{user_id}</code> ᴡᴀs ᴇxᴇᴄᴜᴛᴇᴅ sɪʟᴇɴᴛʟʏ.</b>")
 
     elif data.startswith('sendUnbanAlert'):
-        user_id =(data.split("_")[1])
-        user_id = int(user_id.replace(' ' , ''))
+        user_id = int(data.split("_")[1].strip())
         try:
             unban_text = "<b>ʜᴜʀʀᴀʏ..ʏᴏᴜ ᴀʀᴇ ᴜɴʙᴀɴɴᴇᴅ ʙʏ [ʀᴀʜᴜʟ](https://telegram.me/callownerbot)</b>"
-            await client.send_message(user_id , unban_text)
+            await client.send_message(user_id, unban_text)
             await query.message.edit(f"<b>Uɴʙᴀɴɴᴇᴅ Aʟᴇʀᴛ sᴇɴᴛ ᴛᴏ <code>{user_id}</code>\nᴀʟᴇʀᴛ ᴛᴇxᴛ : {unban_text}</b>")
         except Exception as e:
             await query.message.edit(f"<b>sʀʏ ɪ ɢᴏᴛ ᴛʜɪs ᴇʀʀᴏʀ : {e}</b>")
 
     elif data.startswith('NoUnbanAlert'):
-        user_id =(data.split("_")[1])
-        user_id = int(user_id.replace(' ' , ''))
+        user_id = int(data.split("_")[1].strip())
         await query.message.edit(f"Tʜᴇ ᴜɴʙᴀɴ ᴏɴ <code>{user_id}</code> ᴡᴀs ᴇxᴇᴄᴜᴛᴇᴅ sɪʟᴇɴᴛʟʏ.")
 
 
-# ========== leaderboard system ==============#
+# ========== leaderboard command handler ==============#
 @Client.on_message(filters.command("leaderboard") & filters.private)
 async def leaderboard_handler(client, message):
     top_users = await jishubotz.get_leaderboard(limit=10)
-    
+
     if not top_users:
         return await message.reply("🏆 Leaderboard is currently empty.")
 
