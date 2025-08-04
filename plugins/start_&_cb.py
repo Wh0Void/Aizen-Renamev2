@@ -110,9 +110,9 @@ async def cb_handler(client, query: CallbackQuery):
         )
 
     elif data == "leaderboard":
-       leaderboard = await jishubotz.get_leaderboard()
-       if not leaderboard:
-         return await query.message.edit("🏆 No leaderboard data found yet.")
+    leaderboard = await jishubotz.get_leaderboard()
+    if not leaderboard:
+        return await query.message.edit("🏆 No leaderboard data found yet.")
 
     text = "🏆 **Top Renamers Leaderboard** 🏆\n\n"
     for rank, (user_id, count) in enumerate(leaderboard, start=1):
