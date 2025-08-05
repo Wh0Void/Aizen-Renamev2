@@ -131,11 +131,11 @@ jishubotz = Database(Config.DB_URL, Config.DB_NAME)
 # ======================= Rename Count & Leaderboard ======================== #
 
     # Increment rename count
-async def increment_rename_count(user_id):
-    async with aiosqlite.connect("YourDatabase.db") as db:
-        await db.execute("INSERT OR IGNORE INTO users (id, rename_count) VALUES (?, ?)", (user_id, 0))
-        await db.execute("UPDATE users SET rename_count = rename_count + 1 WHERE id = ?", (user_id,))
-        await db.commit()
+async def increase_rename_count(user_id):
+    user = await db.users.find_one({"_id": user_id})
+    if user:
+        count = user.get("rename_count", 0) + 1
+        await db.users.update_one({"_id": user_id}, {"$set": {"rename_count": count}})
 
 # Get leaderboard
 async def get_leaderboard(limit=10):
