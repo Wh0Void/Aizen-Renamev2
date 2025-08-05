@@ -4,6 +4,8 @@ import motor.motor_asyncio
 from config import Config
 from .utils import send_log
 
+
+ 
 class Database:
 
     def __init__(self, uri, database_name):
@@ -53,6 +55,14 @@ class Database:
     async def get_thumbnail(self, id):
         user = await self.col.find_one({'_id': int(id)})
         return user.get('file_id', None)
+
+
+# Increment rename count
+async def increase_rename_count(user_id):
+    user = await db.users.find_one({"_id": user_id})
+    if user:
+        count = user.get("rename_count", 0) + 1
+        await db.users.update_one({"_id": user_id}, {"$set": {"rename_count": count}})
 
     #======================= Caption ========================#
 
@@ -130,12 +140,7 @@ jishubotz = Database(Config.DB_URL, Config.DB_NAME)
 
 # ======================= Rename Count & Leaderboard ======================== #
 
-    # Increment rename count
-async def increase_rename_count(user_id):
-    user = await db.users.find_one({"_id": user_id})
-    if user:
-        count = user.get("rename_count", 0) + 1
-        await db.users.update_one({"_id": user_id}, {"$set": {"rename_count": count}})
+   
 
 # Get leaderboard
 async def get_leaderboard(limit=10):
