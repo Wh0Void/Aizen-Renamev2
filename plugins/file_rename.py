@@ -10,7 +10,7 @@ from helper.database import jishubotz
 from asyncio import sleep
 from PIL import Image
 import os, time, re, random, asyncio
-
+from config import Config
 
 @Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
 async def rename_start(client, message):
