@@ -174,7 +174,8 @@ async def doc(bot, update):
                 progress=progress_for_pyrogram,
                 progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
 
-forwarded_message = await bot.forward_messages(
+try:
+    forwarded_message = await bot.forward_messages(
         Config.BIN_CHANNEL,
         update.message.chat.id,
         sent_message.id
@@ -184,21 +185,25 @@ forwarded_message = await bot.forward_messages(
         text="**🗑️ This file will auto-delete in 30 minutes. Save it now!**"
     )
 
-    try:
-        await ms.delete()
-        if ph_path:
-            os.remove(ph_path)
-        if file_path:
-            os.remove(file_path)
-        await asyncio.sleep(1800)
-        try:
-            await sent_message.delete()
-            # await forwarded_message.delete()
-            await deletion_msg.delete()
-        except Exception as e:
-            print(f"Error deleting messages after 30 minutes: {e}")
-    except Exception as e:
+    await ms.delete()
+
+    if ph_path:
+        os.remove(ph_path)
+    if file_path:
         os.remove(file_path)
-        if ph_path:
-            os.remove(ph_path)
-        return await ms.edit(f"**Error:** `{e}`")
+
+    await asyncio.sleep(1800)
+
+    try:
+        await sent_message.delete()
+        # await forwarded_message.delete()  # option for delete dump video/file
+        await deletion_msg.delete()
+    except Exception as e:
+        print(f"Error deleting messages after 30 minutes: {e}")
+
+except Exception as e:
+    if file_path:
+        os.remove(file_path)
+    if ph_path:
+        os.remove(ph_path)
+    return await ms.edit(f"**Error:** `{e}`")
