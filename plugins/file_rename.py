@@ -9,21 +9,15 @@ from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_
 from helper.database import jishubotz
 from asyncio import sleep
 from PIL import Image
-from config import Config
 import os, time, re, random, asyncio
 
 
 @Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
 async def rename_start(client, message):
     file = getattr(message, message.media.value)
-    filename = file.file_name
-    ban_chk = await jishubotz.is_banned(int(message.from_user.id))
-    if ban_chk:
-        return await message.reply(
-            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CallOwnerBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
-        )
+    filename = file.file_name  
     if file.file_size > 2000 * 1024 * 1024:
-        return await message.reply_text("Sorry, this bot doesn't support files larger than 2GB.")
+         return await message.reply_text("Sorry Bro This Bot Doesn't Support Uploading Files Bigger Than 2GB", quote=True)
 
     try:
         await message.reply_text(
@@ -39,11 +33,10 @@ async def rename_start(client, message):
             reply_to_message_id=message.id,  
             reply_markup=ForceReply(True)
         )
-    except Exception as e:
-        print(f"Error in rename_start: {e}")
+    except:
+        pass
 
-    await asyncio.sleep(600)
-    await message.delete()
+
 
 @Client.on_message(filters.private & filters.reply)
 async def refunc(client, message):
@@ -62,22 +55,26 @@ async def refunc(client, message):
             new_name = new_name + "." + extn
         await reply_message.delete()
 
-        button = [[InlineKeyboardButton("📁 Document", callback_data="upload_document")]]
+        button = [[InlineKeyboardButton("📁 Document",callback_data = "upload_document")]]
         if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
-            button.append([InlineKeyboardButton("🎥 Video", callback_data="upload_video")])
+            button.append([InlineKeyboardButton("🎥 Video", callback_data = "upload_video")])
         elif file.media == MessageMediaType.AUDIO:
-            button.append([InlineKeyboardButton("🎵 Audio", callback_data="upload_audio")])
+            button.append([InlineKeyboardButton("🎵 Audio", callback_data = "upload_audio")])
         await message.reply(
             text=f"**Select The Output File Type**\n\n**File Name :-** `{new_name}`",
             reply_to_message_id=file.id,
             reply_markup=InlineKeyboardMarkup(button)
         )
 
+
+
 @Client.on_callback_query(filters.regex("upload"))
 async def doc(bot, update):    
+    # Creating Directory for Metadata
     if not os.path.isdir("Metadata"):
         os.mkdir("Metadata")
-        
+
+    # Extracting necessary information    
     prefix = await jishubotz.get_prefix(update.message.chat.id)
     suffix = await jishubotz.get_suffix(update.message.chat.id)
     new_name = update.message.text
@@ -86,29 +83,21 @@ async def doc(bot, update):
     try:
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
-        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`")
-    
+        return await update.message.edit(f"Something Went Wrong Can't Able To Set Prefix Or Suffix 🥺 \n\n**Contact My Creator :** @CallAdminRobot\n\n**Error :** `{e}`")
+
     file_path = f"downloads/{update.from_user.id}/{new_filename}"
     file = update.message.reply_to_message
 
+    ms = await update.message.edit("🚀 Try To Download...  ⚡")    
     try:
-        if update.message.text != "🚀 Try To Download...  ⚡":
-            ms = await update.message.edit("🚀 Try To Download...  ⚡")
+             path = await bot.download_media(message=file, file_name=file_path, progress=progress_for_pyrogram,progress_args=("🚀 Try To Downloading...  ⚡", ms, time.time()))                    
     except Exception as e:
-        print(f"Error editing message: {e}")
-    
-    try:
-        path = await bot.download_media(
-            message=file, 
-            file_name=file_path, 
-            progress=progress_for_pyrogram, 
-            progress_args=("🚀 Downloading...  ⚡", ms, time.time())
-        )                    
-    except Exception as e:
-        return await ms.edit(e)
+             return await ms.edit(e)
 
+
+    # Metadata Adding Code
     _bool_metadata = await jishubotz.get_metadata(update.message.chat.id) 
-    
+
     if _bool_metadata:
         metadata = await jishubotz.get_metadata_code(update.message.chat.id)
         metadata_path = f"Metadata/{new_filename}"
@@ -121,102 +110,66 @@ async def doc(bot, update):
         parser = createParser(file_path)
         metadata = extractMetadata(parser)
         if metadata.has("duration"):
-            duration = metadata.get('duration').seconds
+           duration = metadata.get('duration').seconds
         parser.close()   
     except:
         pass
-        
+
     ph_path = None
     user_id = int(update.message.chat.id) 
-    user_name = update.message.chat.first_name
     media = getattr(file, file.media.value)
     c_caption = await jishubotz.get_caption(update.message.chat.id)
     c_thumb = await jishubotz.get_thumbnail(update.message.chat.id)
 
     if c_caption:
-        try:
-            caption = c_caption.format(filename=new_filename, filesize=humanbytes(media.file_size), duration=convert(duration))
-        except Exception as e:
-            return await ms.edit(text=f"Your Caption Error: ({e})")             
+         try:
+             caption = c_caption.format(filename=new_filename, filesize=humanbytes(media.file_size), duration=convert(duration))
+         except Exception as e:
+             return await ms.edit(text=f"Your Caption Error Except Keyword Argument : ({e})")             
     else:
-        caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
+         caption = f"**{new_filename}**"
 
     if (media.thumbs or c_thumb):
-        if c_thumb:
-            ph_path = await bot.download_media(c_thumb)
-            width, height, ph_path = await fix_thumb(ph_path)
-        else:
-            try:
-                ph_path_ = await take_screen_shot(file_path, os.path.dirname(os.path.abspath(file_path)), random.randint(0, duration - 1))
-                width, height, ph_path = await fix_thumb(ph_path_)
-            except Exception as e:
-                ph_path = None
-                print(e)  
+         if c_thumb:
+             ph_path = await bot.download_media(c_thumb)
+             width, height, ph_path = await fix_thumb(ph_path)
+         else:
+             try:
+                 ph_path_ = await take_screen_shot(file_path, os.path.dirname(os.path.abspath(file_path)), random.randint(0, duration - 1))
+                 width, height, ph_path = await fix_thumb(ph_path_)
+             except Exception as e:
+                 ph_path = None
+                 print(e)  
 
-    try:
-        if update.message.text != "💠 Try To Upload...  ⚡":
-            await ms.edit("💠 Try To Upload...  ⚡")
-    except Exception as e:
-        print(f"Error editing message: {e}")
-    
+
+    await ms.edit("💠 Try To Upload...  ⚡")
     type = update.data.split("_")[1]
     try:
         if type == "document":
-            sent_message = await bot.send_document(
+            await bot.send_document(
                 update.message.chat.id,
                 document=metadata_path if _bool_metadata else file_path,
                 thumb=ph_path, 
                 caption=caption, 
                 progress=progress_for_pyrogram,
-                progress_args=("💠 Uploading...  ⚡", ms, time.time())
-            )
+                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
+
         elif type == "video": 
-            sent_message = await bot.send_video(
+            await bot.send_video(
                 update.message.chat.id,
                 video=metadata_path if _bool_metadata else file_path,
                 caption=caption,
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=("💠 Uploading...  ⚡", ms, time.time())
-            )
+                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
+
         elif type == "audio": 
-            sent_message = await bot.send_audio(
+            await bot.send_audio(
                 update.message.chat.id,
                 audio=metadata_path if _bool_metadata else file_path,
                 caption=caption,
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=("💠 Uploading...  ⚡", ms, time.time())
-            )
-
-        forwarded_message = await bot.forward_messages(
-            Config.BIN_CHANNEL, 
-            update.message.chat.id, 
-            sent_message.id
-        )
-
-        deletion_msg = await sent_message.reply(
-            text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
-        )
-
-    except Exception as e:          
-        os.remove(file_path)
-        if ph_path:
-            os.remove(ph_path)
-        return await ms.edit(f"**Error:** `{e}`")    
-
-    await ms.delete() 
-    if ph_path:
-        os.remove(ph_path)
-    if file_path:
-        os.remove(file_path)
-
-    await asyncio.sleep(1800)
-    try:
-        await sent_message.delete()
-       # await forwarded_message.delete()
-        await deletion_msg.delete()
-    except Exception as e:
-        print(f"Error deleting messages after 30 minutes: {e}")
+                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
