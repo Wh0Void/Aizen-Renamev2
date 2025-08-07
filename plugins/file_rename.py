@@ -55,16 +55,16 @@ async def refunc(client, message):
         await reply_message.delete()
 
         button = [[
-    InlineKeyboardButton("📁 Document", callback_data=f"rename|document|{file.id}|{new_name}")
+    InlineKeyboardButton("📁 Document", callback_data=f"rename|document|{new_name}")
 ]]
 
 if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
     button.append([
-        InlineKeyboardButton("🎥 Video", callback_data=f"rename|video|{file.id}|{new_name}")
+        InlineKeyboardButton("🎥 Video", callback_data=f"rename|video|{new_name}")
     ])
 elif file.media == MessageMediaType.AUDIO:
     button.append([
-        InlineKeyboardButton("🎵 Audio", callback_data=f"rename|audio|{file.id}|{new_name}")
+        InlineKeyboardButton("🎵 Audio", callback_data=f"rename|audio|{new_name}")
     ])
 
 
