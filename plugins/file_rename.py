@@ -173,3 +173,32 @@ async def doc(bot, update):
                 duration=duration,
                 progress=progress_for_pyrogram,
                 progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
+
+forwarded_message = await bot.forward_messages(
+        Config.BIN_CHANNEL,
+        update.message.chat.id,
+        sent_message.id
+    )
+
+    deletion_msg = await sent_message.reply(
+        text="**🗑️ This file will auto-delete in 30 minutes. Save it now!**"
+    )
+
+    try:
+        await ms.delete()
+        if ph_path:
+            os.remove(ph_path)
+        if file_path:
+            os.remove(file_path)
+        await asyncio.sleep(1800)
+        try:
+            await sent_message.delete()
+            # await forwarded_message.delete()
+            await deletion_msg.delete()
+        except Exception as e:
+            print(f"Error deleting messages after 30 minutes: {e}")
+    except Exception as e:
+        os.remove(file_path)
+        if ph_path:
+            os.remove(ph_path)
+        return await ms.edit(f"**Error:** `{e}`")
