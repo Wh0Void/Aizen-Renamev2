@@ -20,7 +20,7 @@ async def rename_start(client, message):
     ban_chk = await jishubotz.is_banned(int(message.from_user.id))
     if ban_chk:
         return await message.reply(
-            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CallOwnerBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
+            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
         )
     if file.file_size > 2000 * 1024 * 1024:
         return await message.reply_text("Sorry, this bot doesn't support files larger than 2GB.")
@@ -198,7 +198,7 @@ async def doc(bot, update):
         )
 
         deletion_msg = await sent_message.reply(
-            text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
+            text="**🗑 This file will auto-delete in 25 minutes. Save it now!**",
         )
 
     except Exception as e:          
@@ -213,10 +213,10 @@ async def doc(bot, update):
     if file_path:
         os.remove(file_path)
 
-    await asyncio.sleep(1800)
+    await asyncio.sleep(1500)
     try:
         await sent_message.delete()
-        await forwarded_message.delete()
+       # await forwarded_message.delete()
         await deletion_msg.delete()
     except Exception as e:
-        print(f"Error deleting messages after 30 minutes: {e}")
+        print(f"Error deleting messages after 25 minutes: {e}")
