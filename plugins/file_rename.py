@@ -3,22 +3,35 @@ from pyrogram.enums import MessageMediaType
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
 from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
+from hachoir.parser import createParser
 from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
 from helper.database import jishubotz
 from asyncio import sleep
 from PIL import Image
-import os, time, re, random, asyncio
 from config import Config
+from .fsub import *
+import os, time, re, random, asyncio
+from .maintenance import get_maintenance
 
-@Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
+def clean_filename(name):
+    name = name.strip()
+    return re.sub(r'[\\/*?:"<>|]', "_", name)  # replaces Windows/UNIX illegal chars
+
+@Client.on_message(filters.private & (filters.document | filters.video))
 async def rename_start(client, message):
+    if await get_maintenance() and message.from_user.id != Config.ADMIN:
+        return await message.reply_text("**🛠️ Bot is Under Maintenance**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Support", user_id=int(Config.ADMIN))]]))
     file = getattr(message, message.media.value)
-    filename = file.file_name  
+    filename = file.file_name
+    ban_chk = await jishubotz.is_banned(int(message.from_user.id))
+    if ban_chk:
+        return await message.reply(
+            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CallOwnerBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
+        )
+    if Config.IS_FSUB and not await get_fsub(client, message):return
     if file.file_size > 2000 * 1024 * 1024:
          return await message.reply_text("Sorry Bro This Bot Doesn't Support Uploading Files Bigger Than 2GB", quote=True)
-
     try:
         await message.reply_text(
             text=f"**Please Enter New Filename...**\n\n**Old File Name** :- `{filename}`",
@@ -33,9 +46,11 @@ async def rename_start(client, message):
             reply_to_message_id=message.id,  
             reply_markup=ForceReply(True)
         )
-    except:
-        pass
+    except Exception as e:
+        print(f"Error in rename_start: {e}")
 
+    await asyncio.sleep(600)
+    await message.delete()
 
 @Client.on_message(filters.private & filters.reply)
 async def refunc(client, message):
@@ -46,55 +61,56 @@ async def refunc(client, message):
         msg = await client.get_messages(message.chat.id, reply_message.id)
         file = msg.reply_to_message
         media = getattr(file, file.media.value)
-        if not "." in new_name:
-            if "." in media.file_name:
+        if "." not in new_name:
+            if media.file_name and "." in media.file_name:
                 extn = media.file_name.rsplit('.', 1)[-1]
             else:
                 extn = "mkv"
             new_name = new_name + "." + extn
         await reply_message.delete()
-
-        button = [[
-    InlineKeyboardButton("📁 Document", callback_data=f"rename|document|{new_name}")
-]]
-
-if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
-    button.append([
-        InlineKeyboardButton("🎥 Video", callback_data=f"rename|video|{new_name}")
-    ])
-elif file.media == MessageMediaType.AUDIO:
-    button.append([
-        InlineKeyboardButton("🎵 Audio", callback_data=f"rename|audio|{new_name}")
-    ])
-
+        button = [[InlineKeyboardButton("📁 Document", callback_data="upload_document")]]
+        if file.media in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
+            button.append([InlineKeyboardButton("🎥 Video", callback_data="upload_video")])
+        await message.reply(
+            text=f"**Select The Output File Type**\n\n**File Name :-** `{new_name}`",
+            reply_to_message_id=file.id,
+            reply_markup=InlineKeyboardMarkup(button)
+        )
 
 @Client.on_callback_query(filters.regex("upload"))
 async def doc(bot, update):    
-    # Creating Directory for Metadata
     if not os.path.isdir("Metadata"):
         os.mkdir("Metadata")
 
-    # Extracting necessary information    
     prefix = await jishubotz.get_prefix(update.message.chat.id)
     suffix = await jishubotz.get_suffix(update.message.chat.id)
     new_name = update.message.text
-    new_filename_ = new_name.split(":-")[1]
+    new_filename_ = clean_filename(new_name.split(":-")[1])
 
     try:
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
-        return await update.message.edit(f"Something Went Wrong Can't Able To Set Prefix Or Suffix 🥺 \n\n**Contact My Creator :** @CallAdminRobot\n\n**Error :** `{e}`")
+        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`")
 
     file_path = f"downloads/{update.from_user.id}/{new_filename}"
     file = update.message.reply_to_message
 
-    ms = await update.message.edit("🚀 Try To Download...  ⚡")    
     try:
-        path = await bot.download_media(message=file, file_name=file_path, progress=progress_for_pyrogram, progress_args=("🚀 Try To Downloading...  ⚡", ms, time.time()))                    
+        if update.message.text != "🚀 Try To Download...  ⚡":
+            ms = await update.message.edit("🚀 Try To Download...  ⚡")
+    except Exception as e:
+        print(f"Error editing message: {e}")
+
+    try:
+        path = await bot.download_media(
+            message=file, 
+            file_name=file_path, 
+            progress=progress_for_pyrogram, 
+            progress_args=("🚀 Downloading...  ⚡", ms, time.time())
+        )                    
     except Exception as e:
         return await ms.edit(e)
 
-    # Metadata Adding Code
     _bool_metadata = await jishubotz.get_metadata(update.message.chat.id) 
 
     if _bool_metadata:
@@ -116,6 +132,7 @@ async def doc(bot, update):
 
     ph_path = None
     user_id = int(update.message.chat.id) 
+    user_name = update.message.chat.first_name
     media = getattr(file, file.media.value)
     c_caption = await jishubotz.get_caption(update.message.chat.id)
     c_thumb = await jishubotz.get_thumbnail(update.message.chat.id)
@@ -124,9 +141,9 @@ async def doc(bot, update):
         try:
             caption = c_caption.format(filename=new_filename, filesize=humanbytes(media.file_size), duration=convert(duration))
         except Exception as e:
-            return await ms.edit(text=f"Your Caption Error Except Keyword Argument : ({e})")             
+            return await ms.edit(text=f"Your Caption Error: ({e})")             
     else:
-        caption = f"**{new_filename}**"
+        caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
 
     if (media.thumbs or c_thumb):
         if c_thumb:
@@ -140,8 +157,14 @@ async def doc(bot, update):
                 ph_path = None
                 print(e)  
 
-    await ms.edit("💠 Try To Upload...  ⚡")
+    try:
+        if update.message.text != "💠 Try To Upload...  ⚡":
+            await ms.edit("💠 Try To Upload...  ⚡")
+    except Exception as e:
+        print(f"Error editing message: {e}")
+
     type = update.data.split("_")[1]
+    close_button = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Close", callback_data="close")]])
     try:
         if type == "document":
             sent_message = await bot.send_document(
@@ -150,8 +173,9 @@ async def doc(bot, update):
                 thumb=ph_path, 
                 caption=caption, 
                 progress=progress_for_pyrogram,
-                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
-
+                progress_args=("💠 Uploading...  ⚡", ms, time.time()),
+                reply_markup=close_button
+            )
         elif type == "video": 
             sent_message = await bot.send_video(
                 update.message.chat.id,
@@ -160,52 +184,37 @@ async def doc(bot, update):
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
-
-        elif type == "audio": 
-            sent_message = await bot.send_audio(
-                update.message.chat.id,
-                audio=metadata_path if _bool_metadata else file_path,
-                caption=caption,
-                thumb=ph_path,
-                duration=duration,
-                progress=progress_for_pyrogram,
-                progress_args=("💠 Try To Uploading...  ⚡", ms, time.time()))
-
-        # ✅ Dump and Auto-delete logic safely here
-        try:
-            forwarded_message = await bot.forward_messages(
-                Config.BIN_CHANNEL,
-                update.message.chat.id,
-                sent_message.id
+                progress_args=("💠 Uploading...  ⚡", ms, time.time()),
+                reply_markup=close_button
             )
 
-            deletion_msg = await sent_message.reply(
-                text="**🗑️ This file will auto-delete in 30 minutes. Save it now!**"
-            )
+        deletion_msg = await sent_message.reply(
+            text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
+        )
 
-            await ms.delete()
+        bin = await bot.copy_message(
+            chat_id=Config.BIN_CHANNEL,
+            from_chat_id=update.message.chat.id,
+            message_id=sent_message.id,
+            reply_markup=close_button
+        )
 
-            if ph_path:
-                os.remove(ph_path)
-            if file_path:
-                os.remove(file_path)
+    except Exception as e:          
+        os.remove(file_path)
+        if ph_path:
+            os.remove(ph_path)
+        return await ms.edit(f"**Error:** `{e}`")    
 
-            await asyncio.sleep(1800)
+    await ms.delete() 
+    if ph_path:
+        os.remove(ph_path)
+    if file_path:
+        os.remove(file_path)
 
-            try:
-                await sent_message.delete()
-                # await forwarded_message.delete()
-                await deletion_msg.delete()
-            except Exception as e:
-                print(f"Error deleting messages after 30 minutes: {e}")
-
-        except Exception as e:
-            if file_path:
-                os.remove(file_path)
-            if ph_path:
-                os.remove(ph_path)
-            return await ms.edit(f"**Error:** `{e}`")
-
+    await asyncio.sleep(1800)
+    try:
+        await sent_message.delete()
+      #  await bin.delete()
+        await deletion_msg.delete()
     except Exception as e:
-        return await ms.edit(f"⚠️ Upload Failed: `{e}`")
+        print(f"Error deleting messages after 30 minutes: {e}")
