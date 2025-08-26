@@ -4,6 +4,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceRepl
 from helper.database import jishubotz
 from config import Config, Txt  
 from pyrogram.enums import ParseMode
+import html
 
 @Client.on_message(filters.private & filters.command("start"))
 async def start(client: Client, message: Message):
@@ -19,14 +20,14 @@ async def start(client: Client, message: Message):
             photo=Config.START_PIC, 
             caption=Txt.START_TXT.format(user.mention), 
             reply_markup=button,
-            parse_mode="HTML"  # Enable MarkdownV2 for blockquotes
+            parse_mode="html"  # Enable MarkdownV2 for blockquotes
         )       
     else:
         await message.reply_text(
             text=Txt.START_TXT.format(user.mention), 
             reply_markup=button, 
             disable_web_page_preview=True,
-            parse_mode="HTML"  # Enable MarkdownV2 for blockquotes
+            parse_mode="html"  # Enable MarkdownV2 for blockquotes
         )
     
     # Send sticker after photo/text and caption
