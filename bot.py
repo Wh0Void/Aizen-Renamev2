@@ -27,14 +27,18 @@ class Bot(Client):
         )
 
     async def start(self):
+        # Initialize pyromod listeners to prevent KeyError
+        if 'message' not in self.listeners:
+            self.listeners['message'] = []
+        if 'callback_query' not in self.listeners:
+            self.listeners['callback_query'] = []
+        print(f"Initial listeners: {self.listeners}")
+
         await super().start()
         me = await self.get_me()
         self.mention = me.mention
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
-
-        # Log listeners for debugging pyromod KeyError
-        print(f"Initial listeners: {self.listeners}")
 
         # Initialize file rename plugin
         try:
