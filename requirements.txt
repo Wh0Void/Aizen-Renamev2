@@ -1,4 +1,4 @@
-pyrofork
+# pyrofork
 pyromod
 TgCrypto
 motor
@@ -10,6 +10,6 @@ pytz
 Flask
 gunicorn
 aiohttp
-# pyrogram
+ pyrogram
 pymongo
 requests
