@@ -8,7 +8,6 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
-from pyromod.listen import ListenerTypes  # Add this import
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
@@ -28,19 +27,20 @@ class Bot(Client):
         )
 
     async def start(self):
-        # Initialize pyromod listeners
-        self.setup_listeners()
-
         await super().start()
         me = await self.get_me()
         self.mention = me.mention
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
 
+        # Log listeners for debugging
+        print(f"Initial listeners: {self.listeners}")
+
         # Initialize file rename plugin
         try:
             from plugins import file_rename
             file_rename.init(self)
+ সম
             print("✅ File rename plugin initialized")
         except Exception as e:
             print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
@@ -70,14 +70,6 @@ class Bot(Client):
                 await self.send_message(Config.LOG_CHANNEL, f"**{me.mention} Is Restarted !!**\n\n📅 Date : `{date}`\n⏰ Time : `{time}`\n🌐 Timezone : `Asia/Kolkata`\n\n🉐 Version : `v{__version__} (Layer {layer})`</b>")                                
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
-
-    def setup_listeners(self):
-        # Initialize pyromod listeners to prevent KeyError
-        if ListenerTypes.MESSAGE not in self.listeners:
-            self.listeners[ListenerTypes.MESSAGE] = []
-        if ListenerTypes.CALLBACK_QUERY not in self.listeners:
-            self.listeners[ListenerTypes.CALLBACK_QUERY] = []
-        print("✅ pyromod listeners initialized")
 
     async def stop(self):
         await super().stop()
