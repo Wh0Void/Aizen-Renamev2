@@ -58,9 +58,7 @@ class Txt(object):
 Renaming or sharing <u>adult content</u> is <b>strictly prohibited</b>.  
 Violation will lead to an <b>immediate and permanent ban</b>.
 
-<blockquote>
-<b>✨ Stay safe, stay creative, and enjoy the bot!</b>
-</blockquote>
+<blockquote><b>✨ Stay safe, stay creative, and enjoy the bot!</b></blockquote>
 """
 
     ABOUT_TXT = """
