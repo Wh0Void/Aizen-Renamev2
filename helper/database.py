@@ -4,10 +4,7 @@ import motor.motor_asyncio
 from config import Config
 from .utils import send_log
 
-
- 
 class Database:
-
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.jishubotz = self._client[database_name]
@@ -22,7 +19,8 @@ class Database:
             prefix=None,
             suffix=None,
             metadata=False,
-            metadata_code="By :- @TechifyBots"
+            metadata_code="By :- @TechifyBots",
+            rename_count=0  # Added for rename count tracking
         )
 
     async def add_user(self, b, m):
@@ -55,14 +53,6 @@ class Database:
     async def get_thumbnail(self, id):
         user = await self.col.find_one({'_id': int(id)})
         return user.get('file_id', None)
-
-
-# Increment rename count
-async def increase_rename_count(user_id):
-    user = await db.users.find_one({"_id": user_id})
-    if user:
-        count = user.get("rename_count", 0) + 1
-        await db.users.update_one({"_id": user_id}, {"$set": {"rename_count": count}})
 
     #======================= Caption ========================#
 
@@ -122,7 +112,7 @@ async def increase_rename_count(user_id):
     async def is_banned(self, user_id):
         user = await self.bannedList.find_one({'banId': int(user_id)})
         return True if user else False
-    
+
     async def is_unbanned(self, user_id):
         try: 
             if await self.bannedList.find_one({'banId': int(user_id)}):
@@ -131,20 +121,25 @@ async def increase_rename_count(user_id):
             else:
                 return False
         except Exception as e:
-            e = f'Fᴀɪʟᴇᴅ ᴛᴏ ᴜɴʙᴀɴ.Rᴇᴀsᴏɴ : {e}'
+            e = f'Failed to unban. Reason: {e}'
             print(e)
             return e
 
+    #======================= Rename Count ========================#
+
+    async def increase_rename_count(self, user_id):
+        user = await self.col.find_one({'_id': int(user_id)})
+        if user:
+            count = user.get('rename_count', 0) + 1
+            await self.col.update_one({'_id': int(user_id)}, {'$set': {'rename_count': count}})
+            return count
+        return 0
+
+    #======================= Leaderboard ========================#
+
+    async def get_leaderboard(self, limit=10):
+        users = self.col.find({}).sort('rename_count', -1).limit(limit)
+        return [(user['_id'], user.get('rename_count', 0)) async for user in users]
+
 # Create a Database instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
-
-# ======================= Rename Count & Leaderboard ======================== #
-
-   
-
-# Get leaderboard
-async def get_leaderboard(limit=10):
-    async with aiosqlite.connect("YourDatabase.db") as db:
-        cursor = await db.execute("SELECT id, rename_count FROM users ORDER BY rename_count DESC LIMIT ?", (limit,))
-        rows = await cursor.fetchall()
-        return rows
