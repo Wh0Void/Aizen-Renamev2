@@ -33,14 +33,13 @@ class Bot(Client):
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
 
-        # Log listeners for debugging
+        # Log listeners for debugging pyromod KeyError
         print(f"Initial listeners: {self.listeners}")
 
         # Initialize file rename plugin
         try:
             from plugins import file_rename
             file_rename.init(self)
- সম
             print("✅ File rename plugin initialized")
         except Exception as e:
             print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
