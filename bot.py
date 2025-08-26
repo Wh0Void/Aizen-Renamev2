@@ -8,6 +8,7 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
+from pyromod.listen import ListenerTypes  # Add this import
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
@@ -27,12 +28,15 @@ class Bot(Client):
         )
 
     async def start(self):
+        # Initialize pyromod listeners
+        self.setup_listeners()
+
         await super().start()
         me = await self.get_me()
         self.mention = me.mention
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
-        
+
         # Initialize file rename plugin
         try:
             from plugins import file_rename
@@ -40,16 +44,16 @@ class Bot(Client):
             print("✅ File rename plugin initialized")
         except Exception as e:
             print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
-        
+
         if Config.WEBHOOK:
             app = web.AppRunner(await web_server())
             await app.setup()
             PORT = int(os.environ.get("PORT", 8000))  # Use port 8000 or env PORT
             await web.TCPSite(app, "0.0.0.0", PORT).start()
             print(f"🌐 Webhook server started on port {PORT}")
-            
+
         print(f"{me.first_name} Is Started.....✨️")
-        
+
         # Send startup message to admins
         for id in Config.ADMIN:
             try: 
@@ -67,12 +71,18 @@ class Bot(Client):
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
 
+    def setup_listeners(self):
+        # Initialize pyromod listeners to prevent KeyError
+        if ListenerTypes.MESSAGE not in self.listeners:
+            self.listeners[ListenerTypes.MESSAGE] = []
+        if ListenerTypes.CALLBACK_QUERY not in self.listeners:
+            self.listeners[ListenerTypes.CALLBACK_QUERY] = []
+        print("✅ pyromod listeners initialized")
+
     async def stop(self):
         await super().stop()
         print(f"{self.mention} is stopped.")
 
 
-# ✅ SIMPLE FIX: Use main guard to prevent circular import issues
 if __name__ == "__main__":
-    # Only run the bot if this file is executed directly
     Bot().run()
