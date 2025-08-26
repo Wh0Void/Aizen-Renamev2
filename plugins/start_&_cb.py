@@ -19,14 +19,14 @@ async def start(client: Client, message: Message):
             photo=Config.START_PIC, 
             caption=Txt.START_TXT.format(user.mention), 
             reply_markup=button,
-            parse_mode="MarkdownV2"  # Enable MarkdownV2 for blockquotes
+            parse_mode="HTML"  # Enable MarkdownV2 for blockquotes
         )       
     else:
         await message.reply_text(
             text=Txt.START_TXT.format(user.mention), 
             reply_markup=button, 
             disable_web_page_preview=True,
-            parse_mode="MarkdownV2"  # Enable MarkdownV2 for blockquotes
+            parse_mode="HTML"  # Enable MarkdownV2 for blockquotes
         )
     
     # Send sticker after photo/text and caption
