@@ -6,7 +6,7 @@ from config import Config, Txt
 from pyrogram.enums import ParseMode
 
 @Client.on_message(filters.private & filters.command("start"))
-async def start(client, message):
+async def start(client: Client, message: Message):
     user = message.from_user
     await jishubotz.add_user(client, message)                
     button = InlineKeyboardMarkup([
@@ -15,9 +15,25 @@ async def start(client, message):
         [InlineKeyboardButton("♻ ᴅᴇᴠᴇʟᴏᴘᴇʀ ♻", url='https://telegram.me/VoidXTora')]
     ])
     if Config.START_PIC:
-        await message.reply_photo(Config.START_PIC, caption=Txt.START_TXT.format(user.mention), reply_markup=button)       
+        await message.reply_photo(
+            photo=Config.START_PIC, 
+            caption=Txt.START_TXT.format(user.mention), 
+            reply_markup=button
+        )       
     else:
-        await message.reply_text(text=Txt.START_TXT.format(user.mention), reply_markup=button, disable_web_page_preview=True)
+        await message.reply_text(
+            text=Txt.START_TXT.format(user.mention), 
+            reply_markup=button, 
+            disable_web_page_preview=True
+        )
+    
+    # Send sticker after photo/text and caption
+    try:
+        await message.reply_sticker(Config.STICKER_ID)
+    except Exception as e:
+        print(f"Error sending sticker: {e}")  # Log error to console
+        # Optional: Notify user
+        # await message.reply("Could not send sticker.")
 
 
 @Client.on_callback_query()
