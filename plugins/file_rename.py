@@ -20,7 +20,7 @@ async def rename_start(client, message):
     ban_chk = await jishubotz.is_banned(int(message.from_user.id))
     if ban_chk:
         return await message.reply(
-            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CallOwnerBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
+            "**ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!**"
         )
     if file.file_size > 2000 * 1024 * 1024:
         return await message.reply_text("Sorry, this bot doesn't support files larger than 2GB.")
@@ -86,7 +86,7 @@ async def doc(bot, update):
     try:
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
-        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`")
+        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`\nᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!")
     
     file_path = f"downloads/{update.from_user.id}/{new_filename}"
     file = update.message.reply_to_message
