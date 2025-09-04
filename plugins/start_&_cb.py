@@ -164,7 +164,7 @@ async def cb_handler(client, query: CallbackQuery):
         user_id = int(data.split("_")[1].strip())
         reason = str(data.split("_")[2])
         try:
-            await client.send_message(user_id, f"<b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ʙʏ [ʀᴀʜᴜʟ](https://telegram.me/callownerbot)\nʀᴇᴀsᴏɴ : {reason}</b>")
+            await client.send_message(user_id, f"<b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ʙʏ [Sᴜᴘʀᴇᴍᴇ](https://telegram.me/PS_TalkBot)\nʀᴇᴀsᴏɴ : {reason}</b>")
             await query.message.edit(f"<b>Aʟᴇʀᴛ sᴇɴᴛ ᴛᴏ <code>{user_id}</code>\nʀᴇᴀsᴏɴ : {reason}</b>")
         except Exception as e:
             await query.message.edit(f"<b>sʀʏ ɪ ɢᴏᴛ ᴛʜɪs ᴇʀʀᴏʀ : {e}</b>")
