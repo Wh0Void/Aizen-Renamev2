@@ -11,7 +11,7 @@ from pyrogram.types import (
 )
 import re
 
-# Import the DB instance (your helper/database.py creates `jishubotz = Database(...)`)
+# DB instance (your helper/database.py should expose `jishubotz = Database(...)`)
 from helper.database import jishubotz
 
 # Optional banner image for the settings card (set DESTINATION_PIC_URL in config.py)
@@ -24,6 +24,7 @@ except Exception:
 CB_SET_DEST = "set_dest_channel"
 CB_CLEAR_DEST = "clear_dest_channel"
 CB_HELP_DEST = "dest_help"
+CB_CANCEL_SET = "cancel_set_dest"
 
 
 def _dest_kb(current: Optional[int]) -> InlineKeyboardMarkup:
@@ -67,19 +68,38 @@ async def cmd_setchannel(c: Client, m: Message):
     await _send_dest_card(c, m)
 
 
+# /cancelsetchannel command to clear waiting flag
+@Client.on_message(filters.command(["cancelsetchannel", "cancelsetdest"]) & filters.private)
+async def cmd_cancel_setchannel(c: Client, m: Message):
+    uid = m.from_user.id
+    await jishubotz.clear_waiting_for_channel(uid)
+    await m.reply_text("✅ Cancelled destination setup. You can use other commands now.")
+
+
 # User clicked "Set Destination Channel"
 @Client.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
 async def cb_set_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
     await jishubotz.set_waiting_for_channel(uid, True)
     await q.answer("Send me a forwarded post from your channel.", show_alert=False)
+
+    # show Cancel button so user can easily cancel waiting state
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL_SET)]])
     await q.message.reply_text(
         "➡️ <b>Step 1:</b> Forward any post from your <b>Destination Channel</b> here.\n"
         "➡️ <b>Step 2:</b> Make sure the bot is <b>Admin</b> in that channel.\n\n"
-        "💡 Tip: If forwarding hides channel info (anonymous forward), send the <code>@username</code> "
-        "or an invite link of the channel instead.",
+        "💡 If forwarding hides channel info, send the <code>@username</code> or invite link instead.",
         quote=True,
+        reply_markup=cancel_kb
     )
+
+
+@Client.on_callback_query(filters.regex(f"^{CB_CANCEL_SET}$"))
+async def cb_cancel_set(c: Client, q: CallbackQuery):
+    uid = q.from_user.id
+    await jishubotz.clear_waiting_for_channel(uid)
+    await q.answer("Setup cancelled.", show_alert=False)
+    await q.message.edit_text("❌ Destination setup cancelled.")
 
 
 @Client.on_callback_query(filters.regex(f"^{CB_CLEAR_DEST}$"))
@@ -97,10 +117,10 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
     await q.message.reply_text(
         "❓ <b>How it works</b>\n\n"
         "1) Tap <b>Set Destination Channel</b>.\n"
-        "2) Forward any post from your target channel to the bot here, or send its @username / invite link.\n"
-        "3) Make sure the bot is <b>Admin</b> in that channel with permission to post.\n"
+        "2) Forward any post from your target channel or send @username / invite link.\n"
+        "3) Make sure the bot is <b>Admin</b> in that channel.\n"
         "4) After each rename, the bot will also copy the file to that channel.\n\n"
-        "🔐 Private channel? Add the bot as admin first.",
+        "Use /cancelsetchannel to stop the waiting state anytime.",
     )
 
 
@@ -108,17 +128,22 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
 @Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
+
+    # If user is not currently setting a destination -> do nothing here (let other handlers run)
     if not await jishubotz.is_waiting_for_channel(uid):
-        return  # not setting right now
+        return
+
+    # IMPORTANT: ignore commands so other command handlers still work
+    if m.text and m.text.startswith("/"):
+        return
 
     channel_id, reason = await _extract_channel_id(c, m)
     if channel_id is None:
-        # keep waiting state — user can try again or press clear
+        # keep waiting state — user can try again or press cancel
         await m.reply_text(
             "⚠️ I couldn't detect a channel from that.\n\n"
-            "• Please forward a post from your channel (with channel info visible),\n"
-            "  or send its <code>@username</code> / invite link.\n"
-            f"Details: {reason or 'unknown'}"
+            "• Forward a post from your channel (with channel info visible), or send its <code>@username</code> / invite link.\n"
+            f"Details: {reason or 'unknown'}\n\nUse /cancelsetchannel to cancel."
         )
         return
 
@@ -127,7 +152,7 @@ async def handle_forward_or_text_while_waiting(c: Client, m: Message):
         await m.reply_text(
             "🚫 I don't have permission to post in that channel.\n"
             "Please add me as <b>Admin</b> and try again.\n\n"
-            f"Details: {why}"
+            f"Details: {why}\n\nUse /cancelsetchannel to cancel."
         )
         return
 
@@ -140,13 +165,6 @@ async def handle_forward_or_text_while_waiting(c: Client, m: Message):
 
 
 async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Try different ways to find a channel ID:
-      - forwarded message (forward_from_chat)
-      - sender_chat
-      - @username or t.me/username or t.me/+invite
-      - raw numeric -100... id
-    """
     try:
         if getattr(m, "forward_from_chat", None) and m.forward_from_chat.type == enums.ChatType.CHANNEL:
             return m.forward_from_chat.id, None
