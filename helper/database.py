@@ -1,5 +1,3 @@
-# helper/database.py
-
 import motor.motor_asyncio
 from config import Config
 from .utils import send_log
@@ -20,7 +18,9 @@ class Database:
             suffix=None,
             metadata=False,
             metadata_code="By :- @TechifyBots",
-            rename_count=0  # Added for rename count tracking
+            rename_count=0,  # Rename count tracking
+            destination_channel=None,  # New field for Destination Channel
+            waiting_for_channel=False  # State flag while setting Destination
         )
 
     async def add_user(self, b, m):
@@ -140,6 +140,43 @@ class Database:
     async def get_leaderboard(self, limit=10):
         users = self.col.find({}).sort('rename_count', -1).limit(limit)
         return [(user['_id'], user.get('rename_count', 0)) async for user in users]
+
+    #======================= Destination Channel ========================#
+
+    async def set_waiting_for_channel(self, user_id, value: bool):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"waiting_for_channel": bool(value)}},
+            upsert=True
+        )
+
+    async def is_waiting_for_channel(self, user_id):
+        user = await self.col.find_one({'_id': int(user_id)}, {"waiting_for_channel": 1})
+        return bool(user and user.get("waiting_for_channel"))
+
+    async def clear_waiting_for_channel(self, user_id):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$unset": {"waiting_for_channel": ""}}
+        )
+
+    async def save_destination_channel(self, user_id, channel_id: int):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"destination_channel": int(channel_id)}},
+            upsert=True
+        )
+
+    async def get_destination_channel(self, user_id):
+        user = await self.col.find_one({'_id': int(user_id)}, {"destination_channel": 1})
+        return int(user["destination_channel"]) if user and "destination_channel" in user else None
+
+    async def clear_destination_channel(self, user_id):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$unset": {"destination_channel": ""}}
+        )
+
 
 # Create a Database instance
 jishubotz = Database(Config.DB_URL, Config.DB_NAME)
