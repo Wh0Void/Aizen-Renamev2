@@ -244,3 +244,10 @@ async def doc(bot, update):
         await deletion_msg.delete()
     except Exception as e:
         print(f"Error deleting messages after 30 minutes: {e}")
+
+# file_rename.py / rename.py
+
+# Empty init function to satisfy bot.py call
+def init(client):
+    # Nothing needed here because decorators already register handlers
+    pass
