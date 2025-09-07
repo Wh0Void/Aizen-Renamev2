@@ -41,12 +41,12 @@ class Bot(Client):
         self.uptime = Config.BOT_UPTIME
 
         # Initialize file rename plugin
-        try:
-            from plugins import file_rename
-            file_rename.init(self)
-            print("✅ File rename plugin initialized")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
+      #  try:
+      #      from plugins import file_rename
+      #      file_rename.init(self)
+      #      print("✅ File rename plugin initialized")
+      #  except Exception as e:
+      #      print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
 
         if Config.WEBHOOK:
             app = web.AppRunner(await web_server())
