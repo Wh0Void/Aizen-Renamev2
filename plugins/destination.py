@@ -9,7 +9,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-import re
+import re, time
 
 # DB instance (your helper/database.py should expose `jishubotz = Database(...)`)
 from helper.database import jishubotz
@@ -19,6 +19,9 @@ try:
     from config import DESTINATION_PIC_URL
 except Exception:
     DESTINATION_PIC_URL = None
+
+# Timeout (in seconds) for waiting state
+DEST_WAIT_TIMEOUT = 120  # 2 minutes
 
 # Callback IDs
 CB_SET_DEST = "set_dest_channel"
@@ -80,15 +83,16 @@ async def cmd_cancel_setchannel(c: Client, m: Message):
 @Client.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
 async def cb_set_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
-    await jishubotz.set_waiting_for_channel(uid, True)
+    # Save timestamp along with waiting flag
+    await jishubotz.set_waiting_for_channel(uid, True, int(time.time()))
     await q.answer("Send me a forwarded post from your channel.", show_alert=False)
 
-    # show Cancel button so user can easily cancel waiting state
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL_SET)]])
     await q.message.reply_text(
         "➡️ <b>Step 1:</b> Forward any post from your <b>Destination Channel</b> here.\n"
         "➡️ <b>Step 2:</b> Make sure the bot is <b>Admin</b> in that channel.\n\n"
-        "💡 If forwarding hides channel info, send the <code>@username</code> or invite link instead.",
+        "💡 If forwarding hides channel info, send the <code>@username</code> or invite link instead.\n\n"
+        f"⏳ You have <b>{DEST_WAIT_TIMEOUT // 60} minutes</b> before setup is cancelled automatically.",
         quote=True,
         reply_markup=cancel_kb
     )
@@ -120,26 +124,31 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
         "2) Forward any post from your target channel or send @username / invite link.\n"
         "3) Make sure the bot is <b>Admin</b> in that channel.\n"
         "4) After each rename, the bot will also copy the file to that channel.\n\n"
+        "⏳ If you don’t complete within 2 minutes, setup will be auto-cancelled.\n\n"
         "Use /cancelsetchannel to stop the waiting state anytime.",
     )
 
 
-# Only handle forwarded/text messages when the user is in 'waiting' state
+# Handle forwarded/text messages when user is in 'waiting' state
 @Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
+    waiting, ts = await jishubotz.is_waiting_for_channel(uid, with_ts=True)
 
-    # If user is not currently setting a destination -> do nothing here (let other handlers run)
-    if not await jishubotz.is_waiting_for_channel(uid):
+    if not waiting:
         return
 
-    # IMPORTANT: ignore commands so other command handlers still work
+    # timeout check
+    if ts and (time.time() - ts > DEST_WAIT_TIMEOUT):
+        await jishubotz.clear_waiting_for_channel(uid)
+        await m.reply_text("⌛ Timeout! Destination setup cancelled. Please try again with /setchannel.")
+        return
+
     if m.text and m.text.startswith("/"):
         return
 
     channel_id, reason = await _extract_channel_id(c, m)
     if channel_id is None:
-        # keep waiting state — user can try again or press cancel
         await m.reply_text(
             "⚠️ I couldn't detect a channel from that.\n\n"
             "• Forward a post from your channel (with channel info visible), or send its <code>@username</code> / invite link.\n"
@@ -175,7 +184,6 @@ async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Opt
         if m.text:
             text = m.text.strip()
 
-            # @username
             at_match = re.search(r"@([A-Za-z0-9_]{5,})", text)
             if at_match:
                 try:
@@ -185,7 +193,6 @@ async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Opt
                 except Exception as e:
                     return None, f"Cannot resolve username: {e}"
 
-            # t.me/username OR t.me/+invite OR t.me/joinchat/xxxx
             link_match = re.search(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_+\-]{5,})", text)
             if link_match:
                 handle = link_match.group(1)
@@ -196,7 +203,6 @@ async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Opt
                 except Exception as e:
                     return None, f"Cannot resolve link: {e}"
 
-            # Raw numeric ID like -1001234567890
             if text.startswith("-100") and text[4:].isdigit():
                 return int(text), None
 
