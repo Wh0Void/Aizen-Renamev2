@@ -1,7 +1,7 @@
 from typing import Optional, Tuple
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-import time
+import re, time
 
 from helper.database import jishubotz
 
@@ -42,23 +42,17 @@ async def _send_dest_card(c: Client, m: Message):
         await m.reply_text(caption, reply_markup=_dest_kb(current))
 
 
-# ================= COMMANDS ==================
-
-@Client.on_message(filters.command(["setchannel", "setdest"]) & filters.private)
+# ================== HANDLER FUNCTIONS ================== #
 async def cmd_setchannel(c: Client, m: Message):
     await _send_dest_card(c, m)
 
 
-@Client.on_message(filters.command(["cancelsetchannel", "cancelsetdest"]) & filters.private)
 async def cmd_cancel_setchannel(c: Client, m: Message):
     uid = m.from_user.id
     await jishubotz.clear_waiting_for_channel(uid)
     await m.reply_text("✅ Cancelled destination setup.")
 
 
-# ================= CALLBACKS ==================
-
-@Client.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
 async def cb_set_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
     await jishubotz.set_waiting_for_channel(uid, True, int(time.time()))
@@ -72,7 +66,6 @@ async def cb_set_dest(c: Client, q: CallbackQuery):
     )
 
 
-@Client.on_callback_query(filters.regex(f"^{CB_CANCEL_SET}$"))
 async def cb_cancel_set(c: Client, q: CallbackQuery):
     uid = q.from_user.id
     await jishubotz.clear_waiting_for_channel(uid)
@@ -80,7 +73,6 @@ async def cb_cancel_set(c: Client, q: CallbackQuery):
     await q.message.edit_text("❌ Destination setup cancelled.")
 
 
-@Client.on_callback_query(filters.regex(f"^{CB_CLEAR_DEST}$"))
 async def cb_clear_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
     await jishubotz.clear_destination_channel(uid)
@@ -89,7 +81,6 @@ async def cb_clear_dest(c: Client, q: CallbackQuery):
     await _send_dest_card(c, q.message)
 
 
-@Client.on_callback_query(filters.regex(f"^{CB_HELP_DEST}$"))
 async def cb_help_dest(c: Client, q: CallbackQuery):
     await q.answer()
     await q.message.reply_text(
@@ -102,9 +93,6 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
     )
 
 
-# ================= FORWARD HANDLER ==================
-
-@Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
     waiting, ts = await jishubotz.is_waiting_for_channel(uid, with_ts=True)
@@ -131,8 +119,7 @@ async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     await m.reply_text(f"✅ Destination channel saved:\n<code>{channel_id}</code>")
 
 
-# ================= UTILS ==================
-
+# ================== HELPER FUNCTIONS ================== #
 async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Optional[str]]:
     try:
         if m.forward_from_chat and m.forward_from_chat.type == enums.ChatType.CHANNEL:
@@ -175,8 +162,6 @@ async def _can_post_to_channel(c: Client, channel_id: int) -> Tuple[bool, str]:
         return False, str(e)
 
 
-# ================= DESTINATION SENDER ==================
-
 async def send_to_destination_if_set(c: Client, user_id: int, src_message: Message, caption: Optional[str] = None):
     try:
         dest = await jishubotz.get_destination_channel(user_id)
@@ -191,3 +176,14 @@ async def send_to_destination_if_set(c: Client, user_id: int, src_message: Messa
             await c.send_message(user_id, f"⚠️ Failed to send to Destination Channel:\n<code>{e}</code>")
         except Exception:
             pass
+
+
+# ================== INIT FUNCTION ================== #
+def init(bot: Client):
+    bot.add_handler(filters.command(["setchannel", "setdest"]) & filters.private, cmd_setchannel)
+    bot.add_handler(filters.command(["cancelsetchannel", "cancelsetdest"]) & filters.private, cmd_cancel_setchannel)
+    bot.add_handler(filters.regex(f"^{CB_SET_DEST}$"), cb_set_dest)
+    bot.add_handler(filters.regex(f"^{CB_CANCEL_SET}$"), cb_cancel_set)
+    bot.add_handler(filters.regex(f"^{CB_CLEAR_DEST}$"), cb_clear_dest)
+    bot.add_handler(filters.regex(f"^{CB_HELP_DEST}$"), cb_help_dest)
+    bot.add_handler(filters.private & (filters.text | filters.forwarded), handle_forward_or_text_while_waiting)
