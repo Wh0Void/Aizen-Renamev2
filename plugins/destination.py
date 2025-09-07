@@ -1,29 +1,17 @@
-# plugins/destination.py
-# Destination Channel feature — uses helper.database.jishubotz instance
-
 from typing import Optional, Tuple
 from pyrogram import Client, filters, enums
-from pyrogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import re, time
 
-# DB instance (your helper/database.py should expose `jishubotz = Database(...)`)
 from helper.database import jishubotz
 
-# Optional banner image for the settings card (set DESTINATION_PIC_URL in config.py)
 try:
     from config import DESTINATION_PIC_URL
 except Exception:
     DESTINATION_PIC_URL = None
 
-# Timeout (in seconds) for waiting state
 DEST_WAIT_TIMEOUT = 120  # 2 minutes
 
-# Callback IDs
 CB_SET_DEST = "set_dest_channel"
 CB_CLEAR_DEST = "clear_dest_channel"
 CB_HELP_DEST = "dest_help"
@@ -32,68 +20,50 @@ CB_CANCEL_SET = "cancel_set_dest"
 
 def _dest_kb(current: Optional[int]) -> InlineKeyboardMarkup:
     label = f"📡 Set Destination Channel" if not current else f"📡 Change Destination (now: {current})"
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(label, callback_data=CB_SET_DEST)],
-            [InlineKeyboardButton("🗑️ Clear Destination", callback_data=CB_CLEAR_DEST)],
-            [InlineKeyboardButton("❓ How it works", callback_data=CB_HELP_DEST)],
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=CB_SET_DEST)],
+        [InlineKeyboardButton("🗑️ Clear Destination", callback_data=CB_CLEAR_DEST)],
+        [InlineKeyboardButton("❓ How it works", callback_data=CB_HELP_DEST)],
+    ])
 
 
-async def _send_dest_card(c: Client, m: Message) -> None:
+async def _send_dest_card(c: Client, m: Message):
     uid = m.from_user.id
     current = await jishubotz.get_destination_channel(uid)
-    if current:
-        caption = (
-            "🧭 <b>Destination Channel</b>\n\n"
-            "• Set a channel once, and every renamed file will also be posted there automatically.\n"
-            "• Bot must be <b>Admin</b> in that channel with permission to post.\n\n"
-            f"<i>Current:</i> <code>{current}</code>"
-        )
-    else:
-        caption = (
-            "🧭 <b>Destination Channel</b>\n\n"
-            "• Set a channel once, and every renamed file will also be posted there automatically.\n"
-            "• Bot must be <b>Admin</b> in that channel with permission to post.\n\n"
-            "<i>Current:</i> <code>Not set</code>"
-        )
-
+    caption = (
+        "🧭 <b>Destination Channel</b>\n\n"
+        "• Set a channel once, and every renamed file will also be posted there automatically.\n"
+        "• Bot must be <b>Admin</b> in that channel with permission to post.\n\n"
+        f"<i>Current:</i> <code>{current or 'Not set'}</code>"
+    )
     if DESTINATION_PIC_URL:
         await m.reply_photo(photo=DESTINATION_PIC_URL, caption=caption, reply_markup=_dest_kb(current))
     else:
         await m.reply_text(caption, reply_markup=_dest_kb(current))
 
 
-# /setchannel or /setdest opens the card
 @Client.on_message(filters.command(["setchannel", "setdest"]) & filters.private)
 async def cmd_setchannel(c: Client, m: Message):
     await _send_dest_card(c, m)
 
 
-# /cancelsetchannel command to clear waiting flag
 @Client.on_message(filters.command(["cancelsetchannel", "cancelsetdest"]) & filters.private)
 async def cmd_cancel_setchannel(c: Client, m: Message):
     uid = m.from_user.id
     await jishubotz.clear_waiting_for_channel(uid)
-    await m.reply_text("✅ Cancelled destination setup. You can use other commands now.")
+    await m.reply_text("✅ Cancelled destination setup.")
 
 
-# User clicked "Set Destination Channel"
 @Client.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
 async def cb_set_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
-    # Save timestamp along with waiting flag
     await jishubotz.set_waiting_for_channel(uid, True, int(time.time()))
     await q.answer("Send me a forwarded post from your channel.", show_alert=False)
-
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL_SET)]])
     await q.message.reply_text(
-        "➡️ <b>Step 1:</b> Forward any post from your <b>Destination Channel</b> here.\n"
-        "➡️ <b>Step 2:</b> Make sure the bot is <b>Admin</b> in that channel.\n\n"
-        "💡 If forwarding hides channel info, send the <code>@username</code> or invite link instead.\n\n"
-        f"⏳ You have <b>{DEST_WAIT_TIMEOUT // 60} minutes</b> before setup is cancelled automatically.",
-        quote=True,
+        "➡️ Forward any post from your <b>Destination Channel</b> here.\n"
+        "➡️ Or send @username / invite link.\n"
+        f"⏳ You have {DEST_WAIT_TIMEOUT // 60} minutes.",
         reply_markup=cancel_kb
     )
 
@@ -124,89 +94,62 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
         "2) Forward any post from your target channel or send @username / invite link.\n"
         "3) Make sure the bot is <b>Admin</b> in that channel.\n"
         "4) After each rename, the bot will also copy the file to that channel.\n\n"
-        "⏳ If you don’t complete within 2 minutes, setup will be auto-cancelled.\n\n"
-        "Use /cancelsetchannel to stop the waiting state anytime.",
+        f"⏳ Setup auto-cancels in {DEST_WAIT_TIMEOUT // 60} minutes."
     )
 
 
-# Handle forwarded/text messages when user is in 'waiting' state
 @Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
     waiting, ts = await jishubotz.is_waiting_for_channel(uid, with_ts=True)
-
     if not waiting:
         return
 
-    # timeout check
     if ts and (time.time() - ts > DEST_WAIT_TIMEOUT):
         await jishubotz.clear_waiting_for_channel(uid)
-        await m.reply_text("⌛ Timeout! Destination setup cancelled. Please try again with /setchannel.")
-        return
+        return await m.reply_text("⌛ Timeout! Setup cancelled. Use /setchannel again.")
 
     if m.text and m.text.startswith("/"):
         return
 
     channel_id, reason = await _extract_channel_id(c, m)
-    if channel_id is None:
-        await m.reply_text(
-            "⚠️ I couldn't detect a channel from that.\n\n"
-            "• Forward a post from your channel (with channel info visible), or send its <code>@username</code> / invite link.\n"
-            f"Details: {reason or 'unknown'}\n\nUse /cancelsetchannel to cancel."
-        )
-        return
+    if not channel_id:
+        return await m.reply_text(f"⚠️ Couldn’t detect a channel. Reason: {reason or 'unknown'}")
 
     ok, why = await _can_post_to_channel(c, channel_id)
     if not ok:
-        await m.reply_text(
-            "🚫 I don't have permission to post in that channel.\n"
-            "Please add me as <b>Admin</b> and try again.\n\n"
-            f"Details: {why}\n\nUse /cancelsetchannel to cancel."
-        )
-        return
+        return await m.reply_text(f"🚫 Bot lacks permission in that channel.\nReason: {why}")
 
     await jishubotz.save_destination_channel(uid, channel_id)
     await jishubotz.clear_waiting_for_channel(uid)
-    await m.reply_text(
-        f"✅ Destination channel saved:\n<code>{channel_id}</code>\n\n"
-        "All future renamed files will also be posted there."
-    )
+    await m.reply_text(f"✅ Destination channel saved:\n<code>{channel_id}</code>")
 
 
 async def _extract_channel_id(c: Client, m: Message) -> Tuple[Optional[int], Optional[str]]:
     try:
-        if getattr(m, "forward_from_chat", None) and m.forward_from_chat.type == enums.ChatType.CHANNEL:
+        if m.forward_from_chat and m.forward_from_chat.type == enums.ChatType.CHANNEL:
             return m.forward_from_chat.id, None
-
-        if getattr(m, "sender_chat", None) and m.sender_chat.type == enums.ChatType.CHANNEL:
+        if m.sender_chat and m.sender_chat.type == enums.ChatType.CHANNEL:
             return m.sender_chat.id, None
-
         if m.text:
             text = m.text.strip()
-
-            at_match = re.search(r"@([A-Za-z0-9_]{5,})", text)
-            if at_match:
-                try:
-                    chat = await c.get_chat(at_match.group(1))
-                    if chat and chat.type == enums.ChatType.CHANNEL:
-                        return chat.id, None
-                except Exception as e:
-                    return None, f"Cannot resolve username: {e}"
-
-            link_match = re.search(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([A-Za-z0-9_+\-]{5,})", text)
-            if link_match:
-                handle = link_match.group(1)
-                try:
-                    chat = await c.get_chat(handle)
-                    if chat and chat.type == enums.ChatType.CHANNEL:
-                        return chat.id, None
-                except Exception as e:
-                    return None, f"Cannot resolve link: {e}"
-
             if text.startswith("-100") and text[4:].isdigit():
                 return int(text), None
-
-        return None, "Channel not detected."
+            if text.startswith("@"):
+                try:
+                    chat = await c.get_chat(text)
+                    if chat.type == enums.ChatType.CHANNEL:
+                        return chat.id, None
+                except Exception as e:
+                    return None, str(e)
+            if "t.me" in text:
+                try:
+                    chat = await c.get_chat(text.split("/")[-1])
+                    if chat.type == enums.ChatType.CHANNEL:
+                        return chat.id, None
+                except Exception as e:
+                    return None, str(e)
+        return None, "Not a valid channel."
     except Exception as e:
         return None, str(e)
 
@@ -216,29 +159,25 @@ async def _can_post_to_channel(c: Client, channel_id: int) -> Tuple[bool, str]:
         me = await c.get_chat_member(channel_id, "me")
         if me.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
             priv = getattr(me, "privileges", None)
-            if priv is None or getattr(priv, "can_post_messages", True):
+            if not priv or getattr(priv, "can_post_messages", True):
                 return True, "ok"
-            return False, "Admin but cannot post messages."
-        return False, f"My status is {me.status}, not admin."
+            return False, "Admin but cannot post."
+        return False, f"My status is {me.status}"
     except Exception as e:
         return False, str(e)
 
 
-# Public helper for rename.py to call
 async def send_to_destination_if_set(c: Client, user_id: int, src_message: Message, caption: Optional[str] = None):
     try:
         dest = await jishubotz.get_destination_channel(user_id)
         if not dest:
             return
-        if caption is not None:
+        if caption:
             await src_message.copy(chat_id=dest, caption=caption)
         else:
             await src_message.copy(chat_id=dest)
     except Exception as e:
         try:
-            await c.send_message(
-                user_id,
-                f"⚠️ Failed to send to Destination Channel:\n<code>{e}</code>\nPlease ensure I'm admin in that channel."
-            )
+            await c.send_message(user_id, f"⚠️ Failed to send to Destination Channel:\n<code>{e}</code>")
         except Exception:
             pass
