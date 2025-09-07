@@ -17,7 +17,7 @@ class Database:
             prefix=None,
             suffix=None,
             metadata=False,
-            metadata_code="By :- @TechifyBots",
+            metadata_code="By :- @Otaku_Hindi_Hub",
             rename_count=0,  # Rename count tracking
             destination_channel=None,  # New field for Destination Channel
             waiting_for_channel=False  # State flag while setting Destination
