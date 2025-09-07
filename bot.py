@@ -8,7 +8,9 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
-from destination import *
+
+# Import the destination plugin properly
+from plugins import destination  # <-- updated
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
@@ -41,18 +43,25 @@ class Bot(Client):
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
 
-        # Initialize file rename plugin
-      #  try:
-      #      from plugins import file_rename
-      #      file_rename.init(self)
-      #      print("✅ File rename plugin initialized")
-      #  except Exception as e:
-      #      print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
+        # Initialize destination plugin
+        try:
+            destination.init(self)  # <-- attach handlers to this bot instance
+            print("✅ Destination plugin initialized")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not initialize destination plugin: {e}")
+
+        # Optional: initialize other plugins here
+        # try:
+        #     from plugins import file_rename
+        #     file_rename.init(self)
+        #     print("✅ File rename plugin initialized")
+        # except Exception as e:
+        #     print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
 
         if Config.WEBHOOK:
             app = web.AppRunner(await web_server())
             await app.setup()
-            PORT = int(os.environ.get("PORT", 8000))  # Use port 8000 or env PORT
+            PORT = int(os.environ.get("PORT", 8000))
             await web.TCPSite(app, "0.0.0.0", PORT).start()
             print(f"🌐 Webhook server started on port {PORT}")
 
@@ -71,7 +80,14 @@ class Bot(Client):
                 curr = datetime.now(timezone("Asia/Kolkata"))
                 date = curr.strftime('%d %B, %Y')
                 time = curr.strftime('%I:%M:%S %p')
-                await self.send_message(Config.LOG_CHANNEL, f"**{me.mention} Is Restarted !!**\n\n📅 Date : `{date}`\n⏰ Time : `{time}`\n🌐 Timezone : `Asia/Kolkata`\n\n🉐 Version : `v{__version__} (Layer {layer})`</b>")                                
+                await self.send_message(
+                    Config.LOG_CHANNEL,
+                    f"**{me.mention} Is Restarted !!**\n\n"
+                    f"📅 Date : `{date}`\n"
+                    f"⏰ Time : `{time}`\n"
+                    f"🌐 Timezone : `Asia/Kolkata`\n\n"
+                    f"🉐 Version : `v{__version__} (Layer {layer})`</b>"
+                )                                
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
 
