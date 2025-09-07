@@ -13,7 +13,7 @@ from pyrogram.types import (
 import re
 
 # 🧠 Import your DB helper functions (you'll add these to database.py)
-from .database import (
+from helper.database import (
     save_destination_channel,
     get_destination_channel,
     clear_destination_channel,
