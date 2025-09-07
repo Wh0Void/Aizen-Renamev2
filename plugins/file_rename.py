@@ -6,7 +6,7 @@ from hachoir.metadata import extractMetadata
 from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
 from hachoir.parser import createParser
 from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
-from helper.database import jishubotz
+from helper.database import jishubotz   # ✅ DB updated with destination methods
 from asyncio import sleep
 from PIL import Image
 from config import Config
@@ -77,7 +77,7 @@ async def refunc(client, message):
 async def doc(bot, update):    
     if not os.path.isdir("Metadata"):
         os.mkdir("Metadata")
-        
+
     prefix = await jishubotz.get_prefix(update.message.chat.id)
     suffix = await jishubotz.get_suffix(update.message.chat.id)
     new_name = update.message.text
@@ -87,7 +87,7 @@ async def doc(bot, update):
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
         return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`\nᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!")
-    
+
     file_path = f"downloads/{update.from_user.id}/{new_filename}"
     file = update.message.reply_to_message
 
@@ -96,7 +96,7 @@ async def doc(bot, update):
             ms = await update.message.edit("🚀 Try To Download...  ⚡")
     except Exception as e:
         print(f"Error editing message: {e}")
-    
+
     try:
         path = await bot.download_media(
             message=file, 
@@ -108,7 +108,7 @@ async def doc(bot, update):
         return await ms.edit(e)
 
     _bool_metadata = await jishubotz.get_metadata(update.message.chat.id) 
-    
+
     if _bool_metadata:
         metadata = await jishubotz.get_metadata_code(update.message.chat.id)
         metadata_path = f"Metadata/{new_filename}"
@@ -125,7 +125,7 @@ async def doc(bot, update):
         parser.close()   
     except:
         pass
-        
+
     ph_path = None
     user_id = int(update.message.chat.id) 
     user_name = update.message.chat.first_name
@@ -158,7 +158,7 @@ async def doc(bot, update):
             await ms.edit("💠 Try To Upload...  ⚡")
     except Exception as e:
         print(f"Error editing message: {e}")
-    
+
     type = update.data.split("_")[1]
     try:
         if type == "document":
@@ -191,11 +191,24 @@ async def doc(bot, update):
                 progress_args=("💠 Uploading...  ⚡", ms, time.time())
             )
 
-        forwarded_message = await bot.forward_messages(
+        # ✅ Forward to universal dump
+        await bot.forward_messages(
             Config.BIN_CHANNEL, 
             update.message.chat.id, 
             sent_message.id
         )
+
+        # ✅ Forward/Copy to user Destination Channel (if set)
+        dest_channel = await jishubotz.get_destination_channel(update.from_user.id)
+        if dest_channel:
+            try:
+                await bot.copy_message(
+                    chat_id=dest_channel,
+                    from_chat_id=update.message.chat.id,
+                    message_id=sent_message.id
+                )
+            except Exception as e:
+                print(f"Failed to send to destination channel: {e}")
 
         deletion_msg = await sent_message.reply(
             text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
@@ -216,7 +229,6 @@ async def doc(bot, update):
     await asyncio.sleep(1800)
     try:
         await sent_message.delete()
-      #  await forwarded_message.delete()
         await deletion_msg.delete()
     except Exception as e:
         print(f"Error deleting messages after 30 minutes: {e}")
