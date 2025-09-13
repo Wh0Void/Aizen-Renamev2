@@ -20,7 +20,7 @@ CB_HELP_DEST = "dest_help"
 CB_CANCEL_SET = "cancel_set_dest"
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def _dest_kb(current: Optional[int]) -> InlineKeyboardMarkup:
@@ -122,7 +122,7 @@ async def cmd_cancel_setchannel(c: Client, m: Message):
 async def cb_set_dest(c: Client, q: CallbackQuery):
     try:
         uid = q.from_user.id
-        logger.info(f"Callback query {CB_SET_DEST} received from user {uid}")
+        logger.info(f"Callback query {CB_SET_DEST} received from user {uid}, data: {q.data}")
         await jishubotz.set_waiting_for_channel(uid, True, int(time.time()))
         await q.answer("Send a forwarded post from your channel or @username/invite link.", show_alert=False)
         cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL_SET)]])
@@ -139,7 +139,7 @@ async def cb_set_dest(c: Client, q: CallbackQuery):
 async def cb_cancel_set(c: Client, q: CallbackQuery):
     try:
         uid = q.from_user.id
-        logger.info(f"Callback query {CB_CANCEL_SET} received from user {uid}")
+        logger.info(f"Callback query {CB_CANCEL_SET} received from user {uid}, data: {q.data}")
         await jishubotz.clear_waiting_for_channel(uid)
         await q.answer("Setup cancelled.", show_alert=False)
         await q.message.edit_text("❌ Destination setup cancelled.")
@@ -150,7 +150,7 @@ async def cb_cancel_set(c: Client, q: CallbackQuery):
 async def cb_clear_dest(c: Client, q: CallbackQuery):
     try:
         uid = q.from_user.id
-        logger.info(f"Callback query {CB_CLEAR_DEST} received from user {uid}")
+        logger.info(f"Callback query {CB_CLEAR_DEST} received from user {uid}, data: {q.data}")
         await jishubotz.clear_destination_channel(uid)
         await jishubotz.clear_waiting_for_channel(uid)
         await q.answer("Destination cleared.", show_alert=False)
@@ -162,7 +162,7 @@ async def cb_clear_dest(c: Client, q: CallbackQuery):
 async def cb_help_dest(c: Client, q: CallbackQuery):
     try:
         uid = q.from_user.id
-        logger.info(f"Callback query {CB_HELP_DEST} received from user {uid}")
+        logger.info(f"Callback query {CB_HELP_DEST} received from user {uid}, data: {q.data}")
         await q.answer()
         await q.message.reply_text(
             "❓ <b>How it works</b>\n\n"
@@ -235,6 +235,7 @@ async def send_to_destination_if_set(c: Client, user_id: int, src_message: Messa
 
 # ================== INIT FUNCTION ================== #
 def init(bot: Client):
+    logger.info("Registering destination.py handlers")
     @bot.on_message(filters.command(["setchannel", "setdest"]) & filters.private)
     async def _cmd_setchannel(client, message):
         logger.info(f"Registering /setchannel handler for user {message.from_user.id}")
@@ -247,22 +248,22 @@ def init(bot: Client):
 
     @bot.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
     async def _cb_set_dest(client, query):
-        logger.info(f"Registering callback handler for {CB_SET_DEST}")
+        logger.info(f"Callback handler triggered for {CB_SET_DEST}, data: {query.data}, user: {query.from_user.id}")
         await cb_set_dest(client, query)
 
     @bot.on_callback_query(filters.regex(f"^{CB_CANCEL_SET}$"))
     async def _cb_cancel_set(client, query):
-        logger.info(f"Registering callback handler for {CB_CANCEL_SET}")
+        logger.info(f"Callback handler triggered for {CB_CANCEL_SET}, data: {query.data}, user: {query.from_user.id}")
         await cb_cancel_set(client, query)
 
     @bot.on_callback_query(filters.regex(f"^{CB_CLEAR_DEST}$"))
     async def _cb_clear_dest(client, query):
-        logger.info(f"Registering callback handler for {CB_CLEAR_DEST}")
+        logger.info(f"Callback handler triggered for {CB_CLEAR_DEST}, data: {query.data}, user: {query.from_user.id}")
         await cb_clear_dest(client, query)
 
     @bot.on_callback_query(filters.regex(f"^{CB_HELP_DEST}$"))
     async def _cb_help_dest(client, query):
-        logger.info(f"Registering callback handler for {CB_HELP_DEST}")
+        logger.info(f"Callback handler triggered for {CB_HELP_DEST}, data: {query.data}, user: {query.from_user.id}")
         await cb_help_dest(client, query)
 
     @bot.on_message(filters.private & (filters.text | filters.forwarded) & ~filters.command([]))
