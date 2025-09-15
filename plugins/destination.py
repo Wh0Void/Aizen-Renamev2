@@ -5,7 +5,7 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from motor.motor_asyncio import AsyncIOMotorClient
-from config import DB_URL, DB_NAME
+from Config import DB_URL, DB_NAME
 
 # Setup MongoDB
 mongo = AsyncIOMotorClient(DB_URL)
