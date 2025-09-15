@@ -137,28 +137,34 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
 
 
 # ================== MESSAGE HANDLER FOR WAITING ==================
-@Client.on_message(filters.private & (filters.text | filters.forwarded) & ~filters.command([]))
+@Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
+
+    # 🔍 Check waiting state first
     waiting, ts = await jishubotz.is_waiting_for_channel(uid, with_ts=True)
     if not waiting:
-        return
+        return  # 🚫 Ignore if not waiting → lets other commands run
 
+    # Timeout check
     if ts and (time.time() - ts > DEST_WAIT_TIMEOUT):
         await jishubotz.clear_waiting_for_channel(uid)
         await m.reply_text("⌛ Timeout! Setup cancelled. Use /setchannel again.")
         return
 
+    # Try extracting channel
     channel_id, reason = await _extract_channel_id(c, m)
     if not channel_id:
         await m.reply_text(f"⚠️ Couldn’t detect a channel. Reason: {reason}")
         return
 
+    # Permission check
     ok, why = await _can_post_to_channel(c, channel_id)
     if not ok:
         await m.reply_text(f"🚫 Bot cannot post there.\nReason: {why}")
         return
 
+    # Save destination
     await jishubotz.save_destination_channel(uid, channel_id)
     await jishubotz.clear_waiting_for_channel(uid)
     await m.reply_text(f"✅ Destination channel saved:\n<code>{channel_id}</code>")
