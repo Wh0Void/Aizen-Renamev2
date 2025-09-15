@@ -1,16 +1,16 @@
 # plugins/destination.py
-# ✅ Destination Plugin (MongoDB Version)
-# Keeps SAME command names as old file
+# ✅ Destination Plugin using database.py helper functions
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from motor.motor_asyncio import AsyncIOMotorClient
-from Config import DB_URL, DB_NAME
-
-# Setup MongoDB
-mongo = AsyncIOMotorClient(DB_URL)
-db = mongo[DB_NAME]
-destinations = db["destinations"]  # collection
+from database import (
+    get_destination_channel,
+    save_destination_channel,
+    clear_destination_channel,
+    set_waiting_for_channel,
+    clear_waiting_for_channel,
+    is_waiting_for_channel
+)
 
 
 # ➕ /adddestination <channel_id>
@@ -21,47 +21,32 @@ async def add_destination(client: Client, message: Message):
 
     channel_id = message.command[1]
 
-    # check duplicate
-    if await destinations.find_one({"channel_id": channel_id}):
-        return await message.reply_text("⚠️ Destination already exists.", quote=True)
-
-    await destinations.insert_one({"channel_id": channel_id})
-    await message.reply_text(f"✅ Destination added:\n`{channel_id}`", quote=True)
+    await save_destination_channel(channel_id)
+    await message.reply_text(f"✅ Destination saved:\n`{channel_id}`", quote=True)
 
 
-# ➖ /removedestination <channel_id>
+# ➖ /removedestination
 @Client.on_message(filters.private & filters.command("removedestination"))
 async def remove_destination(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text("❌ Usage: `/removedestination -100xxxxxxxxxx`", quote=True)
-
-    channel_id = message.command[1]
-
-    result = await destinations.delete_one({"channel_id": channel_id})
-    if result.deleted_count == 0:
-        return await message.reply_text("⚠️ Destination not found.", quote=True)
-
-    await message.reply_text(f"🗑️ Destination removed:\n`{channel_id}`", quote=True)
+    await clear_destination_channel()
+    await message.reply_text("🗑️ Destination removed successfully.", quote=True)
 
 
 # 📋 /listdestinations
 @Client.on_message(filters.private & filters.command("listdestinations"))
 async def list_destinations(client: Client, message: Message):
-    cursor = destinations.find({})
-    dest_list = [f"• `{doc['channel_id']}`" async for doc in cursor]
+    channel_id = await get_destination_channel()
+    if not channel_id:
+        return await message.reply_text("📭 No destination channel set.", quote=True)
 
-    if not dest_list:
-        return await message.reply_text("📭 No destinations saved yet.", quote=True)
-
-    text = "📌 **Saved Destinations:**\n\n" + "\n".join(dest_list)
-    await message.reply_text(text, quote=True)
+    await message.reply_text(f"📌 Current destination:\n`{channel_id}`", quote=True)
 
 
-# 🗑️ /cleardestinations
+# 🧹 /cleardestinations
 @Client.on_message(filters.private & filters.command("cleardestinations"))
 async def clear_destinations(client: Client, message: Message):
-    result = await destinations.delete_many({})
-    await message.reply_text(f"🧹 Cleared `{result.deleted_count}` destinations.", quote=True)
+    await clear_destination_channel()
+    await message.reply_text("🧹 All destinations cleared.", quote=True)
 
 
 # 🔍 /checkdestination <channel_id>
@@ -71,8 +56,25 @@ async def check_destination(client: Client, message: Message):
         return await message.reply_text("❌ Usage: `/checkdestination -100xxxxxxxxxx`", quote=True)
 
     channel_id = message.command[1]
+    current = await get_destination_channel()
 
-    if await destinations.find_one({"channel_id": channel_id}):
-        await message.reply_text(f"✅ Destination `{channel_id}` exists.", quote=True)
+    if current == channel_id:
+        await message.reply_text(f"✅ Destination `{channel_id}` is set.", quote=True)
     else:
-        await message.reply_text(f"❌ Destination `{channel_id}` not found.", quote=True)
+        await message.reply_text(f"❌ Destination `{channel_id}` is not set.", quote=True)
+
+
+# ⚡ Extra (interactive flow) using waiting flags
+@Client.on_message(filters.private & filters.command("setdestination"))
+async def set_destination_interactive(client: Client, message: Message):
+    await set_waiting_for_channel(message.from_user.id)
+    await message.reply_text("📩 Please send me the channel ID now.")
+
+
+@Client.on_message(filters.private & filters.text)
+async def handle_channel_input(client: Client, message: Message):
+    if await is_waiting_for_channel(message.from_user.id):
+        channel_id = message.text.strip()
+        await save_destination_channel(channel_id)
+        await clear_waiting_for_channel(message.from_user.id)
+        await message.reply_text(f"✅ Destination saved via interactive mode:\n`{channel_id}`")
