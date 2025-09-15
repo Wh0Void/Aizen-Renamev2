@@ -3,7 +3,7 @@
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from database import (
+from helper.database import (
     get_destination_channel,
     save_destination_channel,
     clear_destination_channel,
