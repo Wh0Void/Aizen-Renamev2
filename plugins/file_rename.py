@@ -143,7 +143,7 @@ async def doc(bot, update):
                 duration=convert(duration)
             )
         except Exception as e:
-        return await ms.edit(text=f"Your Caption Error: ({e})")             
+          return await ms.edit(text=f"Your Caption Error: ({e})")             
     else:
         caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
 
