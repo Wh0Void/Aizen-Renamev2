@@ -204,7 +204,8 @@ async def doc(bot, update):
             )
 
         # ✅ Update leaderboard count
-        await jishubotz.increment_rename_count(user_id)
+        user_id = update.from_user.id if update.from_user else update.message.chat.id
+await jishubotz.increase_rename_count(user_id)
 
         # ✅ Send to universal dump with custom caption
         dump_caption = (
