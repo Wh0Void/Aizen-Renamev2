@@ -196,12 +196,16 @@ async def leaderboard_handler(client, message):
         return await message.reply("🏆 Leaderboard is currently empty.")
 
     text = "🏆 <b>Top 10 Renamers:</b>\n\n"
-    for i, user in enumerate(top_users, start=1):
+    for i, (user_id, count) in enumerate(top_users, start=1):  # ✅ unpack tuple
         try:
-            mention = f"<a href='tg://user?id={user['_id']}'>User</a>"
+            user = await client.get_users(user_id)  # get full user object
+            mention = user.mention  # clickable mention
         except Exception:
-            mention = f"<code>{user['_id']}</code>"
-        count = user.get('rename_count', 0)
+            mention = f"<code>{user_id}</code>"  # fallback to ID
         text += f"{i}. {mention} — <b>{count}</b> renames\n"
 
-    await message.reply(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await message.reply(
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
