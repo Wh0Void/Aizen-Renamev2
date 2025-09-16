@@ -136,10 +136,14 @@ async def doc(bot, update):
     c_thumb = await jishubotz.get_thumbnail(int(update.message.chat.id))
 
     if c_caption:
-        try:
-            caption = c_caption.format(filename=f"<b>{new_filename}</b>",  # ✅ only filename bold, filesize=humanbytes(media.file_size), duration=convert(duration))
-        except Exception as e:
-            return await ms.edit(text=f"Your Caption Error: ({e})")             
+    try:
+        caption = c_caption.format(
+            filename=f"<b>{new_filename}</b>",  # only filename bold
+            filesize=humanbytes(media.file_size),
+            duration=convert(duration)
+        )
+    except Exception as e:
+        return await ms.edit(text=f"Your Caption Error: ({e})")             
     else:
         caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
 
