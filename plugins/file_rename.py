@@ -198,24 +198,17 @@ async def doc(bot, update):
             )
 
         # ✅ Forward to universal bin channel with custom caption
-
-# Now send to BIN_CHANNEL with different caption
-if Config.BIN_CHANNEL:
-    try:
-        bin_caption = f"📁**{new_filename}**\nUser: {user_name} — {user_id}\nFile Size: {humanbytes(media.file_size)}\nDuration: {convert(duration)}"
-
-        # ✅ Use copy_message instead of forward
-        await bot.copy_message(
-            chat_id=Config.BIN_CHANNEL,
-            from_chat_id=update.chat.id,
-            message_id=sent_message.id,
-            caption=bin_caption
-        )
-    except Exception as e:
-        print(f"Failed to send to BIN_CHANNEL: {e}")
-
-
-
+        if Config.BIN_CHANNEL:
+            try:
+                bin_caption = f"📁 **{new_filename}**\n👤 User: {user_name} — {user_id}\n📦 File Size: {humanbytes(media.file_size)}\n⏳ Duration: {convert(duration)}"
+                await bot.copy_message(
+                    chat_id=Config.BIN_CHANNEL,
+                    from_chat_id=update.chat.id,
+                    message_id=sent_message.id,
+                    caption=bin_caption
+                )
+            except Exception as e:
+                print(f"Failed to send to BIN_CHANNEL: {e}")
 
         # ✅ Forward/Copy to user Destination Channel (if set)
         dest_channel = await jishubotz.get_destination_channel(int(update.from_user.id))
@@ -238,15 +231,16 @@ if Config.BIN_CHANNEL:
         )
 
     except Exception as e:          
-        os.remove(file_path)
-        if ph_path:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        if ph_path and os.path.exists(ph_path):
             os.remove(ph_path)
         return await ms.edit(f"**Error:** `{e}`")    
 
     await ms.delete() 
-    if ph_path:
+    if ph_path and os.path.exists(ph_path):
         os.remove(ph_path)
-    if file_path:
+    if file_path and os.path.exists(file_path):
         os.remove(file_path)
 
     await asyncio.sleep(1800)
