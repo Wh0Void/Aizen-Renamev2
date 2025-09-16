@@ -137,7 +137,7 @@ async def doc(bot, update):
 
     if c_caption:
         try:
-            caption = c_caption.format(filename=new_filename, filesize=humanbytes(media.file_size), duration=convert(duration))
+            caption = c_caption.format(filename=f"<b>{new_filename}</b>",  # ✅ only filename bold, filesize=humanbytes(media.file_size), duration=convert(duration))
         except Exception as e:
             return await ms.edit(text=f"Your Caption Error: ({e})")             
     else:
