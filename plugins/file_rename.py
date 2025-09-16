@@ -1,16 +1,16 @@
 from pyrogram import Client, filters
-from pyrogram.enums import MessageMediaType
+from pyrogram.enums import MessageMediaType, ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
 from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
-from helper.database import jishubotz   # ✅ DB updated with destination methods
+from helper.database import jishubotz   # ✅ DB updated with destination + leaderboard
 from config import Config
 from asyncio import sleep
 from PIL import Image
-import os, time, re, random, asyncio
+import os, time, random, asyncio
 
 
 @Client.on_message(filters.private & (filters.document | filters.audio | filters.video))
@@ -28,7 +28,7 @@ async def rename_start(client, message):
     try:
         await message.reply_text(
             text=f"**Please Enter New Filename...**\n\n**Old File Name** :- `{filename}`",
-            reply_to_message_id=message.id,  
+            reply_to_message_id=message.id,
             reply_markup=ForceReply(True)
         )       
         await sleep(30)
@@ -36,7 +36,7 @@ async def rename_start(client, message):
         await sleep(e.value)
         await message.reply_text(
             text=f"**Please Enter New Filename**\n\n**Old File Name** :- `{filename}`",
-            reply_to_message_id=message.id,  
+            reply_to_message_id=message.id,
             reply_markup=ForceReply(True)
         )
     except Exception as e:
@@ -50,8 +50,8 @@ async def rename_start(client, message):
 async def refunc(client, message):
     reply_message = message.reply_to_message
     if (reply_message.reply_markup) and isinstance(reply_message.reply_markup, ForceReply):
-        new_name = message.text 
-        await message.delete() 
+        new_name = message.text
+        await message.delete()
         msg = await client.get_messages(message.chat.id, reply_message.id)
         file = msg.reply_to_message
         media = getattr(file, file.media.value)
@@ -88,7 +88,9 @@ async def doc(bot, update):
     try:
         new_filename = add_prefix_suffix(new_filename_, prefix, suffix)
     except Exception as e:
-        return await update.message.edit(f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`\nᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot ᴛᴏ ʀᴇsᴏʟᴠᴇ ᴛʜᴇ ɪssᴜᴇ!!")
+        return await update.message.edit(
+            f"Something Went Wrong Can't Set Prefix/Suffix 🥺\n\n**Error:** `{e}`\nᴄᴏɴᴛᴀᴄᴛ @PS_TalkBot"
+        )
 
     file_path = f"downloads/{int(update.from_user.id)}/{new_filename}"
     file = update.message.reply_to_message
@@ -101,11 +103,11 @@ async def doc(bot, update):
 
     try:
         path = await bot.download_media(
-            message=file, 
-            file_name=file_path, 
-            progress=progress_for_pyrogram, 
+            message=file,
+            file_name=file_path,
+            progress=progress_for_pyrogram,
             progress_args=("🚀 Downloading...  ⚡", ms, time.time())
-        )                    
+        )
     except Exception as e:
         return await ms.edit(str(e))
 
@@ -124,12 +126,12 @@ async def doc(bot, update):
         metadata = extractMetadata(parser)
         if metadata.has("duration"):
             duration = metadata.get('duration').seconds
-        parser.close()   
+        parser.close()
     except:
         pass
 
     ph_path = None
-    user_id = int(update.message.chat.id) 
+    user_id = int(update.message.chat.id)
     user_name = update.message.chat.first_name
     media = getattr(file, file.media.value)
     c_caption = await jishubotz.get_caption(int(update.message.chat.id))
@@ -139,11 +141,11 @@ async def doc(bot, update):
         try:
             caption = c_caption.format(
                 filename=f"<b>{new_filename}</b>",  # only filename bold
-                 filesize=humanbytes(media.file_size),
+                filesize=humanbytes(media.file_size),
                 duration=convert(duration)
             )
         except Exception as e:
-          return await ms.edit(text=f"Your Caption Error: ({e})")             
+            return await ms.edit(text=f"Your Caption Error: ({e})")             
     else:
         caption = f"**{new_filename}**\n\n**User:** {user_name}\n**User ID:** {user_id}"
 
@@ -153,11 +155,15 @@ async def doc(bot, update):
             width, height, ph_path = await fix_thumb(ph_path)
         else:
             try:
-                ph_path_ = await take_screen_shot(file_path, os.path.dirname(os.path.abspath(file_path)), random.randint(0, duration - 1))
+                ph_path_ = await take_screen_shot(
+                    file_path,
+                    os.path.dirname(os.path.abspath(file_path)),
+                    random.randint(0, duration - 1)
+                )
                 width, height, ph_path = await fix_thumb(ph_path_)
             except Exception as e:
                 ph_path = None
-                print(e)  
+                print(e)
 
     try:
         if update.message.text != "💠 Try To Upload...  ⚡":
@@ -171,12 +177,12 @@ async def doc(bot, update):
             sent_message = await bot.send_document(
                 int(update.message.chat.id),
                 document=metadata_path if _bool_metadata else file_path,
-                thumb=ph_path, 
-                caption=caption, 
+                thumb=ph_path,
+                caption=caption,
                 progress=progress_for_pyrogram,
                 progress_args=("💠 Uploading...  ⚡", ms, time.time())
             )
-        elif type_ == "video": 
+        elif type_ == "video":
             sent_message = await bot.send_video(
                 int(update.message.chat.id),
                 video=metadata_path if _bool_metadata else file_path,
@@ -186,7 +192,7 @@ async def doc(bot, update):
                 progress=progress_for_pyrogram,
                 progress_args=("💠 Uploading...  ⚡", ms, time.time())
             )
-        elif type_ == "audio": 
+        elif type_ == "audio":
             sent_message = await bot.send_audio(
                 int(update.message.chat.id),
                 audio=metadata_path if _bool_metadata else file_path,
@@ -197,12 +203,28 @@ async def doc(bot, update):
                 progress_args=("💠 Uploading...  ⚡", ms, time.time())
             )
 
-        # ✅ Forward to universal dump
-        await bot.forward_messages(
-            Config.BIN_CHANNEL, 
-            int(update.message.chat.id), 
-            sent_message.id
+        # ✅ Update leaderboard count
+        await jishubotz.increment_rename_count(user_id)
+
+        # ✅ Send to universal dump with custom caption
+        dump_caption = (
+            f"📂 <b>Renamed File</b>\n\n"
+            f"👤 User: <a href='tg://user?id={user_id}'>{user_name}</a>\n"
+            f"🆔 User ID: <code>{user_id}</code>\n"
+            f"📁 Filename: <code>{new_filename}</code>\n"
+            f"⚡ Size: {humanbytes(media.file_size)}\n"
+            f"⏱ Duration: {convert(duration) if duration else 'N/A'}"
         )
+        try:
+            await bot.copy_message(
+                chat_id=Config.BIN_CHANNEL,
+                from_chat_id=int(update.message.chat.id),
+                message_id=sent_message.id,
+                caption=dump_caption,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"Failed to send to BIN_CHANNEL: {e}")
 
         # ✅ Forward/Copy to user Destination Channel (if set)
         dest_channel = await jishubotz.get_destination_channel(int(update.from_user.id))
@@ -220,13 +242,13 @@ async def doc(bot, update):
             text="**🗑 This file will auto-delete in 30 minutes. Save it now!**",
         )
 
-    except Exception as e:          
+    except Exception as e:
         os.remove(file_path)
         if ph_path:
             os.remove(ph_path)
-        return await ms.edit(f"**Error:** `{e}`")    
+        return await ms.edit(f"**Error:** `{e}`")
 
-    await ms.delete() 
+    await ms.delete()
     if ph_path:
         os.remove(ph_path)
     if file_path:
