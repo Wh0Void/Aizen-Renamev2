@@ -198,9 +198,24 @@ async def doc(bot, update):
             )
 
         # ✅ Forward to universal bin channel with custom caption
-        bin_caption = f"**{new_filename}**\nUser: {user_name} — {user_id}\nFile Size: {humanbytes(media.file_size)}\nDuration: {convert(duration)}"
-        await bot.send_message(Config.BIN_CHANNEL, text=bin_caption)
-        await bot.forward_messages(Config.BIN_CHANNEL, int(update.message.chat.id), sent_message.id)
+
+# Now send to BIN_CHANNEL with different caption
+if Config.BIN_CHANNEL:
+    try:
+        bin_caption = f"📁**{new_filename}**\nUser: {user_name} — {user_id}\nFile Size: {humanbytes(media.file_size)}\nDuration: {convert(duration)}"
+
+        # ✅ Use copy_message instead of forward
+        await bot.copy_message(
+            chat_id=Config.BIN_CHANNEL,
+            from_chat_id=update.chat.id,
+            message_id=sent_message.id,
+            caption=bin_caption
+        )
+    except Exception as e:
+        print(f"Failed to send to BIN_CHANNEL: {e}")
+
+
+
 
         # ✅ Forward/Copy to user Destination Channel (if set)
         dest_channel = await jishubotz.get_destination_channel(int(update.from_user.id))
