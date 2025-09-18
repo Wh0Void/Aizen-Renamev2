@@ -196,7 +196,7 @@ try:
 
     # ✅ Forward to universal bin channel with custom caption
 
-Now send to BIN_CHANNEL with different caption
+# Now send to BIN_CHANNEL with different caption
 
     if Config.BIN_CHANNEL:
         try:
