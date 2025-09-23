@@ -254,7 +254,7 @@ try:
 except Exception as e:  
     print(f"Error deleting messages after 30 minutes: {e}")
 
-✅ Dummy init function to satisfy bot.py
+# ✅ Dummy init function to satisfy bot.py
 
 def init(client):
 pass
