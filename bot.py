@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime
 from pytz import timezone
 from pyrogram import Client, __version__
@@ -9,6 +8,8 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
+
+# Import the destination plugin properly
 from plugins import destination  # <-- updated
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
@@ -16,6 +17,7 @@ pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
 
 
 class Bot(Client):
+
     def __init__(self):
         super().__init__(
             name="renamer",
@@ -28,6 +30,7 @@ class Bot(Client):
         )
 
     async def start(self):
+        # Initialize pyromod listeners to prevent KeyError
         if 'message' not in self.listeners:
             self.listeners['message'] = []
         if 'callback_query' not in self.listeners:
@@ -40,11 +43,20 @@ class Bot(Client):
         self.username = me.username  
         self.uptime = Config.BOT_UPTIME
 
+        # Initialize destination plugin
         try:
-            destination.init(self)
+            destination.init(self)  # <-- attach handlers to this bot instance
             print("✅ Destination plugin initialized")
         except Exception as e:
             print(f"⚠️ Warning: Could not initialize destination plugin: {e}")
+
+        # Optional: initialize other plugins here
+        # try:
+        #     from plugins import file_rename
+        #     file_rename.init(self)
+        #     print("✅ File rename plugin initialized")
+        # except Exception as e:
+        #     print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
 
         if Config.WEBHOOK:
             app = web.AppRunner(await web_server())
@@ -55,12 +67,14 @@ class Bot(Client):
 
         print(f"{me.first_name} Is Started.....✨️")
 
+        # Send startup message to admins
         for id in Config.ADMIN:
             try: 
                 await self.send_message(id, f"**{me.first_name} Is Started...**")                                
             except Exception as e:
                 print(f"Error sending message to admin {id}: {e}")
 
+        # Send startup message to log channel
         if Config.LOG_CHANNEL:
             try:
                 curr = datetime.now(timezone("Asia/Kolkata"))
@@ -82,19 +96,5 @@ class Bot(Client):
         print(f"{self.mention} is stopped.")
 
 
-async def run_bot_loop():
-    while True:
-        try:
-            bot = Bot()
-            await bot.start()
-            # Keep the bot running indefinitely
-            while True:
-                await asyncio.sleep(600)  # Check every 10 minutes
-        except Exception as e:
-            print(f"⚠️ Bot crashed: {e}")
-            print("🔄 Restarting bot in 10 seconds...")
-            await asyncio.sleep(10)  # Small delay before restart
-
-
 if __name__ == "__main__":
-    asyncio.run(run_bot_loop())
+    Bot().run()
