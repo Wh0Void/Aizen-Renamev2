@@ -10,8 +10,8 @@ class Config(object):
     STICKER_ID = "CAACAgUAAxkBAAEPPyForea7mUMyTQegrzwcdE7GyOR9LQAC3BYAAqqMAAFXZzpttZeEZiQ2BA"  # Replace with actual sticker file ID
    
     # database config
-    DB_NAME = os.environ.get("DB_NAME","Rename")     
-    DB_URL  = os.environ.get("DB_URL","mongodb+srv://Rename:XoFpKwreyhCeEvcI@rename.aukmb5u.mongodb.net/")
+    DB_NAME = os.environ.get("DB_NAME","")     
+    DB_URL  = os.environ.get("DB_URL","")
 
     # other configs
     BOT_UPTIME  = time.time()
