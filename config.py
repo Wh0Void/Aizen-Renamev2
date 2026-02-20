@@ -4,9 +4,9 @@ id_pattern = re.compile(r'^.\d+$')
 
 class Config(object):
     # pyro client config
-    API_ID    = os.environ.get("API_ID", "23476863")
-    API_HASH  = os.environ.get("API_HASH", "69daa0835439c4211f34c2e9ad0acb5c")
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "8189225558:AAFCe89gHJf3UUFWeZ_rcGbte3_V7NqTYns") 
+    API_ID    = os.environ.get("API_ID", "")
+    API_HASH  = os.environ.get("API_HASH", "")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "") 
     STICKER_ID = "CAACAgUAAxkBAAEPPyForea7mUMyTQegrzwcdE7GyOR9LQAC3BYAAqqMAAFXZzpttZeEZiQ2BA"  # Replace with actual sticker file ID
    
     # database config
