@@ -1,18 +1,127 @@
 import os
 import sys
 import time
+import shutil
+import platform
 import asyncio
 import logging
 import datetime
+import psutil
 from config import Config
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
 from helper.database import Mythicbotz
 from bot.core.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Prime non-blocking CPU percent counter on import
+try:
+    psutil.cpu_percent(interval=None)
+except Exception:
+    pass
+
+
+def _system_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 ʀᴇꜰʀᴇsʜ", callback_data="refresh_system"),
+                InlineKeyboardButton("✖️ ᴄʟᴏsᴇ", callback_data="close"),
+            ]
+        ]
+    )
+
+
+async def _build_safe_system_stats(bot, uid: int, ping_ms: float) -> str:
+    """
+    Build a safe, lightweight system stats summary without exposing sensitive
+    hostnames, IP addresses, filesystem paths, or environment variables.
+    """
+    uptime_sec = max(0, time.time() - getattr(bot, "uptime", Config.BOT_UPTIME))
+    uptime = time.strftime("%Hh %Mm %Ss", time.gmtime(uptime_sec))
+
+    try:
+        cpu_pct = psutil.cpu_percent(interval=None)
+        cpu_cores = psutil.cpu_count(logical=True) or os.cpu_count() or 1
+    except Exception:
+        cpu_pct = 0.0
+        cpu_cores = os.cpu_count() or 1
+
+    try:
+        vm = psutil.virtual_memory()
+        ram_used_gb = vm.used / (1024 ** 3)
+        ram_total_gb = vm.total / (1024 ** 3)
+        ram_pct = vm.percent
+    except Exception:
+        ram_used_gb, ram_total_gb, ram_pct = 0.0, 0.0, 0.0
+
+    try:
+        bot_ram_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        bot_ram_mb = 0.0
+
+    try:
+        du = shutil.disk_usage(".")
+        disk_used_gb = du.used / (1024 ** 3)
+        disk_total_gb = du.total / (1024 ** 3)
+        disk_free_gb = du.free / (1024 ** 3)
+    except Exception:
+        disk_used_gb, disk_total_gb, disk_free_gb = 0.0, 0.0, 0.0
+
+    os_name = platform.system() or "Linux"
+    py_ver = platform.python_version()
+
+    admin_line = ""
+    if uid in (Config.ADMIN or []):
+        try:
+            total_users = await Mythicbotz.total_users_count()
+            admin_line = f"├─▸ 👥 <b>ᴛᴏᴛᴀʟ ᴜsᴇʀs :</b> <code>{total_users}</code>\n"
+        except Exception:
+            pass
+
+    return (
+        "<blockquote>🖥️ <b>sʏsᴛᴇᴍ ɪɴꜰᴏ & sᴛᴀᴛs</b></blockquote>\n\n"
+        f"╭─▸ ⚙️ <b>ᴄᴘᴜ ʟᴏᴀᴅ :</b> <code>{cpu_pct:.1f}% ({cpu_cores} ᴄᴏʀᴇs)</code>\n"
+        f"├─▸ 🧠 <b>sʏsᴛᴇᴍ ʀᴀᴍ :</b> <code>{ram_used_gb:.2f} GB / {ram_total_gb:.2f} GB ({ram_pct:.1f}%)</code>\n"
+        f"├─▸ 📊 <b>ʙᴏᴛ ᴍᴇᴍᴏʀʏ :</b> <code>{bot_ram_mb:.1f} MB</code>\n"
+        f"├─▸ 💾 <b>ᴅɪsᴋ sᴘᴀᴄᴇ :</b> <code>{disk_used_gb:.1f} GB / {disk_total_gb:.1f} GB ({disk_free_gb:.1f} GB ꜰʀᴇᴇ)</code>\n"
+        f"├─▸ 🐍 <b>ʀᴜɴᴛɪᴍᴇ :</b> <code>Python {py_ver} ({os_name})</code>\n"
+        f"├─▸ ⌚ <b>ᴜᴘᴛɪᴍᴇ :</b> <code>{uptime}</code>\n"
+        f"{admin_line}"
+        f"╰─▸ 🛰️ <b>ᴘɪɴɢ :</b> <code>{ping_ms:.2f} ms</code>"
+    )
+
+
+@Client.on_message(filters.private & filters.command(["system", "sys"]))
+async def system_info_cmd(bot, message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    start_t = time.perf_counter()
+    st = await message.reply_text(
+        "<blockquote>⏳ <b>ᴄʜᴇᴄᴋɪɴɢ sʏsᴛᴇᴍ sᴛᴀᴛs...</b></blockquote>",
+        quote=True,
+    )
+    ping_ms = (time.perf_counter() - start_t) * 1000
+    text = await _build_safe_system_stats(bot, uid, ping_ms)
+    await st.edit(text=text, reply_markup=_system_markup())
+
+
+@Client.on_callback_query(filters.regex("^refresh_system$"))
+async def refresh_system_cb(bot, query: CallbackQuery):
+    uid = query.from_user.id if query.from_user else 0
+    start_t = time.perf_counter()
+    try:
+        await query.answer("⚡ ʀᴇꜰʀᴇsʜɪɴɢ sʏsᴛᴇᴍ sᴛᴀᴛs...")
+    except Exception:
+        pass
+    ping_ms = (time.perf_counter() - start_t) * 1000
+    text = await _build_safe_system_stats(bot, uid, ping_ms)
+    try:
+        await query.message.edit(text=text, reply_markup=_system_markup())
+    except Exception:
+        pass
 
 
 @Client.on_message(filters.command("status") & filters.user(Config.ADMIN))
