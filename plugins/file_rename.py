@@ -183,7 +183,8 @@ async def doc(bot, update):
     file_size = getattr(media, "file_size", 0) or 0
 
     # Smart RAM-Disk (/dev/shm) routing for small files & disk fallback for large (up to 2GB) files
-    file_path = ram_workspace.resolve_transfer_path(f"{user_id}_{new_filename}", file_size)
+    # Uses an isolated per-job directory so the file's basename on disk is strictly `new_filename`
+    file_path = ram_workspace.resolve_transfer_path(new_filename, file_size)
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
     path = None
@@ -213,11 +214,12 @@ async def doc(bot, update):
         ram_workspace.cleanup_files(file_path)
         return await ms.edit(f"<blockquote>❌ <b>ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ</b></blockquote>\n╰─ <code>{e}</code>")
 
-    # Handle metadata (only when enabled)
+    # Handle metadata (only when enabled) — output inside isolated `meta_out/` sub-folder
+    # so the file's basename remains strictly `new_filename`
     if _bool_metadata:
-        metadata_dir = ram_workspace.shm_dir if ram_workspace.should_use_ram_disk(file_size) else "Metadata"
+        metadata_dir = os.path.join(os.path.dirname(file_path), "meta_out")
         os.makedirs(metadata_dir, exist_ok=True)
-        metadata_path = os.path.join(metadata_dir, f"meta_{user_id}_{new_filename}")
+        metadata_path = os.path.join(metadata_dir, new_filename)
         try:
             res_meta = await add_metadata(path, metadata_path, user_metadata_code, ms)
             if not res_meta:
@@ -251,12 +253,7 @@ async def doc(bot, update):
             ram_workspace.cleanup_files(path, metadata_path)
             return await ms.edit(f"<blockquote>⚠️ <b>ᴄᴀᴘᴛɪᴏɴ ᴇʀʀᴏʀ</b></blockquote>\n╰─ <code>{e}</code>")
     else:
-        caption = (
-            f"<blockquote>📄 <b>{new_filename}</b></blockquote>\n"
-            f"╭─ 📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(file_size)}</code>\n"
-            f"├─ 👤 <b>ᴜsᴇʀ :</b> {user_name} (<code>{user_id}</code>)\n"
-            f"╰─ ⚡ <b>ᴘᴏᴡᴇʀᴇᴅ ʙʏ :</b> @CosmicBotz"
-        )
+        caption = f"<b>{new_filename}</b>"
 
     # Thumbnail handling:
     # 1. If user set a custom thumbnail (`c_thumb`), fetch from RAM cache or download once.
@@ -293,6 +290,7 @@ async def doc(bot, update):
             sent_message = await bot.send_document(
                 chat_id=user_id,
                 document=upload_path,
+                file_name=new_filename,
                 thumb=ph_path,
                 caption=caption,
                 progress=progress_for_pyrogram,
@@ -302,6 +300,7 @@ async def doc(bot, update):
             sent_message = await bot.send_video(
                 chat_id=user_id,
                 video=upload_path,
+                file_name=new_filename,
                 caption=caption,
                 thumb=ph_path,
                 duration=duration,
@@ -312,6 +311,7 @@ async def doc(bot, update):
             sent_message = await bot.send_audio(
                 chat_id=user_id,
                 audio=upload_path,
+                file_name=new_filename,
                 caption=caption,
                 thumb=ph_path,
                 duration=duration,

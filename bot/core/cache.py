@@ -271,13 +271,16 @@ class SmartRAMWorkspace:
 
     def resolve_transfer_path(self, filename: str, file_size_bytes: int = 0) -> str:
         """
-        Return an absolute file path inside `/dev/shm` (for small files/thumbnails)
-        or `downloads/` (for large files up to 2 GB).
+        Return an absolute file path inside an isolated per-transfer directory in
+        `/dev/shm` (for small files) or `downloads/` (for large files up to 2 GB)
+        so the file's basename on disk is strictly `filename` with zero `user_id_`
+        or temporary prefixes.
         """
         safe_name = os.path.basename(filename) or f"file_{int(time.time())}"
         base_dir = self.shm_dir if self.should_use_ram_disk(file_size_bytes) else self.disk_dir
-        os.makedirs(base_dir, exist_ok=True)
-        return os.path.join(base_dir, safe_name)
+        slot_dir = os.path.join(base_dir, f"job_{int(time.time() * 1000)}_{os.urandom(2).hex()}")
+        os.makedirs(slot_dir, exist_ok=True)
+        return os.path.join(slot_dir, safe_name)
 
     def resolve_thumb_path(self, name: str) -> str:
         """Return optimal path for temporary thumbnail processing."""
@@ -293,10 +296,14 @@ class SmartRAMWorkspace:
             if not path:
                 continue
             try:
+                parent = os.path.dirname(os.path.abspath(path))
                 if os.path.isfile(path):
                     os.remove(path)
                 elif os.path.isdir(path):
                     shutil.rmtree(path, ignore_errors=True)
+                # Also remove isolated per-transfer `job_*` directory if present
+                if os.path.basename(parent).startswith("job_") and os.path.isdir(parent):
+                    shutil.rmtree(parent, ignore_errors=True)
             except Exception as exc:
                 logger.debug("Cleanup ignored for %s: %s", path, exc)
         release_memory()
