@@ -1,4 +1,12 @@
 import os
+import asyncio
+
+# Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from datetime import datetime
 from pytz import timezone
 from pyrogram import Client, __version__
@@ -8,6 +16,38 @@ from aiohttp import web
 from route import web_server
 import pyrogram.utils
 import pyromod
+from pyromod.types.identifier import Identifier
+
+# Compatibility patch for Python 3.14+ (PEP 649 annotation handling in pyromod)
+def _pyromod_matches(self, update: "Identifier") -> bool:
+    annotations = getattr(type(self), "__annotations__", {})
+    for field in annotations:
+        pattern_value = getattr(self, field, None)
+        update_value = getattr(update, field, None)
+        if pattern_value is not None:
+            if isinstance(update_value, list):
+                if isinstance(pattern_value, list):
+                    if not set(update_value).intersection(set(pattern_value)):
+                        return False
+                elif pattern_value not in update_value:
+                    return False
+            elif isinstance(pattern_value, list):
+                if update_value not in pattern_value:
+                    return False
+            elif update_value != pattern_value:
+                return False
+    return True
+
+def _pyromod_count_populated(self):
+    non_null_count = 0
+    annotations = getattr(type(self), "__annotations__", {})
+    for attr in annotations:
+        if getattr(self, attr, None) is not None:
+            non_null_count += 1
+    return non_null_count
+
+Identifier.matches = _pyromod_matches
+Identifier.count_populated = _pyromod_count_populated
 
 # Import the destination plugin properly
 from plugins import destination  # <-- updated
