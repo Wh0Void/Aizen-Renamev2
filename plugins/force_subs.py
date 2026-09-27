@@ -2,12 +2,12 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import UserNotParticipant
 from config import Config
-from helper.database import jishubotz
+from helper.database import Mythicbotz
 
 
 
 async def not_subscribed(_, client, message):
-    await jishubotz.add_user(client, message)
+    await Mythicbotz.add_user(client, message)
     if not Config.FORCE_SUB:
         return False
     try:             
@@ -39,5 +39,5 @@ async def forces_sub(client, message):
 
 # Jishu Developer 
 # Don't Remove Credit 🥺
-# Telegram Channel @JishuBotz
+# Telegram Channel @Mythicbotz
 # Developer @JishuDeveloper

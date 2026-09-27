@@ -1,7 +1,7 @@
 import random
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply, CallbackQuery, Message
-from helper.database import jishubotz
+from helper.database import Mythicbotz
 from config import Config, Txt  
 from pyrogram.enums import ParseMode
 import html
@@ -9,7 +9,7 @@ import html
 @Client.on_message(filters.private & filters.command("start"))
 async def start(client: Client, message: Message):
     user = message.from_user
-    await jishubotz.add_user(client, message)                
+    await Mythicbotz.add_user(client, message)                
     button = InlineKeyboardMarkup([
         [InlineKeyboardButton('• ᴀʙᴏᴜᴛ •', callback_data='about'),
          InlineKeyboardButton('• ʜᴇʟᴘ •', callback_data='help')],
@@ -131,7 +131,7 @@ async def cb_handler(client, query: CallbackQuery):
         )
 
     elif data == "leaderboard":
-        leaderboard = await jishubotz.get_leaderboard()
+        leaderboard = await Mythicbotz.get_leaderboard()
         if not leaderboard:
             return await query.message.edit("🏆 No leaderboard data found yet.")
 
@@ -190,7 +190,7 @@ async def cb_handler(client, query: CallbackQuery):
 # ========== leaderboard command handler ==============#
 @Client.on_message(filters.command("leaderboard") & filters.private)
 async def leaderboard_handler(client, message):
-    top_users = await jishubotz.get_leaderboard(limit=10)
+    top_users = await Mythicbotz.get_leaderboard(limit=10)
 
     if not top_users:
         return await message.reply("🏆 Leaderboard is currently empty.")

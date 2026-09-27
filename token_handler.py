@@ -5,7 +5,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta
 from config import Config
 from helper.database import (
-    jishubotz,
+    Mythicbotz,
     add_token,
     reduce_token,
     get_token,
@@ -57,7 +57,7 @@ async def verify_command(client, message: Message):
     user_id = message.from_user.id
 
     # Check if already verified
-    if await jishubotz.is_premium(user_id):
+    if await Mythicbotz.is_premium(user_id):
         await message.reply("✅ You are already verified and have Premium access!")
         return
 
@@ -72,7 +72,7 @@ async def verify_command(client, message: Message):
 async def block_if_unverified(client, message: Message):
     user_id = message.from_user.id
 
-    if not await jishubotz.is_premium(user_id):
+    if not await Mythicbotz.is_premium(user_id):
         await message.reply_text(
             "**🔒 Access Denied!**\nYou must verify using /gettoken before using the bot.",
             quote=True,

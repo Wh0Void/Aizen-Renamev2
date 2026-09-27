@@ -3,7 +3,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import re, time
 
-from helper.database import jishubotz
+from helper.database import Mythicbotz
 
 try:
     from config import DESTINATION_PIC_URL
@@ -29,7 +29,7 @@ def _dest_kb(current: Optional[int]) -> InlineKeyboardMarkup:
 
 async def _send_dest_card(c: Client, m: Message):
     uid = m.from_user.id
-    current = await jishubotz.get_destination_channel(uid)
+    current = await Mythicbotz.get_destination_channel(uid)
     caption = (
         "🧭 <b>Destination Channel</b>\n\n"
         "• Set a channel once, and every renamed file will also be posted there automatically.\n"
@@ -50,14 +50,14 @@ async def cmd_setchannel(c: Client, m: Message):
 @Client.on_message(filters.command(["cancelsetchannel", "cancelsetdest"]) & filters.private)
 async def cmd_cancel_setchannel(c: Client, m: Message):
     uid = m.from_user.id
-    await jishubotz.clear_waiting_for_channel(uid)
+    await Mythicbotz.clear_waiting_for_channel(uid)
     await m.reply_text("✅ Cancelled destination setup.")
 
 
 @Client.on_callback_query(filters.regex(f"^{CB_SET_DEST}$"))
 async def cb_set_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
-    await jishubotz.set_waiting_for_channel(uid, True, int(time.time()))
+    await Mythicbotz.set_waiting_for_channel(uid, True, int(time.time()))
     await q.answer("Send me a forwarded post from your channel.", show_alert=False)
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL_SET)]])
     await q.message.reply_text(
@@ -71,7 +71,7 @@ async def cb_set_dest(c: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(f"^{CB_CANCEL_SET}$"))
 async def cb_cancel_set(c: Client, q: CallbackQuery):
     uid = q.from_user.id
-    await jishubotz.clear_waiting_for_channel(uid)
+    await Mythicbotz.clear_waiting_for_channel(uid)
     await q.answer("Setup cancelled.", show_alert=False)
     await q.message.edit_text("❌ Destination setup cancelled.")
 
@@ -79,8 +79,8 @@ async def cb_cancel_set(c: Client, q: CallbackQuery):
 @Client.on_callback_query(filters.regex(f"^{CB_CLEAR_DEST}$"))
 async def cb_clear_dest(c: Client, q: CallbackQuery):
     uid = q.from_user.id
-    await jishubotz.clear_destination_channel(uid)
-    await jishubotz.clear_waiting_for_channel(uid)
+    await Mythicbotz.clear_destination_channel(uid)
+    await Mythicbotz.clear_waiting_for_channel(uid)
     await q.answer("Destination cleared.", show_alert=False)
     await _send_dest_card(c, q.message)
 
@@ -101,12 +101,12 @@ async def cb_help_dest(c: Client, q: CallbackQuery):
 @Client.on_message(filters.private & (filters.text | filters.forwarded))
 async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     uid = m.from_user.id
-    waiting, ts = await jishubotz.is_waiting_for_channel(uid, with_ts=True)
+    waiting, ts = await Mythicbotz.is_waiting_for_channel(uid, with_ts=True)
     if not waiting:
         return
 
     if ts and (time.time() - ts > DEST_WAIT_TIMEOUT):
-        await jishubotz.clear_waiting_for_channel(uid)
+        await Mythicbotz.clear_waiting_for_channel(uid)
         return await m.reply_text("⌛ Timeout! Setup cancelled. Use /setchannel again.")
 
     if m.text and m.text.startswith("/"):
@@ -120,8 +120,8 @@ async def handle_forward_or_text_while_waiting(c: Client, m: Message):
     if not ok:
         return await m.reply_text(f"🚫 Bot lacks permission in that channel.\nReason: {why}")
 
-    await jishubotz.save_destination_channel(uid, channel_id)
-    await jishubotz.clear_waiting_for_channel(uid)
+    await Mythicbotz.save_destination_channel(uid, channel_id)
+    await Mythicbotz.clear_waiting_for_channel(uid)
     await m.reply_text(f"✅ Destination channel saved:\n<code>{channel_id}</code>")
 
 
@@ -169,7 +169,7 @@ async def _can_post_to_channel(c: Client, channel_id: int) -> Tuple[bool, str]:
 
 async def send_to_destination_if_set(c: Client, user_id: int, src_message: Message, caption: Optional[str] = None):
     try:
-        dest = await jishubotz.get_destination_channel(user_id)
+        dest = await Mythicbotz.get_destination_channel(user_id)
         if not dest:
             return
         if caption:

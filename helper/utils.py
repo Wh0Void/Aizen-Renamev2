@@ -124,5 +124,5 @@ def get_file_name(message):
 
 # Jishu Developer 
 # Don't Remove Credit 🥺
-# Telegram Channel @JishuBotz
+# Telegram Channel @Mythicbotz
 # Developer @JishuDeveloper

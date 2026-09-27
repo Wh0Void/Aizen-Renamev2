@@ -7,9 +7,9 @@ from .utils import send_log
 class Database:
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
-        self.jishubotz = self._client[database_name]
-        self.col = self.jishubotz.user
-        self.bannedList = self.jishubotz.bannedList
+        self.Mythicbotz = self._client[database_name]
+        self.col = self.Mythicbotz.user
+        self.bannedList = self.Mythicbotz.bannedList
 
     def new_user(self, id):
         return dict(
@@ -168,4 +168,4 @@ class Database:
 
 
 # Global instance
-jishubotz = Database(Config.DB_URL, Config.DB_NAME)
+Mythicbotz = Database(Config.DB_URL, Config.DB_NAME)

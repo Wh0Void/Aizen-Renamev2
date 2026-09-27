@@ -6,7 +6,7 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from helper.ffmpeg import fix_thumb, take_screen_shot, add_metadata
 from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
-from helper.database import jishubotz
+from helper.database import Mythicbotz
 from config import Config
 from asyncio import sleep
 import os, time, re, random, asyncio
@@ -22,7 +22,7 @@ async def rename_start(client, message):
     filename = file.file_name
 
     # Check if user is banned
-    if await jishubotz.is_banned(int(message.from_user.id)):
+    if await Mythicbotz.is_banned(int(message.from_user.id)):
         return await message.reply("You are banned from using this bot. Contact @PS_TalkBot to resolve the issue!")
 
     # Check file size limit
@@ -105,8 +105,8 @@ async def doc(bot, update):
 
     # Add prefix and suffix
     try:
-        prefix = await jishubotz.get_prefix(int(update.message.chat.id))
-        suffix = await jishubotz.get_suffix(int(update.message.chat.id))
+        prefix = await Mythicbotz.get_prefix(int(update.message.chat.id))
+        suffix = await Mythicbotz.get_suffix(int(update.message.chat.id))
         new_filename = add_prefix_suffix(new_filename, prefix, suffix)
     except Exception as e:
         return await update.message.edit(f"Error setting prefix/suffix: {e}\nContact @PS_TalkBot.")
@@ -140,10 +140,10 @@ async def doc(bot, update):
         return await ms.edit(f"Download failed: {e}")
 
     # Handle metadata
-    _bool_metadata = await jishubotz.get_metadata(int(update.message.chat.id))
+    _bool_metadata = await Mythicbotz.get_metadata(int(update.message.chat.id))
     metadata_path = None
     if _bool_metadata:
-        metadata = await jishubotz.get_metadata_code(int(update.message.chat.id))
+        metadata = await Mythicbotz.get_metadata_code(int(update.message.chat.id))
         metadata_path = f"Metadata/{new_filename}"
         try:
             await add_metadata(path, metadata_path, metadata, ms)
@@ -168,8 +168,8 @@ async def doc(bot, update):
     ph_path = None
     user_id = int(update.message.chat.id)
     user_name = update.message.chat.first_name
-    c_caption = await jishubotz.get_caption(int(update.message.chat.id))
-    c_thumb = await jishubotz.get_thumbnail(int(update.message.chat.id))
+    c_caption = await Mythicbotz.get_caption(int(update.message.chat.id))
+    c_thumb = await Mythicbotz.get_thumbnail(int(update.message.chat.id))
 
     if c_caption:
         try:
@@ -249,7 +249,7 @@ async def doc(bot, update):
                 logger.error(f"Failed to send to BIN_CHANNEL: {e}")
 
         # Send to destination channel
-        dest_channel = await jishubotz.get_destination_channel(user_id)
+        dest_channel = await Mythicbotz.get_destination_channel(user_id)
         if dest_channel:
             try:
                 await bot.copy_message(
@@ -261,7 +261,7 @@ async def doc(bot, update):
                 logger.error(f"Failed to send to destination channel: {e}")
 
         # Increment rename count
-        await jishubotz.increase_rename_count(user_id)
+        await Mythicbotz.increase_rename_count(user_id)
 
         # Notify about auto-deletion
         deletion_msg = await sent_message.reply("🗑 This file will auto-delete in 30 minutes. Save it now!")
