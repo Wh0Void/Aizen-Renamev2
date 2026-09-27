@@ -19,7 +19,7 @@
 - Force subscribe available.
 - Supports ulimited renaming at a time.
 - Auto delete 
-- Fully modified repo
+- Fully modified repo.
 - Deploy To Koyeb + Heroku + Railway.
 - [Developer support](https://telegram.me/TechifySupport) 24x7
 </details>
