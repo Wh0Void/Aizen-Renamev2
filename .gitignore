@@ -1,0 +1,42 @@
+﻿# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Local Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# Telegram / Pyrogram Session files (NEVER commit these)
+*.session
+*.session-journal
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary downloads and media
+downloads/
+temp/
+*.tmp
+*.log
+
+# Database / SQLite
+*.db
+*.sqlite3
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
