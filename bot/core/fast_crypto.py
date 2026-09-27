@@ -100,16 +100,38 @@ def configure_wzgram_environment(
     return applied
 
 
+def _is_writer_closing(writer: Any) -> bool:
+    """Return True if an asyncio/uvloop StreamWriter or its underlying TCPTransport is closed/closing."""
+    if writer is None:
+        return True
+    try:
+        if hasattr(writer, "is_closing") and writer.is_closing():
+            return True
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            if hasattr(transport, "is_closing") and transport.is_closing():
+                return True
+            if getattr(transport, "closed", False) or getattr(transport, "_closed", False):
+                return True
+    except Exception:
+        return True
+    return False
+
+
 def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) -> None:
     """
-    Patch Wzgram v3.1.1's `Session.send`, `Client.get_dc_option`, and `save_file`
-    to eliminate `Connection closed by the server` during multi-session uploads:
-      1. Serializes `msg_factory` + `warpcrypto.pack_message` + `connection.send`
+    Patch Wzgram v3.1.1's `TCP`, `Session.send`, `Client.get_dc_option`, and `save_file`
+    to eliminate `Connection closed by the server` and `uvloop` closed-transport `RuntimeError`s:
+      1. Hardens `TCP.send`, `TCP.close`, and `TCP.recv` so closed/closing `uvloop`
+         `TCPTransport` handles immediately set `is_connected = False` and raise
+         `ConnectionResetError` instead of spamming `Send exception: RuntimeError`
+         across queued coroutines.
+      2. Serializes `msg_factory` + `warpcrypto.pack_message` + `connection.send`
          per Session so `PingDelayDisconnect` / `MsgsAck` and 512 KB chunks never
          arrive on the wire with out-of-order `msg_id` or `seq_no`.
-      2. Aligns home-DC media sessions with the production DC endpoint (`not dc.media_only`)
+      3. Aligns home-DC media sessions with the production DC endpoint (`not dc.media_only`)
          where `auth_key` was negotiated.
-      3. Configures `save_file` `POOL_SIZE` to match `pool_size` (6-8 parallel sockets).
+      4. Configures `save_file` `POOL_SIZE` to match `pool_size` (6-8 parallel sockets).
     """
     global _MTPROTO_PATCHED
     if _MTPROTO_PATCHED:
@@ -132,7 +154,58 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
         save_file_mod.POOL_SIZE = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
-        # 2. Patch Session.send with per-session atomic ordering lock
+        # 2. Patch TCP transport send/close/recv to handle uvloop closed TCPTransport cleanly
+        _orig_tcp_recv = tcp_mod.TCP.recv
+
+        async def _safe_tcp_send(self: Any, data: bytes) -> None:
+            if not self.is_connected or _is_writer_closing(self.writer):
+                self.is_connected = False
+                raise ConnectionResetError("Connection closed")
+
+            async with self.lock:
+                if not self.is_connected or _is_writer_closing(self.writer):
+                    self.is_connected = False
+                    raise ConnectionResetError("Connection closed")
+
+                try:
+                    self.writer.write(data)
+                    await self.writer.drain()
+                except Exception as e:
+                    self.is_connected = False
+                    self.writer = None
+                    tcp_mod.log.debug("TCP send aborted on closed transport: %s %s", type(e).__name__, e)
+                    raise ConnectionResetError("Connection closed") from e
+
+        async def _safe_tcp_close(self: Any) -> None:
+            self.is_connected = False
+            writer = self.writer
+            self.writer = None
+            self.reader = None
+
+            try:
+                if writer is not None:
+                    if not _is_writer_closing(writer):
+                        writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), tcp_mod.TCP.TIMEOUT)
+                elif self.socket is not None:
+                    self.socket.close()
+            except Exception as e:
+                tcp_mod.log.debug("TCP close ignored on transport: %s %s", type(e).__name__, e)
+
+        async def _safe_tcp_recv(self: Any, length: int = 0) -> Optional[bytes]:
+            if not self.is_connected or self.reader is None:
+                self.is_connected = False
+                return None
+            result = await _orig_tcp_recv(self, length)
+            if result is None:
+                self.is_connected = False
+            return result
+
+        tcp_mod.TCP.send = _safe_tcp_send
+        tcp_mod.TCP.close = _safe_tcp_close
+        tcp_mod.TCP.recv = _safe_tcp_recv
+
+        # 3. Patch Session.send with per-session atomic ordering lock and fast-fail transport check
         async def _atomic_ordered_send(
             self: Session,
             data: Any,
@@ -140,8 +213,13 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             timeout: float = Session.WAIT_TIMEOUT,
             retry: int = 0,
         ) -> Any:
-            if self.connection is None or self.connection.protocol is None:
-                raise OSError("Connection is not established")
+            if (
+                getattr(self, "_stopping", False)
+                or getattr(self, "_teardown_started", False)
+                or self.connection is None
+                or self.connection.protocol is None
+            ):
+                raise ConnectionResetError("Connection is not established")
 
             send_lock = getattr(self, "_atomic_send_lock", None)
             if send_lock is None:
@@ -154,8 +232,17 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
             # Allocate msg_id/seq_no, encrypt, and write to TCP socket atomically per Session
             async with send_lock:
-                if self.connection is None or self.connection.protocol is None:
-                    raise OSError("Connection is not established")
+                protocol = getattr(self.connection, "protocol", None) if self.connection else None
+                if (
+                    getattr(self, "_stopping", False)
+                    or getattr(self, "_teardown_started", False)
+                    or protocol is None
+                    or not getattr(protocol, "is_connected", False)
+                    or _is_writer_closing(getattr(protocol, "writer", None))
+                ):
+                    if protocol is not None:
+                        protocol.is_connected = False
+                    raise ConnectionResetError("Connection is not established")
 
                 message = self.msg_factory(data, len(serialized))
                 msg_id = message.msg_id
@@ -177,7 +264,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         )
                     else:
                         payload = await self.loop.run_in_executor(
-                            self.connection.protocol.crypto_executor,
+                            protocol.crypto_executor,
                             warpcrypto.pack_message,
                             message.msg_id,
                             message.seq_no,
@@ -195,6 +282,17 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         )
                     except asyncio.TimeoutError:
                         raise TimeoutError("Request send timed out")
+                    except (OSError, RuntimeError) as send_err:
+                        if (
+                            self.is_started.is_set()
+                            and not getattr(self, "_stopping", False)
+                            and not getattr(self, "_teardown_started", False)
+                            and not getattr(self, "is_restarting", False)
+                        ):
+                            self.loop.create_task(self._safe_restart())
+                        if isinstance(send_err, ConnectionResetError):
+                            raise
+                        raise ConnectionResetError(str(send_err)) from send_err
 
                     delivered = True
                 finally:
@@ -244,7 +342,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
         Session.send = _atomic_ordered_send
 
-        # 3. Patch Client.get_dc_option so media sessions on the primary DC use the
+        # 4. Patch Client.get_dc_option so media sessions on the primary DC use the
         # production DC IP (`not dc.media_only`) that shares the bot's `auth_key`
         _orig_get_dc_option = Client.get_dc_option
 
@@ -268,7 +366,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
         Client.get_dc_option = _aligned_get_dc_option
 
         _MTPROTO_PATCHED = True
-        logger.info("Applied Wzgram MTProto atomic send-ordering & DC alignment patches.")
+        logger.info("Applied Wzgram MTProto atomic send-ordering, TCP transport guard & DC alignment patches.")
     except Exception as exc:
         logger.warning("Could not apply Wzgram MTProto patch: %s", exc)
 
@@ -617,9 +715,11 @@ class MultiSessionMediaPool:
         """
         session = self.select_session(dc_id, pool)
         sid = id(session)
+        now = time.monotonic()
+        session.last_used = now
         self._session_inflight[sid] = self._session_inflight.get(sid, 0) + 1
         if self.client is not None and hasattr(self.client, "_media_session_last_used"):
-            self.client._media_session_last_used[sid] = time.monotonic()
+            self.client._media_session_last_used[sid] = now
 
         try:
             result = await rpc_factory(session)
@@ -627,6 +727,7 @@ class MultiSessionMediaPool:
             self._total_bytes_dispatched += chunk_bytes
             return result
         finally:
+            session.last_used = time.monotonic()
             remaining = self._session_inflight.get(sid, 1) - 1
             if remaining <= 0:
                 self._session_inflight.pop(sid, None)
@@ -635,27 +736,46 @@ class MultiSessionMediaPool:
 
     async def reap_idle_sessions(self) -> int:
         """
-        Reap pooled media sessions that have been idle longer than `self.idle_timeout`,
-        returning freed heap memory to the OS.
+        Reap pooled media sessions that have been idle longer than `self.idle_timeout`
+        and have zero in-flight RPCs, returning freed heap memory to the OS.
         """
         reaped = 0
         now = time.monotonic()
         if self.client is not None and hasattr(self.client, "media_session_pools"):
-            for dc_id, pool in list(self.client.media_session_pools.items()):
-                if not isinstance(pool, list):
-                    continue
-                keep = []
-                for sess in pool:
-                    last_used = getattr(sess, "last_used", now)
-                    if (now - last_used) > self.idle_timeout:
-                        try:
-                            await sess.stop()
-                        except Exception:
-                            pass
-                        reaped += 1
+            client_locks = getattr(self.client, "_media_sessions_locks", None)
+            for dc_id in list(self.client.media_session_pools.keys()):
+                if isinstance(client_locks, dict):
+                    lock = client_locks.setdefault(dc_id, asyncio.Lock())
+                else:
+                    lock = self._dc_locks.setdefault(dc_id, asyncio.Lock())
+
+                stale: List[Any] = []
+                async with lock:
+                    pool = self.client.media_session_pools.get(dc_id)
+                    if not isinstance(pool, list):
+                        continue
+                    keep: List[Any] = []
+                    for sess in pool:
+                        last_used = getattr(sess, "last_used", now)
+                        has_pending = bool(getattr(sess, "results", None)) or (
+                            self._session_inflight.get(id(sess), 0) > 0
+                        )
+                        if not has_pending and (now - last_used) > self.idle_timeout:
+                            stale.append(sess)
+                        else:
+                            keep.append(sess)
+                    if keep:
+                        self.client.media_session_pools[dc_id] = keep
                     else:
-                        keep.append(sess)
-                self.client.media_session_pools[dc_id] = keep
+                        self.client.media_session_pools.pop(dc_id, None)
+
+                for sess in stale:
+                    try:
+                        await sess.stop()
+                    except Exception:
+                        pass
+                    reaped += 1
+
         if reaped > 0:
             release_memory()
         return reaped
