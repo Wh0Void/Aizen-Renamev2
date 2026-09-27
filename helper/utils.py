@@ -5,36 +5,46 @@ from config import Config, Txt
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import shutil
 
+_PROGRESS_LAST_EDIT = {}
+
+
 async def progress_for_pyrogram(current, total, ud_type, message, start):
     now = time.time()
-    diff = now - start
-    if round(diff % 5.00) == 0 or current == total:        
-        percentage = current * 100 / total
-        speed = current / diff
+    diff = max(now - start, 0.001)
+    msg_key = (getattr(getattr(message, "chat", None), "id", 0), getattr(message, "id", id(message)))
+    last_edit = _PROGRESS_LAST_EDIT.get(msg_key, 0.0)
+
+    if current == total or (now - last_edit) >= 5.0:
+        _PROGRESS_LAST_EDIT[msg_key] = now
+        if current == total:
+            _PROGRESS_LAST_EDIT.pop(msg_key, None)
+
+        total_safe = max(total, 1)
+        percentage = current * 100 / total_safe
+        speed = max(current / diff, 1.0)
         elapsed_time = round(diff) * 1000
-        time_to_completion = round((total - current) / speed) * 1000
+        time_to_completion = round((total_safe - current) / speed) * 1000
         estimated_total_time = elapsed_time + time_to_completion
 
         elapsed_time = TimeFormatter(milliseconds=elapsed_time)
         estimated_total_time = TimeFormatter(milliseconds=estimated_total_time)
 
-        progress = "{0}{1}".format(
-            ''.join(["▣" for i in range(math.floor(percentage / 5))]),
-            ''.join(["▢" for i in range(20 - math.floor(percentage / 5))])
-        )            
-        tmp = progress + Txt.PROGRESS_BAR.format( 
+        filled = min(14, max(0, math.floor(percentage / (100 / 14))))
+        bar = "".join(["▰" for _ in range(filled)]) + "".join(["▱" for _ in range(14 - filled)])
+        progress = f"<blockquote><code>[{bar}] {round(percentage, 1)}%</code></blockquote>"
+        tmp = progress + Txt.PROGRESS_BAR.format(
             round(percentage, 2),
             humanbytes(current),
             humanbytes(total),
-            humanbytes(speed),            
+            humanbytes(speed),
             estimated_total_time if estimated_total_time != '' else "0 s"
         )
         try:
             await message.edit(
-                text=f"{ud_type}\n\n{tmp}",               
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ 𝖢𝖺𝗇𝖼𝖾𝗅 ✖️", callback_data="close")]])                                               
+                text=f"{ud_type}\n\n{tmp}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ ᴄᴀɴᴄᴇʟ", callback_data="close")]])
             )
-        except:
+        except Exception:
             pass
 
 def humanbytes(size):    
@@ -73,10 +83,18 @@ async def send_log(b, u):
     if Config.LOG_CHANNEL is not None:
         curr = datetime.now(timezone("Asia/Kolkata"))
         date = curr.strftime('%d %B, %Y')
-        time = curr.strftime('%I:%M:%S %p')
+        time_str = curr.strftime('%I:%M:%S %p')
         await b.send_message(
             Config.LOG_CHANNEL,
-            f"<b><u>𝖭𝖾𝗐 𝖴𝗌𝖾𝗋 𝖲𝗍𝖺𝗋𝗍𝖾𝖽 𝖳𝗁𝖾 𝖡𝗈𝗍</u></b> \n\n<b>𝖴𝗌𝖾𝗋 𝖬𝖾𝗇𝗍𝗂𝗈𝗇</b> : {u.mention}\n<b>𝖴𝗌𝖾𝗋 𝖨𝖣</b> : `{u.id}`\n<b>𝖥𝗂𝗋𝗌𝗍 𝖭𝖺𝗆𝖾</b> : {u.first_name} \n<b>𝖫𝖺𝗌𝗍 𝖭𝖺𝗆𝖾</b> : {u.last_name} \n<b>𝖴𝗌𝖾𝗋 𝖭𝖺𝗆𝖾</b> : @{u.username} \n<b>𝖴𝗌𝖾𝗋 𝖫𝗂𝗇𝗄</b> : <a href='tg://openmessage?user_id={u.id}'>𝖢𝗅𝗂𝖼𝗄 𝖧𝖾𝗋𝖾</a>\n\n<b>𝖣𝖺𝗍𝖾</b> : {date}\n<b>𝖳𝗂𝗆𝖾</b> : {time}"
+            f"<blockquote>✨ <b>ɴᴇᴡ ᴜsᴇʀ sᴛᴀʀᴛᴇᴅ ᴛʜᴇ ʙᴏᴛ</b></blockquote>\n\n"
+            f"╭─▸ 👤 <b>ᴜsᴇʀ :</b> {u.mention}\n"
+            f"├─▸ 🆔 <b>ᴜsᴇʀ ɪᴅ :</b> <code>{u.id}</code>\n"
+            f"├─▸ 🏷️ <b>ꜰɪʀsᴛ ɴᴀᴍᴇ :</b> <code>{u.first_name or 'N/A'}</code>\n"
+            f"├─▸ 🏷️ <b>ʟᴀsᴛ ɴᴀᴍᴇ :</b> <code>{u.last_name or 'N/A'}</code>\n"
+            f"├─▸ 🌐 <b>ᴜsᴇʀɴᴀᴍᴇ :</b> @{u.username or 'None'}\n"
+            f"├─▸ 🔗 <b>ᴘʀᴏꜰɪʟᴇ :</b> <a href='tg://openmessage?user_id={u.id}'>ᴄʟɪᴄᴋ ʜᴇʀᴇ</a>\n"
+            f"├─▸ 📅 <b>ᴅᴀᴛᴇ :</b> <code>{date}</code>\n"
+            f"╰─▸ ⏰ <b>ᴛɪᴍᴇ :</b> <code>{time_str}</code>"
         )
         
 
@@ -122,7 +140,5 @@ def get_file_name(message):
     return media.file_name if media else "Unknown_File"
 
 
-# Jishu Developer 
-# Don't Remove Credit 🥺
-# Telegram Channel @Mythicbotz
-# Developer @JishuDeveloper
+# Developer @CosmicBotz
+# Telegram Channel @CosmicBotz

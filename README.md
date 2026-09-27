@@ -1,90 +1,73 @@
 <h1 align="center">
- <b><a href="https://youtu.be/6BWLUL3Faxs" target="/blank">Rename Bot 2GB</a>
+ <b><a href="https://telegram.me/CosmicBotz" target="_blank">⚡ CosmicBotz — High-Speed 2GB Rename Bot</a></b>
 </h1>
 
-<p align="center">🩷 Thanks for Being Here 🩷</p>
+<p align="center">🚀 Powered by <b>Wzgram v3.1.1</b> + <b>Multi-Session Connection Pool (6–8 TCP Streams)</b> + <b>Dual-Tier Smart RAM Cache</b> 🚀</p>
 
+---
 
+### ⚡ HIGH-SPEED ARCHITECTURE
 
-### 🥰 FEATURES
+- **Wzgram Framework (`wzgram==3.1.1`)**: Built-in native `ask()` / `listen()` listeners, lazy TL schema loading (~50% lower baseline RAM), and Rust `WarpCrypto` hardware-accelerated AES-NI encryption.
+- **Multi-Session Connection Pool (`bot/core/fast_crypto.py`)**: Overcomes Telegram's ~3–5 MB/s per-socket cap by spawning **6 to 8 parallel TCP media sessions** (`Session(..., is_media=True)`) and distributing **512 KB chunks** across all connections simultaneously (achieving 30–50+ MB/s on Linux VPS).
+- **Dual-Tier Memory & RAM Cache (`bot/core/cache.py`)**:
+  - **Tier 1 (In-Memory LRU + TTL Cache)**: Caches MongoDB user profiles, prefix/suffix/caption/metadata settings, ban status, force-sub checks, and normalized 320x320 JPEG thumbnails in RAM.
+  - **Tier 2 (Smart `/dev/shm` RAM-Disk Router)**: Routes thumbnails and small files through Linux `/dev/shm` RAM disk while automatically falling back to disk with strictly bounded read-ahead buffers for large 2 GB files on **Render** (512 MB RAM) and **Koyeb**.
 
-<details><summary>Tap On Me For Bot Features</summary>
+---
 
-- Renames very fast .
-- Permanent Thumbnail support.
-- Force join for the user for use.
-- Supports Broadcasts.
-- Set custom caption.
-- Has a custom Start-up pic.
-- Force subscribe available.
-- Supports ulimited renaming at a time.
-- Auto delete 
-- Fully modified repo.
-- Deploy To Koyeb + Heroku + Railway.
-- [Developer support](https://telegram.me/TechifySupport) 24x7
-</details>
+### 🔥 ENVIRONMENT VARIABLES
 
+* `API_ID` - Your Telegram API ID from [my.telegram.org](https://my.telegram.org).
+* `API_HASH` - Your Telegram API HASH from [my.telegram.org](https://my.telegram.org).
+* `BOT_TOKEN` - Bot token from [@BotFather](https://telegram.me/BotFather).
+* `ADMIN` - Space-separated Telegram user IDs of bot admins.
+* `DB_URL` - MongoDB connection URI.
+* `DB_NAME` - MongoDB database name.
+* `FORCE_SUB` - Force subscribe channel username without `@` (e.g. `CosmicBotz`).
+* `LOG_CHANNEL` - Log Channel ID (`-100...`).
+* `BIN_CHANNEL` - Bin Channel ID (`-100...`).
+* `START_PIC` - Start message photo URL.
+* `MEDIA_POOL_SIZE` - Parallel TCP media sessions per DC (default `6`, max `8`).
+* `RAM_CACHE_MAX_MB` - Max file size in MB routed via `/dev/shm` RAM disk (default `40`).
 
-### 🔥 VARIABLES
-
-<details><summary>Tap On Me For Environment Variable</summary>
-
-* `API_ID` - Your Telegram [API ID](https://youtu.be/RdMY6Lqfi9w).
-* `API_HASH` - Your Telegram [API HASH](https://youtu.be/RdMY6Lqfi9w).
-* `BOT_TOKEN` - Get it from [BotFather](https://youtu.be/aJILCCXfNVM).
-* `ADMIN` - Your ID
-* `DB_URL` - Enter Mongodb [database URL](https://youtu.be/pMJpHoiu1go)
-* `FORCE_SUB` - Force subscribe channel username without `@`
-* `LOG_CHANNEL` - Log Channel ID.
-* `DB_NAME`  - Your database name from mongoDB.
-* `START_PIC` - Start message photo.
-* `BIN_CHANNEL` - Bin channel ID.
-</details>
-
+---
 
 ### 😍 COMMANDS
 
-<details><summary>Tap On Me For Commands</summary>
-
+```text
+start - Check if the bot is running
+help - Open interactive help menu
+viewthumb - View current custom thumbnail
+delthumb - Delete current custom thumbnail
+set_caption - Set a custom caption
+see_caption - View your custom caption
+del_caption - Delete custom caption
+metadata - Configure custom FFmpeg media metadata
+set_prefix - Set filename prefix
+see_prefix - View filename prefix
+del_prefix - Delete filename prefix
+set_suffix - Set filename suffix
+see_suffix - View filename suffix
+del_suffix - Delete filename suffix
+setchannel - Interactive destination channel setup
+adddestination - Set destination channel ID
+removedestination - Remove destination channel
+listdestinations - View current destination channel
+leaderboard - View top renamers leaderboard
+ping - Check bot latency
+status - Live Multi-Session Pool & RAM Cache telemetry [ADMIN]
+users - View total registered users [ADMIN]
+banned - View banned users list [ADMIN]
+ban - Ban a user [ADMIN]
+unban - Unban a user [ADMIN]
+broadcast - Broadcast a message to all users [ADMIN]
+restart - Restart the bot [ADMIN]
 ```
-start - Check if the bot is running.
-viewthumb - To view current thumbnail.
-delthumb - To delete current thumbnail.
-set_caption - set a custom caption.
-see_caption - see your custom caption.
-del_caption - delete custom caption.
-metadata - To change your metadata
-ping - To check bot ping.
-donate - To support developer.
-set_prefix - Set Your Prefix
-see_prefix - See Your Prefix
-del_prefix - Delete Your Prefix
-set_suffix - Set Your Suffix
-see_suffix - See Your Suffix
-del_suffix - Delete Your Suffix
-restart - To restart the bot [FOR ADMINS USE ONLY]
-broadcast - Message Broadcast command [FOR ADMINS USE ONLY].
-status - Check bot status [FOR ADMINS USE ONLY].
-```
-</details>
 
-### 🥳 CREDIT
+---
 
-<details><summary>Tap On Me For Credit</summary>
+### 🥳 CREDIT & DEVELOPER
 
-💝 [TechifyBots](https://github.com/TechifyBots)
-
-💘 [JishuDeveloper](https://github.com/JishuDeveloper)
-</details>
-
-### 💕 CONTACT DEVELOPER
-
-- [Rahul](https://telegram.me/TechifyRahul)
-
-### ☕ BUY ME A COFFEE
-- [PayPal](https://paypal.me/TechifyBots)
-- [UPI](https://TechifyBots.github.io/Donate)
-
-### 📌 NOTE
-
-𝘊𝘰𝘱𝘺𝘪𝘯𝘨 𝘰𝘳 𝘚𝘦𝘭𝘭𝘪𝘯𝘨 𝘵𝘩𝘪𝘴 𝘳𝘦𝘱𝘰 𝘪𝘴 𝘴𝘵𝘳𝘪𝘤𝘵𝘭𝘺 𝘱𝘳𝘰𝘩𝘪𝘣𝘪𝘵𝘦𝘥.</b>
+- **Developer**: [CosmicBotz](https://telegram.me/CosmicBotz)
+- **Channel**: [@CosmicBotz](https://telegram.me/CosmicBotz)

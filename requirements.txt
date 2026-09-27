@@ -1,4 +1,4 @@
-﻿pyromod
+wzgram==3.1.1
 motor
 dnspython
 hachoir
@@ -7,9 +7,9 @@ aiohttp
 pytz
 Flask
 gunicorn
-pyrogram
 pymongo
 requests
 python-dotenv
 pycryptodome
-# TgCrypto
+psutil
+uvloop; sys_platform != 'win32'

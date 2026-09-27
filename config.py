@@ -23,9 +23,9 @@ class Config(object):
     ADMIN = [int(admin) if id_pattern.search(admin) else admin for admin in os.environ.get('ADMIN', '6617544956').split()]
 
     # channels logs
-    FORCE_SUB   = os.environ.get("FORCE_SUB", "MythicBot_Support") 
-    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1002686116676"))
-    BIN_CHANNEL = int(os.environ.get("BIN_CHANNEL", "-1002475576837"))
+    FORCE_SUB   = os.environ.get("FORCE_SUB", "CosmicBotz") 
+    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", ""))
+    BIN_CHANNEL = int(os.environ.get("BIN_CHANNEL", ""))
 
     # wes response configuration     
     WEBHOOK = bool(os.environ.get("WEBHOOK", True))
@@ -33,118 +33,113 @@ class Config(object):
 
     # 🔐 TOKEN SYSTEM
     TOKEN_TIME = 12   # ⏰ 12 hours in seconds
-    SHORTLINK_API = os.getenv("SHORTLINK_API", "242fb1e2951cdf981a8725048e7abafa3cf868ae")
+    SHORTLINK_API = os.getenv("SHORTLINK_API", "242fb1e2951cdf981a8")
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
+
+    # ⚡ High-Speed Multi-Session Pool & Low-RAM Cache Configs (Render / Koyeb optimized)
+    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "6"))  # 6 to 8 parallel TCP media sessions
+    RAM_CACHE_MAX_MB = int(os.environ.get("RAM_CACHE_MAX_MB", "40"))  # Max file size (MB) routed through /dev/shm
+    USER_CACHE_TTL = int(os.environ.get("USER_CACHE_TTL", "1800"))  # In-memory user DB cache TTL in seconds
+    WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "24"))  # Read-ahead slots (24 * 512KB = 12MB)
 
 
 
 class Txt(object):
-    # part of text configuration
-    START_TXT = """<b>👋 Hello ➤ {},</b>
+    # Premium Modern UI Text Configuration
+    START_TXT = """<blockquote>✨ <b>ʜᴇʏ {}, ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴄᴏsᴍɪᴄ ʀᴇɴᴀᴍᴇʀ ⚡</b></blockquote>
 
-<blockquote>
-<b>❝ Rename, Customize & Share — All in One Place ❞</b>
-</blockquote>
+<blockquote><b>❝ ᴜʟᴛʀᴀ-ꜰᴀsᴛ 𝟸ɢʙ ꜰɪʟᴇ ʀᴇɴᴀᴍᴇʀ & ᴍᴇᴅɪᴀ ᴇɴɢɪɴᴇ ❞</b></blockquote>
 
-✨ With this bot, you can:
-➤ <b>Rename</b> files with a custom name  
-➤ <b>Set or change thumbnails</b> for your media  
-➤ <b>Convert</b> file ↔️ video (and vice versa)  
-➤ Add <b>custom captions</b>, <b>prefix</b>, and <b>suffix</b>
+<b>🚀 ᴡʜᴀᴛ ɪ ᴄᴀɴ ᴅᴏ :</b>
+╭─ 📁 <b>ʀᴇɴᴀᴍᴇ :</b> <code>ʜɪɢʜ-sᴘᴇᴇᴅ ᴍᴜʟᴛɪ-sᴇssɪᴏɴ ᴛʀᴀɴsꜰᴇʀs</code>
+├─ 🖼️ <b>ᴛʜᴜᴍʙɴᴀɪʟ :</b> <code>ᴄᴜsᴛᴏᴍ ᴏʀ ᴀᴜᴛᴏ ᴠɪᴅᴇᴏ-ꜰʀᴀᴍᴇ ᴇxᴛʀᴀᴄᴛ</code>
+├─ 🎞️ <b>ᴄᴏɴᴠᴇʀᴛ :</b> <code>ᴅᴏᴄᴜᴍᴇɴᴛ ⇄ ᴠɪᴅᴇᴏ ⇄ ᴀᴜᴅɪᴏ</code>
+├─ 🏷️ <b>ꜰᴏʀᴍᴀᴛ :</b> <code>ᴄᴜsᴛᴏᴍ ᴘʀᴇꜰɪx, sᴜꜰꜰɪx & ᴄᴀᴘᴛɪᴏɴs</code>
+╰─ ⚙️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ :</b> <code>sᴛʀᴇᴀᴍ-ʟᴇᴠᴇʟ ꜰꜰᴍᴘᴇɢ ᴛᴀɢ ɪɴᴊᴇᴄᴛɪᴏɴ</code>
 
-<b>⚙️ Features You’ll Love:</b>
-🔧 Auto Thumbnail Generator  
-📝 Caption Editor  
-📁 Filename Formatter  
-📤 Inline Upload Options
+<blockquote>⚠️ <b>ɴᴏᴛᴇ :</b> ʀᴇɴᴀᴍɪɴɢ ᴏʀ sʜᴀʀɪɴɢ <u>ᴀᴅᴜʟᴛ / ɴsꜰᴡ ᴄᴏɴᴛᴇɴᴛ</u> ɪs <b>sᴛʀɪᴄᴛʟʏ ᴘʀᴏʜɪʙɪᴛᴇᴅ</b>.
+⚡ <b>ᴘᴏᴡᴇʀᴇᴅ ʙʏ :</b> <a href='https://telegram.me/CosmicBotz'>@CosmicBotz</a></blockquote>"""
 
-<b>🚫 Note:</b>  
-Renaming or sharing <u>adult content</u> is <b>strictly prohibited</b>.  
-Violation will lead to an <b>immediate and permanent ban</b>.
+    ABOUT_TXT = """<blockquote>⚡ <b>ᴀʙᴏᴜᴛ ᴄᴏsᴍɪᴄ ʀᴇɴᴀᴍᴇ ᴇɴɢɪɴᴇ</b></blockquote>
 
-<blockquote><b>✨ Stay safe, stay creative, and enjoy the bot!</b></blockquote>
-"""
+╭─ 🤖 <b>ʙᴏᴛ ɴᴀᴍᴇ :</b> <a href='https://telegram.me/CosmicBotz'>ʀᴇɴᴀᴍᴇ 𝟸ɢʙ ʙᴏᴛ</a>
+├─ 🚀 <b>ꜰʀᴀᴍᴇᴡᴏʀᴋ :</b> <code>ᴡᴢɢʀᴀᴍ ᴠ𝟹.𝟷.𝟷 (ᴍᴜʟᴛɪ-sᴇssɪᴏɴ)</code>
+├─ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>ᴡᴀʀᴘᴄʀʏᴘᴛᴏ (ʀᴜsᴛ ᴀᴇs-ɴɪ)</code>
+├─ 🧠 <b>ᴄᴀᴄʜᴇ :</b> <code>ᴅᴜᴀʟ-ᴛɪᴇʀ ʀᴀᴍ + /dev/shm</code>
+├─ 🗄️ <b>ᴅᴀᴛᴀʙᴀsᴇ :</b> <code>ᴍᴏɴɢᴏᴅʙ ᴀᴛʟᴀs</code>
+├─ ☁️ <b>ᴄʟᴏᴜᴅ :</b> <code>ʀᴇɴᴅᴇʀ / ᴋᴏʏᴇʙ</code>
+╰─ 👨‍💻 <b>ᴅᴇᴠᴇʟᴏᴘᴇʀ :</b> <a href='https://telegram.me/CosmicBotz'>CosmicBotz</a>
 
-    ABOUT_TXT = """
-<b>❍ ᴍʏ ɴᴀᴍᴇ : <a href='https://telegram.me/TechifyBots'>ʀᴇɴᴀᴍᴇ ɢᴇɴɪᴇ ʙᴏᴛ</a>
-❍ ʜᴏsᴛᴇᴅ ᴏɴ : ᴋᴏʏᴇʙ
-❍ ᴅᴀᴛᴀʙᴀsᴇ : ᴍᴏɴɢᴏ ᴅʙ
-❍ ʟᴀɴɢᴜᴀɢᴇ : ᴘʏᴛʜᴏɴ 𝟹
-❍ ᴍʏ ᴄʀᴇᴀᴛᴏʀ : <a href='https://telegram.me/callownerbot'>ʀᴀʜᴜʟ</a>
+<blockquote>✨ <b>ᴛᴀᴘ ᴛʜᴇ ʙᴜᴛᴛᴏɴs ʙᴇʟᴏᴡ ᴛᴏ ᴇxᴘʟᴏʀᴇ ᴍᴏʀᴇ.</b></blockquote>"""
 
-➻ ᴄʟɪᴄᴋ ᴏɴ ᴛʜᴇ ʙᴜᴛᴛᴏɴs ɢɪᴠᴇɴ ʙᴇʟᴏᴡ ꜰᴏʀ ɢᴇᴛᴛɪɴɢ ᴍᴏʀᴇ ɪɴꜰᴏ ᴀʙᴏᴜᴛ ᴍᴇ.</b>
-"""
+    HELP_TXT = """<blockquote>🛠️ <b>ᴄᴏsᴍɪᴄ ʀᴇɴᴀᴍᴇʀ — ʜᴇʟᴘ & ᴍᴏᴅᴜʟᴇs</b></blockquote>
 
-    HELP_TXT = """
-<b>ʀᴇɴᴀᴍᴇ ʙᴏᴛ ɪꜱ ᴀ ʜᴀɴᴅʏ ᴛᴏᴏʟ ᴛʜᴀᴛ ʜᴇʟᴘꜱ ʏᴏᴜ ʀᴇɴᴀᴍᴇ ᴀɴᴅ ᴍᴀɴᴀɢᴇ ʏᴏᴜʀ ꜰɪʟᴇꜱ ᴇꜰꜰᴏʀᴛʟᴇꜱꜱʟʏ.
+╭─ <b>𝟷. sᴇɴᴅ ᴀɴʏ ꜰɪʟᴇ / ᴠɪᴅᴇᴏ / ᴀᴜᴅɪᴏ (ᴜᴘ ᴛᴏ 𝟸ɢʙ)</b>
+├─ <b>𝟸. ʀᴇᴘʟʏ ᴡɪᴛʜ ʏᴏᴜʀ ɴᴇᴡ ꜰɪʟᴇ ɴᴀᴍᴇ</b>
+╰─ <b>𝟹. ᴄʜᴏᴏsᴇ ᴏᴜᴛᴘᴜᴛ ᴛʏᴘᴇ (📁 ᴅᴏᴄᴜᴍᴇɴᴛ / 🎥 ᴠɪᴅᴇᴏ / 🎵 ᴀᴜᴅɪᴏ)</b>
 
-➻ ᴄʟɪᴄᴋ ᴏɴ ᴛʜᴇ ʙᴜᴛᴛᴏɴs ɢɪᴠᴇɴ ʙᴇʟᴏᴡ ꜰᴏʀ ɢᴇᴛᴛɪɴɢ ᴍᴏʀᴇ ɪɴꜰᴏ.</b>
-"""
+<blockquote>👇 <b>sᴇʟᴇᴄᴛ ᴀ ᴍᴏᴅᴜʟᴇ ʙᴇʟᴏᴡ ᴛᴏ ᴄᴏɴꜰɪɢᴜʀᴇ ʏᴏᴜʀ sᴇᴛᴛɪɴɢs :</b></blockquote>"""
 
-    THUMBNAIL_TXT = """<b>» <u>ᴛᴏ ꜱᴇᴛ ᴄᴜꜱᴛᴏᴍ ᴛʜᴜᴍʙɴᴀɪʟ</u></b>
-    
-➲ /start: ꜱᴇɴᴅ ᴀɴʏ ᴘʜᴏᴛᴏ ᴛᴏ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ꜱᴇᴛ ɪᴛ ᴀꜱ ᴀ ᴛʜᴜᴍʙɴᴀɪʟ.
-➲ /delthumb: ᴜꜱᴇ ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ᴛᴏ ᴅᴇʟᴇᴛᴇ ʏᴏᴜʀ ᴛʜᴜᴍʙɴᴀɪʟ.
-➲ /viewthumb: ᴜꜱᴇ ᴛʜɪꜱ ᴄᴏᴍᴍᴀɴᴅ ᴛᴏ ᴠɪᴇᴡ ʏᴏᴜʀ ᴄᴜʀʀᴇɴᴛ ᴛʜᴜᴍʙɴᴀɪʟ.
+    THUMBNAIL_TXT = """<blockquote>🖼️ <b>ᴄᴜsᴛᴏᴍ & ᴀᴜᴛᴏ ᴛʜᴜᴍʙɴᴀɪʟ ᴍᴏᴅᴜʟᴇ</b></blockquote>
 
-<b>ɴᴏᴛᴇ :</b> ɪꜰ ɴᴏ ᴛʜᴜᴍʙɴᴀɪʟ ꜱᴀᴠᴇᴅ ɪɴ ʙᴏᴛ ᴛʜᴇɴ, ɪᴛ ᴡɪʟʟ ᴜꜱᴇ ᴛʜᴜᴍʙɴᴀɪʟ ᴏꜰ ᴛʜᴇ ᴏʀɪɢɪɴɪᴀʟ ꜰɪʟᴇ ᴛᴏ ꜱᴇᴛ ɪɴ ʀᴇɴᴀᴍᴇᴅ ꜰɪʟᴇ"""
+╭─ 📸 <b>sᴇᴛ ᴛʜᴜᴍʙ :</b> <code>sᴇɴᴅ ᴀɴʏ ᴘʜᴏᴛᴏ ɪɴ ᴘʀɪᴠᴀᴛᴇ ᴄʜᴀᴛ</code>
+├─ 👁️ <b>ᴠɪᴇᴡ ᴛʜᴜᴍʙ :</b> <code>/viewthumb</code> ᴏʀ <code>/view_thumb</code>
+╰─ 🗑️ <b>ᴅᴇʟᴇᴛᴇ ᴛʜᴜᴍʙ :</b> <code>/delthumb</code> ᴏʀ <code>/del_thumb</code>
 
-    CAPTION_TXT = """<b>» <u>ᴛᴏ ꜱᴇᴛ ᴄᴜꜱᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ ᴀɴᴅ ᴍᴇᴅɪᴀ ᴛʏᴘᴇ</u></b>
-    
-<b>ᴠᴀʀɪᴀʙʟᴇꜱ :</b>         
-ꜱɪᴢᴇ: {filesize}
-ᴅᴜʀᴀᴛɪᴏɴ: {duration}
-ꜰɪʟᴇɴᴀᴍᴇ: {filename}
+<blockquote>💡 <b>sᴍᴀʀᴛ ᴀᴜᴛᴏ-ꜰʀᴀᴍᴇ :</b> ɪꜰ ʏᴏᴜ ʜᴀᴠᴇ <u>ɴᴏ ᴄᴜsᴛᴏᴍ ᴛʜᴜᴍʙɴᴀɪʟ</u> sᴀᴠᴇᴅ, ᴛʜᴇ ʙᴏᴛ <b>ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ᴇxᴛʀᴀᴄᴛs ᴀ ʜᴅ ꜰʀᴀᴍᴇ</b> ꜰʀᴏᴍ ʏᴏᴜʀ ᴠɪᴅᴇᴏ!</blockquote>"""
 
-➲ /set_caption: ᴛᴏ ꜱᴇᴛ ᴀ ᴄᴜꜱᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ.
-➲ /see_caption: ᴛᴏ ᴠɪᴇᴡ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ.
-➲ /del_caption: ᴛᴏ ᴅᴇʟᴇᴛᴇ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ.
+    CAPTION_TXT = """<blockquote>📝 <b>ᴄᴜsᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ ᴍᴏᴅᴜʟᴇ</b></blockquote>
 
-» ᴇx: /set_caption ꜰɪʟᴇ ɴᴀᴍᴇ: {filename}
-"""
+<b>📌 ᴅʏɴᴀᴍɪᴄ ᴠᴀʀɪᴀʙʟᴇs :</b>
+╭─ <code>{filename}</code> — <b>ɴᴇᴡ ꜰɪʟᴇ ɴᴀᴍᴇ</b>
+├─ <code>{filesize}</code> — <b>ᴛᴏᴛᴀʟ ꜰɪʟᴇ sɪᴢᴇ</b>
+╰─ <code>{duration}</code> — <b>ᴍᴇᴅɪᴀ ᴅᴜʀᴀᴛɪᴏɴ</b>
 
-    PREFIX = """<b>» <u>ᴛᴏ ꜱᴇᴛ ᴄᴜꜱᴛᴏᴍ ᴘʀᴇꜰɪx</u></b>
+<b>⚙️ ᴄᴏᴍᴍᴀɴᴅs :</b>
+╭─ ➕ <code>/set_caption</code> — <b>sᴀᴠᴇ ᴀ ᴄᴜsᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ</b>
+├─ 👁️ <code>/see_caption</code> — <b>ᴘʀᴇᴠɪᴇᴡ ᴄᴜʀʀᴇɴᴛ ᴄᴀᴘᴛɪᴏɴ</b>
+╰─ 🗑️ <code>/del_caption</code> — <b>ʀᴇᴍᴏᴠᴇ ᴄᴜsᴛᴏᴍ ᴄᴀᴘᴛɪᴏɴ</b>
 
-➲ /set_prefix: ᴛᴏ ꜱᴇᴛ ᴀ ᴄᴜꜱᴛᴏᴍ ᴘʀᴇꜰɪx.
-➲ /see_prefix: ᴛᴏ ᴠɪᴇᴡ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ ᴘʀᴇꜰɪx.
-➲ /del_prefix: ᴛᴏ ᴅᴇʟᴇᴛᴇ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ ᴘʀᴇꜰɪx.
+<blockquote>💡 <b>ᴇxᴀᴍᴘʟᴇ :</b>
+<code>/set_caption 📕 ɴᴀᴍᴇ : {filename}\n📦 sɪᴢᴇ : {filesize}\n⏱️ ᴅᴜʀᴀᴛɪᴏɴ : {duration}</code></blockquote>"""
 
-» ᴇx: `/set_prefix @TechifyBots`
-"""
+    PREFIX = """<blockquote>🏷️ <b>ᴄᴜsᴛᴏᴍ ᴘʀᴇꜰɪx ᴍᴏᴅᴜʟᴇ</b></blockquote>
 
-    SUFFIX = """<b>» <u>ᴛᴏ ꜱᴇᴛ ᴄᴜꜱᴛᴏᴍ sᴜꜰꜰɪx</u></b>
+╭─ ➕ <code>/set_prefix</code> — <b>sᴇᴛ ꜰɪʟᴇɴᴀᴍᴇ ᴘʀᴇꜰɪx</b>
+├─ 👁️ <code>/see_prefix</code> — <b>ᴠɪᴇᴡ ᴄᴜʀʀᴇɴᴛ ᴘʀᴇꜰɪx</b>
+╰─ 🗑️ <code>/del_prefix</code> — <b>ʀᴇᴍᴏᴠᴇ ᴄᴜsᴛᴏᴍ ᴘʀᴇꜰɪx</b>
 
-➲ /set_suffix: ᴛᴏ ꜱᴇᴛ ᴀ ᴄᴜꜱᴛᴏᴍ sᴜꜰꜰɪx.
-➲ /see_suffix: ᴛᴏ ᴠɪᴇᴡ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ sᴜꜰꜰɪx.
-➲ /del_suffix: ᴛᴏ ᴅᴇʟᴇᴛᴇ ʏᴏᴜʀ ᴄᴜꜱᴛᴏᴍ sᴜꜰꜰɪx.
+<blockquote>💡 <b>ᴇxᴀᴍᴘʟᴇ :</b>
+<code>/set_prefix @CosmicBotz</code></blockquote>"""
 
-» ᴇx: `/set_suffix @TechifyBots`
-"""
+    SUFFIX = """<blockquote>🔖 <b>ᴄᴜsᴛᴏᴍ sᴜꜰꜰɪx ᴍᴏᴅᴜʟᴇ</b></blockquote>
+
+╭─ ➕ <code>/set_suffix</code> — <b>sᴇᴛ ꜰɪʟᴇɴᴀᴍᴇ sᴜꜰꜰɪx</b>
+├─ 👁️ <code>/see_suffix</code> — <b>ᴠɪᴇᴡ ᴄᴜʀʀᴇɴᴛ sᴜꜰꜰɪx</b>
+╰─ 🗑️ <code>/del_suffix</code> — <b>ʀᴇᴍᴏᴠᴇ ᴄᴜsᴛᴏᴍ sᴜꜰꜰɪx</b>
+
+<blockquote>💡 <b>ᴇxᴀᴍᴘʟᴇ :</b>
+<code>/set_suffix @CosmicBotz</code></blockquote>"""
 
     PROGRESS_BAR = """\n
- <b>🔗 Size :</b> {1} | {2}
-️ <b>⏳️ Done :</b> {0}%
- <b>🚀 Speed :</b> {3}/s
-️ <b>⏰️ ETA :</b> {4}
+╭─ 📦 <b>sɪᴢᴇ :</b> <code>{1} / {2}</code>
+├─ 📊 <b>ᴅᴏɴᴇ :</b> <code>{0}%</code>
+├─ ⚡ <b>sᴘᴇᴇᴅ :</b> <code>{3}/s</code>
+╰─ ⏳ <b>ᴇᴛᴀ :</b> <code>{4}</code>
 """
 
-    DONATE_TXT = """
-<blockquote>❤️‍🔥 𝐓𝐡𝐚𝐧𝐤𝐬 𝐟𝐨𝐫 𝐬𝐡𝐨𝐰𝐢𝐧𝐠 𝐢𝐧𝐭𝐞𝐫𝐞𝐬𝐭 𝐢𝐧 𝐃𝐨𝐧𝐚𝐭𝐢𝐨𝐧</blockquote>
+    DONATE_TXT = """<blockquote>💖 <b>sᴜᴘᴘᴏʀᴛ & ᴅᴏɴᴀᴛɪᴏɴ — @CosmicBotz</b></blockquote>
 
-<b><i>💞  ɪꜰ ʏᴏᴜ ʟɪᴋᴇ ᴏᴜʀ ʙᴏᴛ ꜰᴇᴇʟ ꜰʀᴇᴇ ᴛᴏ ᴅᴏɴᴀᴛᴇ ᴀɴʏ ᴀᴍᴏᴜɴᴛ ₹𝟷𝟶, ₹𝟸𝟶, ₹𝟻𝟶, ₹𝟷𝟶𝟶, ᴇᴛᴄ.</i></b>
+<b><i>✨ ɪꜰ ʏᴏᴜ ᴇɴᴊᴏʏ ᴏᴜʀ ʜɪɢʜ-sᴘᴇᴇᴅ ʙᴏᴛs, ʏᴏᴜ ᴄᴀɴ sᴜᴘᴘᴏʀᴛ ᴏᴜʀ sᴇʀᴠᴇʀ & ᴅᴇᴠᴇʟᴏᴘᴍᴇɴᴛ ᴄᴏsᴛs!</i></b>
 
-❣️ 𝐷𝑜𝑛𝑎𝑡𝑖𝑜𝑛𝑠 𝑎𝑟𝑒 𝑟𝑒𝑎𝑙𝑙𝑦 𝑎𝑝𝑝𝑟𝑒𝑐𝑖𝑎𝑡𝑒𝑑 𝑖𝑡 ℎ𝑒𝑙𝑝𝑠 𝑖𝑛 𝑏𝑜𝑡 𝑑𝑒𝑣𝑒𝑙𝑜𝑝𝑚𝑒𝑛𝑡
+╭─ 💳 <b>ᴜᴘɪ ɪᴅ :</b> <code>CosmicBotz@UPI</code>
+╰─ 💬 <b>ᴄᴏɴᴛᴀᴄᴛ :</b> <a href='https://telegram.me/CosmicBotz'>@CosmicBotz</a>
 
-💖 𝐔𝐏𝐈 𝐈𝐃 : `TechifyBots@UPI`
+<blockquote>🙏 <b>ᴇᴠᴇʀʏ ᴄᴏɴᴛʀɪʙᴜᴛɪᴏɴ ᴋᴇᴇᴘs ᴏᴜʀ sᴇʀᴠᴇʀs ʙʟᴀᴢɪɴɢ ꜰᴀsᴛ!</b></blockquote>"""
 
-💗 𝐐𝐑 𝐂𝐨𝐝𝐞 : <b><a href='https://TechifyBots.github.io/Donate'>𝖢𝗅𝗂𝖼𝗄 𝖧𝖾𝗋𝖾</a></b>
-"""
+    SEND_METADATA = """<blockquote>⚙️ <b>ᴄᴜsᴛᴏᴍ ᴍᴇᴛᴀᴅᴀᴛᴀ ᴄᴏɴꜰɪɢᴜʀᴀᴛɪᴏɴ</b></blockquote>
 
-    SEND_METADATA = """🖼️ 𝗛𝗼𝘄 𝗧𝗼 𝗦𝗲𝘁 𝗖𝘂𝘀𝘁𝗼𝗺 𝗠𝗲𝘁𝗮𝗱𝗮𝘁𝗮
+╭─ <b>sᴇɴᴅ ᴛʜᴇ ᴍᴇᴛᴀᴅᴀᴛᴀ ᴛᴇxᴛ ʏᴏᴜ ᴡᴀɴᴛ ᴛᴏ ᴇᴍʙᴇᴅ ɪɴᴛᴏ ᴀᴜᴅɪᴏ / ᴠɪᴅᴇᴏ / sᴜʙᴛɪᴛʟᴇ sᴛʀᴇᴀᴍs :</b>
+╰─ 💡 <b>ᴇxᴀᴍᴘʟᴇ :</b> <code>By :- @CosmicBotz</code>
 
-For Example :-
-
-<code>By: @TechifyBots</code>
-
-💬 For Help Contact @TechifySupport
-"""
+<blockquote>💬 <b>ɴᴇᴇᴅ ʜᴇʟᴘ? ᴄᴏɴᴛᴀᴄᴛ :</b> <a href='https://telegram.me/CosmicBotz'>@CosmicBotz</a></blockquote>"""

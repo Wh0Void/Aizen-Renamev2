@@ -1,5 +1,32 @@
-import os
 import asyncio
+import inspect
+import os
+import sys
+from datetime import datetime
+from pytz import timezone
+from aiohttp import web
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from config import Config
+from bot.core.fast_crypto import (
+    MultiSessionMediaPool,
+    configure_wzgram_environment,
+    install_fast_event_loop,
+    release_memory,
+)
+
+# 1. Configure Wzgram environment knobs & uvloop BEFORE importing wzgram/pyrogram
+configure_wzgram_environment(
+    pool_size=Config.MEDIA_POOL_SIZE,
+    max_read_ahead=Config.WZGRAM_MAX_READ_AHEAD,
+)
+EVENT_LOOP_BACKEND = install_fast_event_loop()
 
 # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
 try:
@@ -7,133 +34,118 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from datetime import datetime
-from pytz import timezone
-from pyrogram import Client, __version__
-from pyrogram.raw.all import layer
-from config import Config
-from aiohttp import web
-from route import web_server
-import pyrogram.utils
-import pyromod
-from pyromod.types.identifier import Identifier
-
-# Compatibility patch for Python 3.14+ (PEP 649 annotation handling in pyromod)
-def _pyromod_matches(self, update: "Identifier") -> bool:
-    annotations = getattr(type(self), "__annotations__", {})
-    for field in annotations:
-        pattern_value = getattr(self, field, None)
-        update_value = getattr(update, field, None)
-        if pattern_value is not None:
-            if isinstance(update_value, list):
-                if isinstance(pattern_value, list):
-                    if not set(update_value).intersection(set(pattern_value)):
-                        return False
-                elif pattern_value not in update_value:
-                    return False
-            elif isinstance(pattern_value, list):
-                if update_value not in pattern_value:
-                    return False
-            elif update_value != pattern_value:
-                return False
-    return True
-
-def _pyromod_count_populated(self):
-    non_null_count = 0
-    annotations = getattr(type(self), "__annotations__", {})
-    for attr in annotations:
-        if getattr(self, attr, None) is not None:
-            non_null_count += 1
-    return non_null_count
-
-Identifier.matches = _pyromod_matches
-Identifier.count_populated = _pyromod_count_populated
-
-# Import the destination plugin properly
-from plugins import destination  # <-- updated
+import wzgram  # noqa: E402
+from wzgram import Client, __version__  # noqa: E402
+import pyrogram.utils  # noqa: E402
+from route import web_server  # noqa: E402
 
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
 
 
 class Bot(Client):
+    """
+    High-Speed Wzgram Bot Client with Multi-Session Media Connection Pool (6-8 TCP sockets),
+    Hardware AES-NI Crypto (`WarpCrypto`), and Low-RAM In-Memory Session Storage.
+    """
 
     def __init__(self):
-        super().__init__(
-            name="renamer",
-            api_id=Config.API_ID,
-            api_hash=Config.API_HASH,
-            bot_token=Config.BOT_TOKEN,
-            workers=200,
-            plugins={"root": "plugins"},
-            sleep_threshold=15,
-        )
+        client_kwargs = {
+            "name": "renamer",
+            "api_id": Config.API_ID,
+            "api_hash": Config.API_HASH,
+            "bot_token": Config.BOT_TOKEN,
+            "in_memory": True,
+            "workers": 16,
+            "max_concurrent_transmissions": Config.MEDIA_POOL_SIZE,
+            "plugins": {"root": "plugins"},
+            "sleep_threshold": 15,
+        }
 
-    async def start(self):
-        # Initialize pyromod listeners to prevent KeyError
-        if 'message' not in self.listeners:
-            self.listeners['message'] = []
-        if 'callback_query' not in self.listeners:
-            self.listeners['callback_query'] = []
-        print(f"Initial listeners: {self.listeners}")
+        # Apply low-memory Wzgram client options when supported by Client.__init__
+        sig_params = inspect.signature(Client.__init__).parameters
+        optional_low_ram_kwargs = {
+            "fetch_topics": False,
+            "fetch_stories": False,
+            "fetch_stickers": False,
+            "max_message_cache_size": 200,
+            "max_topic_cache_size": 100,
+        }
+        for key, val in optional_low_ram_kwargs.items():
+            if key in sig_params:
+                client_kwargs[key] = val
 
-        await super().start()
-        me = await self.get_me()
-        self.mention = me.mention
-        self.username = me.username  
+        super().__init__(**client_kwargs)
         self.uptime = Config.BOT_UPTIME
 
-        # Initialize destination plugin
-        try:
-            destination.init(self)  # <-- attach handlers to this bot instance
-            print("✅ Destination plugin initialized")
-        except Exception as e:
-            print(f"⚠️ Warning: Could not initialize destination plugin: {e}")
+        # Attach Multi-Session Connection Pool (6-8 parallel TCP media sessions + AES-NI)
+        self.fast_pool = MultiSessionMediaPool(
+            client=self,
+            pool_size=Config.MEDIA_POOL_SIZE,
+        ).attach(self)
 
-        # Optional: initialize other plugins here
-        # try:
-        #     from plugins import file_rename
-        #     file_rename.init(self)
-        #     print("✅ File rename plugin initialized")
-        # except Exception as e:
-        #     print(f"⚠️ Warning: Could not initialize file_rename plugin: {e}")
+    async def start(self):
+        await super().start()
+        await self.fast_pool.start_background_reaper()
+
+        me = await self.get_me()
+        self.mention = me.mention
+        self.username = me.username
+        self.uptime = Config.BOT_UPTIME
 
         if Config.WEBHOOK:
             app = web.AppRunner(await web_server())
             await app.setup()
-            PORT = int(os.environ.get("PORT", 8000))
-            await web.TCPSite(app, "0.0.0.0", PORT).start()
-            print(f"🌐 Webhook server started on port {PORT}")
+            port = int(os.environ.get("PORT", 8000))
+            await web.TCPSite(app, "0.0.0.0", port).start()
+            print(f"🌐 Webhook server started on port {port}")
 
-        print(f"{me.first_name} Is Started.....✨️")
+        print(
+            f"⚡ {me.first_name} Started | Wzgram v{__version__} | "
+            f"Loop: {EVENT_LOOP_BACKEND} | Media Pool: {self.fast_pool.pool_size} TCP sockets | "
+            f"Crypto: {self.fast_pool.crypto.backend_name}"
+        )
 
         # Send startup message to admins
-        for id in Config.ADMIN:
-            try: 
-                await self.send_message(id, f"**{me.first_name} Is Started...**")                                
+        for admin_id in Config.ADMIN:
+            try:
+                await self.send_message(
+                    admin_id,
+                    f"<blockquote>⚡ <b>{me.first_name} ɪs ᴏɴʟɪɴᴇ!</b></blockquote>\n"
+                    f"╭─▸ 🚀 <b>ᴇɴɢɪɴᴇ :</b> <code>ᴡᴢɢʀᴀᴍ ᴠ{__version__}</code>\n"
+                    f"├─▸ 🔌 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{self.fast_pool.pool_size} ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{self.fast_pool.crypto.backend_name}</code>",
+                )
             except Exception as e:
-                print(f"Error sending message to admin {id}: {e}")
+                print(f"Error sending message to admin {admin_id}: {e}")
 
         # Send startup message to log channel
         if Config.LOG_CHANNEL:
             try:
+                from pyrogram.raw.all import layer
+
                 curr = datetime.now(timezone("Asia/Kolkata"))
-                date = curr.strftime('%d %B, %Y')
-                time = curr.strftime('%I:%M:%S %p')
+                date_str = curr.strftime("%d %B, %Y")
+                time_str = curr.strftime("%I:%M:%S %p")
                 await self.send_message(
                     Config.LOG_CHANNEL,
-                    f"**{me.mention} Is Restarted !!**\n\n"
-                    f"📅 Date : `{date}`\n"
-                    f"⏰ Time : `{time}`\n"
-                    f"🌐 Timezone : `Asia/Kolkata`\n\n"
-                    f"🉐 Version : `v{__version__} (Layer {layer})`</b>"
-                )                                
+                    f"<blockquote>⚡ <b>{me.mention} ʀᴇsᴛᴀʀᴛᴇᴅ sᴜᴄᴄᴇssꜰᴜʟʟʏ!</b></blockquote>\n\n"
+                    f"╭─▸ 📅 <b>ᴅᴀᴛᴇ :</b> <code>{date_str}</code>\n"
+                    f"├─▸ ⏰ <b>ᴛɪᴍᴇ :</b> <code>{time_str}</code>\n"
+                    f"├─▸ 🌐 <b>ᴛɪᴍᴇᴢᴏɴᴇ :</b> <code>Asia/Kolkata</code>\n"
+                    f"├─▸ ⚡ <b>ᴇɴɢɪɴᴇ :</b> <code>Wzgram v{__version__} (Layer {layer})</code>\n"
+                    f"├─▸ 🚀 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{self.fast_pool.pool_size} ᴘᴀʀᴀʟʟᴇʟ ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{self.fast_pool.crypto.backend_name}</code>",
+                )
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
 
-    async def stop(self):
-        await super().stop()
-        print(f"{self.mention} is stopped.")
+        release_memory()
+
+    async def stop(self, *args):
+        await self.fast_pool.stop()
+        await super().stop(*args)
+        print(f"{getattr(self, 'mention', 'Bot')} is stopped.")
 
 
 if __name__ == "__main__":
