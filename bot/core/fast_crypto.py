@@ -45,8 +45,9 @@ def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> 
     based on file size and transfer duration profiles:
       - Small files (<= 200 MB): 16 sockets, 32 workers (instant finish in 0.5-2s).
       - Medium files (200 MB - 750 MB): 24 sockets, 48 workers (max burst throughput 60-80+ MB/s).
-      - Large files (750 MB - 2.0 GB): 16 sockets, 16 download workers (1:1 clean socket pipelining
-        to prevent Telegram DC storage cluster -503 timeouts), 32 upload workers.
+      - Large files (750 MB - 2.0 GB):
+          * Download: 16 sockets, 16 workers (1:1 clean socket pipelining with 512KB chunks to prevent -503).
+          * Upload: 24 sockets, 48 workers (for sustained 35-45+ MB/s upload line speed).
     """
     mb = file_size_bytes / (1024 * 1024)
     if mb <= 200:
@@ -56,8 +57,12 @@ def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> 
         pool_size = 24
         workers = 48
     else:
-        pool_size = 16
-        workers = 16 if not is_upload else 32
+        if is_upload:
+            pool_size = 24
+            workers = 48
+        else:
+            pool_size = 16
+            workers = 16
 
     part_size = CHUNK_SIZE_512KB if (is_upload or mb > 750) else DOWNLOAD_CHUNK_1MB
     total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
@@ -983,13 +988,6 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     for i in range(n_workers)
                 ]
 
-                async def read_batch() -> bytes:
-                    batch_size = min(part_size * n_workers, 16 * 1024 * 1024)
-                    return await self.loop.run_in_executor(
-                        self.executor, fp.read, batch_size
-                    )
-
-                next_batch_task = None
                 _last_report_time = 0.0
 
                 async def _report(parts: int) -> None:
@@ -1016,28 +1014,21 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     except Exception as e:
                         logger.debug("Upload progress callback error: %s", e)
 
-                try:
+                async def _producer() -> None:
+                    nonlocal file_part
+                    read_ahead_bytes = min(32 * part_size, 16 * 1024 * 1024)
                     fp.seek(part_size * file_part)
-                    next_batch_task = self.loop.create_task(read_batch())
-
-                    while True:
-                        batch = await next_batch_task
-                        next_batch_task = self.loop.create_task(read_batch())
-
+                    while file_part < file_total_parts:
+                        batch = await self.loop.run_in_executor(
+                            self.executor, fp.read, read_ahead_bytes
+                        )
                         if not batch:
-                            next_batch_task.cancel()
-                            if not is_big and not is_missing_part:
-                                md5_sum = md5_sum.hexdigest()
                             break
-
-                        for t in workers:
-                            if t.done() and not t.cancelled():
-                                exc = t.exception()
-                                if exc is not None:
-                                    raise exc
 
                         for start in range(0, len(batch), part_size):
                             chunk = batch[start : start + part_size]
+                            if not is_big and not is_missing_part and md5_sum is not None:
+                                md5_sum.update(chunk)
 
                             if is_big:
                                 rpc = raw.functions.upload.SaveBigFilePart(
@@ -1053,44 +1044,34 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     bytes=chunk,
                                 )
 
-                            await budget.acquire()
-
-                            while True:
-                                try:
-                                    await asyncio.wait_for(queue.put(rpc), timeout=30)
-                                    break
-                                except asyncio.TimeoutError:
-                                    for t in workers:
-                                        if t.done() and not t.cancelled():
-                                            exc = t.exception()
-                                            if exc is not None:
-                                                raise exc
-                                    await asyncio.sleep(0.5)
-
-                            if is_missing_part:
-                                next_batch_task.cancel()
-                                results = await _stop_workers(queue, workers)
-                                for r in results:
-                                    if isinstance(r, BaseException) and not isinstance(
-                                        r, asyncio.CancelledError
-                                    ):
-                                        raise r
-                                return None
-
-                            if not is_big and not is_missing_part:
-                                md5_sum.update(chunk)
-
-                            rpc = None
-                            chunk = None
                             file_part += 1
+                            await budget.acquire()
+                            await queue.put(rpc)
 
-                            await _report(_acked[0])
+                producer_task = self.loop.create_task(_producer())
 
-                        batch = None
+                try:
+                    while _acked[0] < file_total_parts:
+                        for t in workers:
+                            if t.done() and not t.cancelled():
+                                exc = t.exception()
+                                if exc is not None:
+                                    producer_task.cancel()
+                                    raise exc
+
+                        if producer_task.done() and not producer_task.cancelled():
+                            pexc = producer_task.exception()
+                            if pexc is not None:
+                                raise pexc
+
+                        await _report(_acked[0])
+                        await asyncio.sleep(0.05)
 
                 except StopTransmission:
+                    producer_task.cancel()
                     raise
                 except Exception as e:
+                    producer_task.cancel()
                     logger.exception("Upload failed: %s", e)
                     raise
                 else:
@@ -1103,6 +1084,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     await _report(file_total_parts)
 
+                    if not is_big and not is_missing_part and md5_sum is not None:
+                        md5_sum_str = md5_sum.hexdigest()
+                    else:
+                        md5_sum_str = None
+
                     if is_big:
                         return raw.types.InputFileBig(
                             id=file_id,
@@ -1114,12 +1100,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             id=file_id,
                             parts=file_total_parts,
                             name=file_name,
-                            md5_checksum=md5_sum,
+                            md5_checksum=md5_sum_str,
                         )
                 finally:
-                    if next_batch_task is not None and not next_batch_task.done():
-                        next_batch_task.cancel()
-
+                    if not producer_task.done():
+                        producer_task.cancel()
                     await _stop_workers(queue, workers)
                     budget.release_all()
 
