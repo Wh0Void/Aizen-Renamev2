@@ -405,14 +405,53 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         return
 
                     total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
+
+                    # ── Pool acquisition: timeout + absorb already-live sessions ──────────────
+                    # Strategy: don't wait forever for _get_media_session_pool to create 20
+                    # sessions under _session_creation_gate (7 sequential batches of 3).
+                    # Instead cap the wait at 8s and complement with any already-connected
+                    # sessions from media_session_pools[dc_id] so transfers start fast even
+                    # when a foreign DC has never been used before.
+                    pool: list = []
                     if needs_pool and pool_task is not None:
-                        pool = await pool_task
-                    else:
-                        pool = [session]
+                        try:
+                            pool = await asyncio.wait_for(
+                                asyncio.shield(pool_task), timeout=8.0
+                            )
+                        except asyncio.TimeoutError:
+                            # Pool creation still running in background — grab whatever
+                            # already-connected sessions exist and proceed immediately.
+                            pool = []
+                        except Exception:
+                            pool = []
+
+                    # Absorb any already-started sessions from the client's session pool
+                    # for this DC (covers the timeout case and re-uses warm connections).
+                    existing_dc_pool = (
+                        getattr(self, "media_session_pools", {}) or {}
+                    ).get(dc_id, [])
+                    pool_set = set(id(s) for s in pool)
+                    for _s in existing_dc_pool:
+                        if (
+                            id(_s) not in pool_set
+                            and getattr(_s, "is_started", None) is not None
+                            and _s.is_started.is_set()
+                        ):
+                            pool.append(_s)
+                            pool_set.add(id(_s))
+
                     if not pool:
                         pool = [session]
+
                     n_sessions = len(pool)
-                    total_workers = min(n_sessions * 2, total_chunks)
+
+                    # ── Worker count: scale to target_pool, NOT n_sessions * 2 ──────────────
+                    # pyrogram Session supports concurrent async invoke() calls on a single
+                    # TCP connection (each gets its own msg_id in the pending dict). So even
+                    # 1 session can sustain target_pool (20) parallel in-flight requests.
+                    # Old formula `n_sessions * 2` capped workers at 2 when pool was empty
+                    # → only 2 concurrent 1-MiB chunks in flight → 1–3 Mbps on high-RTT DCs.
+                    total_workers = min(target_pool, total_chunks)
 
                     work = asyncio.Queue()
                     chunks_needed = min(
@@ -438,7 +477,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     _done_count = 0
                     _total_chunks = chunks_needed
 
-                    # Lock-Free Worker: Zero TokenBucket locks or AIMD rate reductions
+                    # Lock-Free Worker: Zero TokenBucket locks or AIMD rate reductions.
+                    # Workers are distributed round-robin across n_sessions; when only 1
+                    # session is available all workers share it (async-multiplexed, safe).
                     async def _worker(sess: Any) -> None:
                         nonlocal _done_count
                         while True:
@@ -524,7 +565,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 if _done_count != _reported_count:
                                     _reported_count = _done_count
                                     await _report(offset_bytes + _done_count * chunk_size)
-                                yield b""
+                                # ── Removed `yield b""` here ─────────────────────────────────
+                                # Yielding empty bytes made download_media pass 0-byte chunks
+                                # to the progress callback → speed displayed as 0/null.
+                                # A plain event-loop yield keeps concurrency alive cleanly.
+                                await asyncio.sleep(0)
                             else:
                                 while offset_bytes not in received:
                                     for t in tasks:
