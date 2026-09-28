@@ -296,7 +296,12 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 current = 0
                 total = abs(limit) or (1 << 31) - 1
-                chunk_size = DOWNLOAD_CHUNK_1MB  # 1 MiB chunk
+                # ── 512 KiB chunks: same as wzgram upload PART_SIZE ─────────────
+                # Upload uses 512 KiB and achieves 30–50 MB/s. Using the same
+                # chunk size for download gives the same pipeline saturation per
+                # TCP session. Larger chunks (1 MiB) add latency per chunk on
+                # foreign DCs, reducing pipeline efficiency.
+                chunk_size = CHUNK_SIZE_512KB  # 512 KiB — mirrors save_file PART_SIZE
                 offset_bytes = abs(offset) * chunk_size
                 _last_progress_time = 0.0
 
@@ -326,18 +331,24 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 dc_id = file_id.dc_id
 
-                # Calculate multi-socket pool requirements (up to 20 parallel sockets)
-                dl_pool_size = target_pool
+                # ── Pool size: exactly mirrors upload (save_file) for bot accounts ─
+                # Upload: pool_size = min(8, POOL_SIZE) for bot = 8 sessions
+                #         n_workers = len(pool) * 2 = 16 workers
+                # We use the same values. Requesting 20+ sessions is wasteful and
+                # overloads _session_creation_gate — 8 is the empirically validated
+                # optimum from wzgram's upload code.
+                dl_pool_size = min(8, target_pool)
                 total_chunks = (
                     math.ceil((file_size - offset_bytes) / chunk_size)
                     if file_size > offset_bytes
                     else 1
                 )
-                pool_size_actual = (
-                    min(dl_pool_size, total_chunks) if total_chunks > 0 else dl_pool_size
-                )
+                pool_size_actual = min(dl_pool_size, total_chunks) if total_chunks > 0 else dl_pool_size
                 needs_pool = min(total, total_chunks) > 1
 
+                # Fire pool creation task immediately so it runs in parallel with
+                # the first sequential chunk fetch below. We will BLOCK on it (no
+                # timeout) after the first chunk, same as upload does.
                 pool_task = None
                 if needs_pool:
                     pool_task = asyncio.ensure_future(
@@ -349,8 +360,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 session = await self.get_session(dc_id, is_media=True)
 
-                # Measure RTT of first chunk to adapt chunk_size for remaining chunks
-                _t0 = time.monotonic()
+                # Fetch first chunk sequentially. pool_task is already running
+                # concurrently so session creation overlaps with this network RTT.
                 r = await session.invoke(
                     raw.functions.upload.GetFile(
                         location=location,
@@ -360,24 +371,6 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     timeout=Session.MEDIA_WAIT_TIMEOUT,
                     sleep_threshold=15,
                 )
-                _first_rtt = time.monotonic() - _t0
-
-                # ── Adaptive chunk size based on measured RTT ────────────────────
-                # Bot-token downloads are rate-limited by Telegram in chunks/sec,
-                # not MB/s. On a high-RTT foreign DC (e.g. Frankfurt → DC1/DC5):
-                #   1 MiB @ 300ms RTT → 3.3 chunks/sec/worker → low throughput
-                #   256 KiB @ 300ms RTT → still 3.3 req/sec but 4× more requests
-                #     → pipeline fills faster → better aggregate throughput
-                # We only adapt remaining chunks; first chunk was already fetched at 1MiB.
-                if file_size > 0 and _first_rtt > 0.30:
-                    chunk_size = CHUNK_SIZE_512KB // 2  # 256 KiB for >300ms RTT
-                elif file_size > 0 and _first_rtt > 0.15:
-                    chunk_size = CHUNK_SIZE_512KB        # 512 KiB for 150–300ms RTT
-                # else keep 1 MiB for home/low-latency DCs (<150ms)
-                logger.debug(
-                    "DC%d RTT=%.3fs → remaining chunk_size=%d KiB",
-                    dc_id, _first_rtt, chunk_size // 1024,
-                )
 
                 if isinstance(r, raw.types.upload.File):
                     first_chunk = r.bytes
@@ -385,11 +378,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     yield first_chunk
                     current += 1
                     first_len = len(first_chunk)
-                    # Advance by the actual first-chunk size (always DOWNLOAD_CHUNK_1MB),
-                    # NOT the newly adapted chunk_size, since adaptive sizing only applies
-                    # to subsequent chunks.
-                    _first_chunk_size = first_len if first_len > 0 else DOWNLOAD_CHUNK_1MB
-                    offset_bytes += _first_chunk_size
+                    offset_bytes += chunk_size
                     if _write_file is not None:
                         _write_file.seek(0)
                         _write_file.write(first_chunk)
@@ -398,9 +387,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     await _report(offset_bytes)
 
-                    # Use _first_chunk_size for the "full chunk" check so we don't
-                    # stop early when first_len==1MiB but chunk_size is now 256KiB.
-                    if not first_len or first_len < _first_chunk_size or current >= total:
+                    if not first_len or first_len < chunk_size or current >= total:
                         return
 
                     # Sequential fallback when file size is unknown
@@ -432,52 +419,27 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
 
-                    # ── Pool acquisition: timeout + absorb already-live sessions ──────────────
-                    # Strategy: don't wait forever for _get_media_session_pool to create 20
-                    # sessions under _session_creation_gate (7 sequential batches of 3).
-                    # Instead cap the wait at 8s and complement with any already-connected
-                    # sessions from media_session_pools[dc_id] so transfers start fast even
-                    # when a foreign DC has never been used before.
-                    pool: list = []
+                    # ── Pool acquisition: BLOCKING await — mirrors save_file exactly ──────────
+                    # save_file does:  pool = await self._get_media_session_pool(dc_id, 8)
+                    #                  n_workers = len(pool) * 2
+                    # We do the same. No timeout, no fallback — block until all sessions ready.
+                    # The pool_task was fired BEFORE the first chunk fetch so session creation
+                    # ran concurrently with that network RTT, minimising actual wait time.
                     if needs_pool and pool_task is not None:
-                        try:
-                            pool = await asyncio.wait_for(
-                                asyncio.shield(pool_task), timeout=8.0
-                            )
-                        except asyncio.TimeoutError:
-                            # Pool creation still running in background — grab whatever
-                            # already-connected sessions exist and proceed immediately.
-                            pool = []
-                        except Exception:
-                            pool = []
-
-                    # Absorb any already-started sessions from the client's session pool
-                    # for this DC (covers the timeout case and re-uses warm connections).
-                    existing_dc_pool = (
-                        getattr(self, "media_session_pools", {}) or {}
-                    ).get(dc_id, [])
-                    pool_set = set(id(s) for s in pool)
-                    for _s in existing_dc_pool:
-                        if (
-                            id(_s) not in pool_set
-                            and getattr(_s, "is_started", None) is not None
-                            and _s.is_started.is_set()
-                        ):
-                            pool.append(_s)
-                            pool_set.add(id(_s))
-
+                        pool = await pool_task
+                    else:
+                        pool = [session]
                     if not pool:
                         pool = [session]
 
                     n_sessions = len(pool)
 
-                    # ── Worker count: scale to target_pool, NOT n_sessions * 2 ──────────────
-                    # pyrogram Session supports concurrent async invoke() calls on a single
-                    # TCP connection (each gets its own msg_id in the pending dict). So even
-                    # 1 session can sustain target_pool (20) parallel in-flight requests.
-                    # Old formula `n_sessions * 2` capped workers at 2 when pool was empty
-                    # → only 2 concurrent 1-MiB chunks in flight → 1–3 Mbps on high-RTT DCs.
-                    total_workers = min(target_pool, total_chunks)
+                    # ── Worker count: n_sessions * 2 — exact upload formula ───────────────────
+                    # save_file: n_workers = len(pool) * 2
+                    # Each worker is bound to a different session (TCP connection) via round-robin.
+                    # Each TCP connection has its own ~5 MB/s Telegram bandwidth ceiling.
+                    # 8 sessions × 2 workers × 5 MB/s = 40–80 MB/s aggregate potential.
+                    total_workers = min(n_sessions * 2, total_chunks)
 
                     work = asyncio.Queue()
                     chunks_needed = min(
