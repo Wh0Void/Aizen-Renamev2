@@ -56,7 +56,7 @@ def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: 
     state["last_speed_sample_ts"] = now
     samples = state.setdefault("samples", [(effective_start, 0)])
     samples.append((now, current_clamped))
-    cutoff = now - 4.0
+    cutoff = now - 3.0
     while len(samples) > 2 and samples[1][0] <= cutoff:
         samples.pop(0)
 
@@ -66,19 +66,19 @@ def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: 
     window_speed = window_bytes / window_dt if window_bytes > 0 else 0.0
 
     avg_speed = current_clamped / max(now - effective_start, 0.001)
-    base_speed = (0.75 * window_speed + 0.25 * avg_speed) if window_speed > 0 else avg_speed
+    base_speed = window_speed if window_speed > 0 else avg_speed
 
     if prev_ema <= 0.0:
         ema_speed = base_speed
     else:
-        ema_speed = (0.35 * base_speed) + (0.65 * prev_ema)
-        # Clamp per-sample swing to ±22% of previous EMA so transient jitter never spikes UI
-        low_bound = prev_ema * 0.78
-        high_bound = prev_ema * 1.22
+        ema_speed = (0.65 * base_speed) + (0.35 * prev_ema)
+        # Clamp per-sample swing to ±35% of previous EMA so transient jitter never spikes UI while keeping responsiveness
+        low_bound = prev_ema * 0.65
+        high_bound = prev_ema * 1.35
         ema_speed = max(low_bound, min(high_bound, ema_speed))
 
     state["ema_speed"] = ema_speed
-    return max(ema_speed, avg_speed * 0.75, 1.0)
+    return max(ema_speed, window_speed * 0.85, 1.0)
 
 
 

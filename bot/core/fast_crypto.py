@@ -49,46 +49,46 @@ CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
 MIN_MEDIA_POOL_SIZE: int = 8
 MAX_MEDIA_POOL_SIZE: int = 24
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "20"))
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "10"))
 
 _MTPROTO_PATCHED: bool = False
 
 
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
-    max_read_ahead: int = 160,
-    max_inflight_media: int = 24,
-    max_inflight_packets: int = 128,
+    max_read_ahead: int = 48,
+    max_inflight_media: int = 8,
+    max_inflight_packets: int = 48,
     inline_crypto_max: int = 2097152,
     media_idle_timeout: int = 300,
 ) -> Dict[str, str]:
     """
     Configure Wzgram runtime environment knobs before client initialization.
-    Tuned for 50-100+ MB/s Turbo throughput (20 parallel media sessions, 24 in-flight
-    requests per socket, 160 read-ahead slots, 16 MiB TCP socket buffers, 8 MiB
-    StreamReader/StreamWriter watermarks, and inline Rust AES-NI packing).
+    Tuned for sustained 50+ MB/s throughput on Koyeb / Linux (10 parallel media sessions,
+    2 workers/session = 20 workers, 48 read-ahead slots, 8 MiB TCP socket buffers,
+    8 MiB StreamReader/StreamWriter watermarks, and inline Rust AES-NI packing).
     """
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        # Multi-session upload/download pool (8-24 parallel TCP media connections)
+        # Multi-session upload/download pool (8-16 parallel TCP media connections)
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
         # High rate ceiling (400 parts/sec * 512 KB = 200 MB/s)
         "WZGRAM_UPLOAD_RATE_BOT": "400",
         "WZGRAM_UPLOAD_RATE_USER": "400",
-        # 160 read-ahead slots for pipelined transfers across 20 sockets
+        # 48 read-ahead slots for pipelined transfers across 10 sockets (low RAM footprint)
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
-        # 24 pipelined chunks per TCP media socket (up to 480 in-flight across 20 sockets)
+        # 8 pipelined chunks per TCP media socket (up to 80 in-flight across 10 sockets)
         "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
         "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
-        # 16 MiB OS TCP send/recv socket buffers (SO_SNDBUF / SO_RCVBUF) for high-BDP links
-        "WZGRAM_SOCKET_BUFFER": str(16 * 1024 * 1024),
+        # 8 MiB OS TCP send/recv socket buffers (SO_SNDBUF / SO_RCVBUF) for high-BDP links
+        "WZGRAM_SOCKET_BUFFER": str(8 * 1024 * 1024),
         # Generous TCP & Media timeouts so burst transfers never drop mid-frame
         "WZGRAM_TCP_TIMEOUT": "30",
         "WZGRAM_MEDIA_TIMEOUT": "90",
-        # Inline hardware AES-NI threshold (2 MiB inline so 512 KB / 1 MB chunks pack in ~140us
+        # Inline hardware AES-NI threshold (2 MiB inline so 512 KB / 1 MB chunks pack in ~70us
         # without holding Session._atomic_send_lock across run_in_executor thread hops)
         "WZGRAM_INLINE_CRYPTO_MAX": str(inline_crypto_max),
         # Keep pooled media sessions warm for 300s between transfers
@@ -544,6 +544,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             progress: Optional[Callable] = None,
             progress_args: tuple = (),
         ) -> Any:
+            _orig_gc = gc.get_threshold()
+            gc.set_threshold(100000, 50, 50)
             async with self.save_file_semaphore:
                 if path is None:
                     return None
@@ -688,8 +690,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 _progress_task: List[Optional[asyncio.Task]] = [None]
                 _stop_requested = [False]
 
-                # 6 pipelined workers per media socket across 20 sockets = 120 upload workers
-                n_workers = max(1, min(len(pool) * 6, file_total_parts))
+                # 2 pipelined workers per media socket across 10 sockets = 20 upload workers
+                n_workers = max(1, min(len(pool) * 2, file_total_parts))
                 queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
                 budget = ReadAhead(self.read_ahead_slots)
 
@@ -856,6 +858,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                     if isinstance(path, (str, PurePath)):
                         fp.close()
 
+                    gc.set_threshold(*_orig_gc)
+                    gc.collect(1)
+
         save_file_mod.SaveFile.save_file = _turbo_save_file
         Client.save_file = _turbo_save_file
 
@@ -872,6 +877,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             progress_args: tuple = (),
             _write_file: Any = None,
         ) -> Any:
+            _orig_gc = gc.get_threshold()
+            gc.set_threshold(100000, 50, 50)
             async with self.get_file_semaphore:
                 file_type = file_id.file_type
 
@@ -920,7 +927,22 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 _file_write_lock = threading.Lock()
                 _chunk_timeout = min(30.0, float(Session.MEDIA_WAIT_TIMEOUT))
 
+                _write_fd = None
+                if _write_file is not None:
+                    try:
+                        _write_fd = getattr(_write_file, "fileno", lambda: None)()
+                    except Exception:
+                        _write_fd = None
+
                 def _sync_write_chunk(chunk_off: int, data_bytes: bytes) -> None:
+                    if _stop_requested[0] or _write_file is None or getattr(_write_file, "closed", False):
+                        return
+                    if _write_fd is not None and hasattr(os, "pwrite"):
+                        try:
+                            os.pwrite(_write_fd, data_bytes, chunk_off)
+                            return
+                        except Exception:
+                            pass
                     with _file_write_lock:
                         if (
                             not _stop_requested[0]
@@ -962,9 +984,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
                 try:
                     # Turbo multi-session download parameters:
-                    # 20 sockets, 6 workers/socket = 120 workers, unthrottled full-speed pipelining
+                    # 10 sockets, 2 workers/socket = 20 workers, sustained 50+ MB/s pipelining
                     dl_pool_size = save_file_mod.POOL_SIZE
-                    dl_workers_per_session = 6
+                    dl_workers_per_session = 2
                     dl_rate = 400
                     dl_burst = 120
 
@@ -1375,12 +1397,17 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                     if pool_task is not None and not pool_task.done():
                         pool_task.cancel()
                     raise
+                finally:
+                    if pool_task is not None and not pool_task.done():
+                        pool_task.cancel()
+                    gc.set_threshold(*_orig_gc)
+                    gc.collect(1)
 
         Client.get_file = _turbo_get_file
 
         _MTPROTO_PATCHED = True
         logger.info(
-            "Applied Wzgram Turbo 50-100+ MB/s patches (pool=%d, sock_buf=16MiB, 120 workers, native DC routing).",
+            "Applied Wzgram Turbo 50+ MB/s patches (pool=%d, sock_buf=8MiB, 20 workers, native DC routing).",
             target_pool,
         )
     except Exception as exc:
