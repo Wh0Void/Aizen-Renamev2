@@ -68,13 +68,15 @@ def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: 
     avg_speed = current_clamped / max(now - effective_start, 0.001)
     base_speed = window_speed if window_speed > 0 else avg_speed
 
+    elapsed_from_start = max(now - effective_start, 0.001)
+    swing = 0.30 if elapsed_from_start < 5.0 else 0.18
+
     if prev_ema <= 0.0:
         ema_speed = base_speed
     else:
         ema_speed = (0.40 * base_speed) + (0.60 * prev_ema)
-        # Tight ±18% swing clamp per update so transient network jitter never causes speed to oscillate
-        low_bound = prev_ema * 0.82
-        high_bound = prev_ema * 1.18
+        low_bound = prev_ema * (1.0 - swing)
+        high_bound = prev_ema * (1.0 + swing)
         ema_speed = max(low_bound, min(high_bound, ema_speed))
 
     state["ema_speed"] = ema_speed

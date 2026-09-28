@@ -54,6 +54,80 @@ DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "16"))
 _MTPROTO_PATCHED: bool = False
 
 
+class AdaptiveConcurrency:
+    """
+    Dynamically controls the number of active transfer workers based on
+    Telegram FloodWait feedback.  Starts conservative, scales up when
+    transfers are clean, backs off immediately on FloodWait.
+
+    - Starts with ``initial`` active worker slots
+    - Every ``scale_interval`` seconds without a FloodWait hit, opens
+      ``scale_step`` additional slots (up to ``max_workers``)
+    - On any FloodWait, halves the active limit (never below ``min_workers``)
+    """
+
+    __slots__ = (
+        "active_limit", "min_workers", "max_workers", "scale_interval",
+        "scale_step", "_last_scale_up", "_last_flood", "_flood_count",
+        "_semaphore", "_lock",
+    )
+
+    def __init__(
+        self,
+        initial: int = 8,
+        min_workers: int = 4,
+        max_workers: int = 48,
+        scale_interval: float = 2.0,
+        scale_step: int = 4,
+    ):
+        self.active_limit = initial
+        self.min_workers = min_workers
+        self.max_workers = max_workers
+        self.scale_interval = scale_interval
+        self.scale_step = scale_step
+        self._last_scale_up = time.monotonic()
+        self._last_flood: float = 0.0
+        self._flood_count: int = 0
+        self._semaphore = asyncio.Semaphore(initial)
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Wait until a worker slot is available."""
+        await self._semaphore.acquire()
+
+    def release(self) -> None:
+        """Release a worker slot."""
+        self._semaphore.release()
+
+    async def on_flood_wait(self, wait_seconds: float) -> None:
+        """Called when a worker hits FloodWait.  Halves the active limit."""
+        async with self._lock:
+            self._flood_count += 1
+            self._last_flood = time.monotonic()
+            new_limit = max(self.min_workers, self.active_limit // 2)
+            if new_limit < self.active_limit:
+                self.active_limit = new_limit
+                # Reset scale-up timer so we don't immediately scale back up
+                self._last_scale_up = time.monotonic()
+
+    async def try_scale_up(self) -> None:
+        """Called periodically; opens more worker slots if no recent FloodWait."""
+        now = time.monotonic()
+        if now - self._last_flood < self.scale_interval * 2:
+            return  # Too soon after last FloodWait
+        if now - self._last_scale_up < self.scale_interval:
+            return
+        async with self._lock:
+            new_limit = min(self.max_workers, self.active_limit + self.scale_step)
+            if new_limit > self.active_limit:
+                added = new_limit - self.active_limit
+                self.active_limit = new_limit
+                for _ in range(added):
+                    self._semaphore.release()
+                self._last_scale_up = now
+
+
+
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
     max_read_ahead: int = 96,
@@ -555,6 +629,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         data = await queue.get()
                         if data is None:
                             return
+                        await _up_adaptive.acquire()
                         try:
                             await _send_part(worker_idx, data)
                             _acked[0] += 1
@@ -562,6 +637,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         finally:
                             data = None
                             budget.release()
+                            _up_adaptive.release()
 
                 _up_session_cooldown: Dict[int, float] = {}
 
@@ -603,6 +679,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             fw_raw = getattr(fw, "value", None)
                             fw_secs = float(fw_raw if fw_raw is not None else 1.0)
                             _up_session_cooldown[sid] = time.monotonic() + max(fw_secs, 0.5) + random.uniform(0.05, 0.25)
+                            await _up_adaptive.on_flood_wait(fw_secs)
                             if attempt == save_file_mod.MAX_RETRIES - 1:
                                 raise
                             if flood_hits >= 2 or n_pool <= 1:
@@ -690,10 +767,24 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 _progress_task: List[Optional[asyncio.Task]] = [None]
                 _stop_requested = [False]
 
-                # 3 pipelined workers per media socket across 10 sockets = 30 upload workers
+                # Adaptive concurrency: start with 8 upload workers, scale up to pool*3
                 n_workers = max(1, min(len(pool) * 3, file_total_parts))
+                _up_adaptive = AdaptiveConcurrency(
+                    initial=min(8, n_workers),
+                    min_workers=4,
+                    max_workers=n_workers,
+                    scale_interval=2.0,
+                    scale_step=4,
+                )
                 queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
                 budget = ReadAhead(self.read_ahead_slots)
+
+                async def _up_scale_ticker() -> None:
+                    while not _stop_requested[0]:
+                        await asyncio.sleep(1.0)
+                        await _up_adaptive.try_scale_up()
+
+                _scale_task: Optional[asyncio.Task] = self.loop.create_task(_up_scale_ticker())
 
                 workers = [
                     self.loop.create_task(worker(i))
@@ -847,6 +938,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             md5_checksum=md5_sum,
                         )
                 finally:
+                    if _scale_task is not None and not _scale_task.done():
+                        _scale_task.cancel()
                     if _progress_task[0] is not None and not _progress_task[0].done():
                         _progress_task[0].cancel()
                     if next_batch_task is not None and not next_batch_task.done():
@@ -984,11 +1077,15 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
                 try:
                     # Turbo multi-session download parameters:
-                    # 10 sockets, 3 workers/socket = 30 workers, sustained 50+ MB/s pipelining
+                    # 16 sockets, adaptive workers (start 8, scale to 48), sleep_threshold=3
+                    # so small FloodWaits (1-2s) are absorbed per-worker independently
+                    # while other workers on different sessions keep downloading in parallel.
+                    # FloodWaits >3s trigger cross-session failover.
                     dl_pool_size = save_file_mod.POOL_SIZE
                     dl_workers_per_session = 3
                     dl_rate = 400
                     dl_burst = 120
+                    _DL_SLEEP_THRESHOLD = 3
 
                     total_chunks = math.ceil((file_size - offset_bytes) / chunk_size) if file_size > offset_bytes else 1
                     pool_size_needed = max(1, min(dl_pool_size, total_chunks))
@@ -1016,7 +1113,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             limit=chunk_size,
                         ),
                         timeout=_chunk_timeout,
-                        sleep_threshold=30,
+                        sleep_threshold=_DL_SLEEP_THRESHOLD,
                     )
 
                     if isinstance(r, raw.types.upload.File):
@@ -1059,7 +1156,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         limit=chunk_size,
                                     ),
                                     timeout=_chunk_timeout,
-                                    sleep_threshold=30,
+                                    sleep_threshold=_DL_SLEEP_THRESHOLD,
                                 )
                                 chunk = r.bytes
                                 if not chunk:
@@ -1110,6 +1207,15 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         _max_chunk_attempts = max(6, min(n_sessions + 2, 10))
                         _dl_session_cooldown: Dict[int, float] = {}
 
+                        # Adaptive concurrency: start with 8 download workers, scale up
+                        _dl_adaptive = AdaptiveConcurrency(
+                            initial=min(8, total_workers),
+                            min_workers=4,
+                            max_workers=total_workers,
+                            scale_interval=2.0,
+                            scale_step=4,
+                        )
+
                         def _pick_dl_session(worker_idx: int, attempt: int) -> Any:
                             now = time.monotonic()
                             start_idx = (worker_idx + attempt) % n_sessions
@@ -1145,6 +1251,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         buffer_slots.release()
                                     return
 
+                                # Adaptive concurrency gate — only N workers active simultaneously
+                                await _dl_adaptive.acquire()
+
                                 r_part = None
                                 last_err: Optional[BaseException] = None
                                 flood_hits = 0
@@ -1167,7 +1276,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                                 limit=chunk_size,
                                             ),
                                             timeout=_chunk_timeout,
-                                            sleep_threshold=30,
+                                            sleep_threshold=_DL_SLEEP_THRESHOLD,
                                         )
                                         last_err = None
                                         break
@@ -1181,6 +1290,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         fw_raw = getattr(fw, "value", None)
                                         fw_secs = float(fw_raw if fw_raw is not None else 1.0)
                                         _dl_session_cooldown[sid] = time.monotonic() + max(fw_secs, 0.5) + random.uniform(0.05, 0.25)
+                                        await _dl_adaptive.on_flood_wait(fw_secs)
                                         if attempt + 1 < _max_chunk_attempts:
                                             if flood_hits >= 2 or n_sessions <= 1:
                                                 await asyncio.sleep(max(fw_secs, 0.05) + random.uniform(0.1, 0.3))
@@ -1193,6 +1303,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                             await asyncio.sleep(min(0.015 * (attempt + 1), 0.25))
 
                                 if last_err is not None or r_part is None:
+                                    _dl_adaptive.release()
                                     if not _write_mode:
                                         buffer_slots.release()
                                     if last_err is not None:
@@ -1200,6 +1311,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     raise ConnectionResetError("Connection is not established")
 
                                 if _stop_requested[0]:
+                                    _dl_adaptive.release()
                                     if not _write_mode:
                                         buffer_slots.release()
                                     return
@@ -1213,6 +1325,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         or _write_file is None
                                         or getattr(_write_file, "closed", False)
                                     ):
+                                        _dl_adaptive.release()
                                         return
                                     await self.loop.run_in_executor(
                                         self.executor,
@@ -1224,6 +1337,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     received[chunk_offset] = chunk_data
 
                                 _done_count += 1
+                                _dl_adaptive.release()
                                 data_ready.set()
 
                                 chunk_len = len(chunk_data)
@@ -1236,6 +1350,13 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             asyncio.ensure_future(_worker(i))
                             for i in range(total_workers)
                         ]
+
+                        async def _dl_scale_ticker() -> None:
+                            while not _stop_requested[0]:
+                                await asyncio.sleep(1.0)
+                                await _dl_adaptive.try_scale_up()
+
+                        _dl_scale_task: Optional[asyncio.Task] = self.loop.create_task(_dl_scale_ticker())
 
                         for t in tasks:
                             t.add_done_callback(lambda _: data_ready.set())
@@ -1300,6 +1421,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         return
                         finally:
                             _stop_requested[0] = True
+                            if _dl_scale_task is not None and not _dl_scale_task.done():
+                                _dl_scale_task.cancel()
                             if _progress_task[0] is not None and not _progress_task[0].done():
                                 _progress_task[0].cancel()
                             for t in tasks:
