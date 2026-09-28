@@ -49,42 +49,42 @@ CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
 MIN_MEDIA_POOL_SIZE: int = 8
 MAX_MEDIA_POOL_SIZE: int = 24
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "10"))
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "16"))
 
 _MTPROTO_PATCHED: bool = False
 
 
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
-    max_read_ahead: int = 48,
-    max_inflight_media: int = 8,
-    max_inflight_packets: int = 48,
+    max_read_ahead: int = 96,
+    max_inflight_media: int = 16,
+    max_inflight_packets: int = 64,
     inline_crypto_max: int = 2097152,
     media_idle_timeout: int = 300,
 ) -> Dict[str, str]:
     """
     Configure Wzgram runtime environment knobs before client initialization.
-    Tuned for sustained 50+ MB/s throughput on Koyeb / Linux (10 parallel media sessions,
-    2 workers/session = 20 workers, 48 read-ahead slots, 8 MiB TCP socket buffers,
+    Tuned for sustained 50-100+ MB/s Turbo throughput (16 parallel media sessions,
+    3 in-flight workers/session = 48 workers, 96 read-ahead slots, 16 MiB TCP socket buffers,
     8 MiB StreamReader/StreamWriter watermarks, and inline Rust AES-NI packing).
     """
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        # Multi-session upload/download pool (8-16 parallel TCP media connections)
+        # Multi-session upload/download pool (8-24 parallel TCP media connections)
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
         # High rate ceiling (400 parts/sec * 512 KB = 200 MB/s)
         "WZGRAM_UPLOAD_RATE_BOT": "400",
         "WZGRAM_UPLOAD_RATE_USER": "400",
-        # 48 read-ahead slots for pipelined transfers across 10 sockets (low RAM footprint)
+        # 96 read-ahead slots for pipelined transfers across 16 sockets
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
-        # 8 pipelined chunks per TCP media socket (up to 80 in-flight across 10 sockets)
+        # 16 pipelined chunks per TCP media socket (up to 256 in-flight across 16 sockets)
         "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
         "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
-        # 8 MiB OS TCP send/recv socket buffers (SO_SNDBUF / SO_RCVBUF) for high-BDP links
-        "WZGRAM_SOCKET_BUFFER": str(8 * 1024 * 1024),
+        # 16 MiB OS TCP send/recv socket buffers (SO_SNDBUF / SO_RCVBUF) for high-BDP links
+        "WZGRAM_SOCKET_BUFFER": str(16 * 1024 * 1024),
         # Generous TCP & Media timeouts so burst transfers never drop mid-frame
         "WZGRAM_TCP_TIMEOUT": "30",
         "WZGRAM_MEDIA_TIMEOUT": "90",
@@ -690,8 +690,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 _progress_task: List[Optional[asyncio.Task]] = [None]
                 _stop_requested = [False]
 
-                # 2 pipelined workers per media socket across 10 sockets = 20 upload workers
-                n_workers = max(1, min(len(pool) * 2, file_total_parts))
+                # 3 pipelined workers per media socket across 10 sockets = 30 upload workers
+                n_workers = max(1, min(len(pool) * 3, file_total_parts))
                 queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
                 budget = ReadAhead(self.read_ahead_slots)
 
@@ -984,9 +984,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
                 try:
                     # Turbo multi-session download parameters:
-                    # 10 sockets, 2 workers/socket = 20 workers, sustained 50+ MB/s pipelining
+                    # 10 sockets, 3 workers/socket = 30 workers, sustained 50+ MB/s pipelining
                     dl_pool_size = save_file_mod.POOL_SIZE
-                    dl_workers_per_session = 2
+                    dl_workers_per_session = 3
                     dl_rate = 400
                     dl_burst = 120
 
@@ -1407,7 +1407,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
         _MTPROTO_PATCHED = True
         logger.info(
-            "Applied Wzgram Turbo 50+ MB/s patches (pool=%d, sock_buf=8MiB, 20 workers, native DC routing).",
+            "Applied Wzgram Turbo 50-100+ MB/s patches (pool=%d, sock_buf=16MiB, 48 workers, native DC routing).",
             target_pool,
         )
     except Exception as exc:
