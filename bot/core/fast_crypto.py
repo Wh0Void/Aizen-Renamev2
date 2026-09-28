@@ -516,13 +516,15 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 for _retry in range(6):
                                     current_sess = pool[sess_idx % len(pool)]
                                     try:
+                                        # Fast 8-second timeout per 1 MiB chunk instead of 120s:
+                                        # If a socket stalls, immediately failover to next session
                                         r_res = await current_sess.invoke(
                                             raw.functions.upload.GetFile(
                                                 location=location,
                                                 offset=offset_cur,
                                                 limit=chunk_size,
                                             ),
-                                            timeout=Session.MEDIA_WAIT_TIMEOUT,
+                                            timeout=8.0,
                                             sleep_threshold=15,
                                         )
                                         chunk_data = r_res.bytes
@@ -531,6 +533,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     except (FloodWait, FloodPremiumWait) as fw:
                                         fw_sec = min(getattr(fw, "value", 1) or 1, 15)
                                         await asyncio.sleep(fw_sec)
+                                    except asyncio.CancelledError:
+                                        return
                                     except Exception as exc:
                                         # Rotate to next healthy session immediately
                                         sess_idx = (sess_idx + 1) % len(pool)
@@ -557,7 +561,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 chunk_len = len(chunk_data)
                                 chunk_data = None
                                 if chunk_len < chunk_size:
+                                    # Final partial chunk arrived -> File download is 100% complete!
+                                    # Mark all chunks as done so master loop exits immediately without waiting
+                                    _done_count = _total_chunks
+                                    data_ready.set()
                                     return
+                            except asyncio.CancelledError:
+                                buffer_slots.release()
+                                return
                             except BaseException:
                                 buffer_slots.release()
                                 raise
