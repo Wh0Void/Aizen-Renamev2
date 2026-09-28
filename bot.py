@@ -87,6 +87,7 @@ class Bot(Client):
     async def start(self):
         await super().start()
         await self.fast_pool.start_background_reaper()
+        asyncio.create_task(self.fast_pool.warm_up())
 
         me = await self.get_me()
         self.mention = me.mention
