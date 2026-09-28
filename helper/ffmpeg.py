@@ -294,11 +294,14 @@ async def add_metadata(
     input_path: str, output_path: str, metadata: str, ms
 ) -> Optional[str]:
     try:
-        await ms.edit(
-            "<blockquote>⚙️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
-            "╭─ <b>sᴛᴀᴛᴜs :</b> <code>ɪɴᴊᴇᴄᴛɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</code> ⚡\n"
-            f"╰─ <b>ᴛᴀɢ :</b> <code>{metadata}</code>"
-        )
+        try:
+            await ms.edit(
+                "<blockquote>⚙️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                "╭─ <b>sᴛᴀᴛᴜs :</b> <code>ɪɴᴊᴇᴄᴛɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</code> ⚡\n"
+                f"╰─ <b>ᴛᴀɢ :</b> <code>{metadata}</code>"
+            )
+        except Exception:
+            pass
         command = [
             "ffmpeg",
             "-y",
@@ -346,23 +349,25 @@ async def add_metadata(
             print(t_response)
 
         if os.path.exists(output_path):
-            await ms.edit(
-                "<blockquote>✅ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
-                "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ᴍᴇᴛᴀᴅᴀᴛᴀ ɪɴᴊᴇᴄᴛᴇᴅ sᴜᴄᴄᴇssꜰᴜʟʟʏ!</code>"
-            )
             return output_path
         else:
-            await ms.edit(
-                "<blockquote>❌ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
-                "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ꜰᴀɪʟᴇᴅ ᴛᴏ ɪɴᴊᴇᴄᴛ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
-            )
+            try:
+                await ms.edit(
+                    "<blockquote>❌ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                    "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ꜰᴀɪʟᴇᴅ ᴛᴏ ɪɴᴊᴇᴄᴛ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
+                )
+            except Exception:
+                pass
             return None
     except Exception as e:
         print(f"Error occurred while adding metadata: {str(e)}")
-        await ms.edit(
-            "<blockquote>⚠️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
-            "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ᴇʀʀᴏʀ ᴡʜɪʟᴇ ᴀᴅᴅɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
-        )
+        try:
+            await ms.edit(
+                "<blockquote>⚠️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ᴇʀʀᴏʀ ᴡʜɪʟᴇ ᴀᴅᴅɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
+            )
+        except Exception:
+            pass
         return None
 
 

@@ -1,34 +1,3 @@
-"""
-High-Speed Telegram Transfer Engine & Multi-Session Connection Pool.
-
-Why Telegram Upload/Download Speed was Capped at ~3-5 MB/s & The Fix:
----------------------------------------------------------------------
-1. The Root Cause:
-   Telegram's MTProto Data Centers enforce a per-connection bandwidth ceiling
-   (~3 to 5 MB/s per TCP socket). Routing all chunk uploads or downloads through
-   a single Session object caps throughput at a single TCP socket.
-
-2. Why `Connection closed by the server` Happened in Default Wzgram v3.1.1:
-   - In `pyrogram/session/session.py`, `Session.send()` allocated `msg_id` and
-     `seq_no` via `self.msg_factory()` BEFORE awaiting `run_in_executor` to
-     encrypt 512 KB chunks. Whenever `ping_worker` (`PingDelayDisconnect`) or
-     `MsgsAck` (`<= 32 KB`) ran on the inline fast-path—or two workers shared
-     one Session—packets arrived at `connection.send()` out of `msg_id`/`seq_no`
-     order, causing Telegram's MTProto server to immediately drop the socket!
-   - Additionally, `get_dc_option(is_media=True)` selected a `media_only` DC IP
-     while reusing the main production DC's `auth_key` without export.
-
-3. The Solution (`bot/core/fast_crypto.py`):
-   - Atomic Per-Session Send Lock (`_patch_wzgram_mtproto_stability`):
-     Guarantees `msg_id`/`seq_no` allocation, `warpcrypto` AES-NI encryption,
-     and TCP socket write execute in strict monotonic order on every Session,
-     while keeping response awaiting 100% concurrent across all sockets.
-   - Prod DC Endpoint Alignment: Ensures pooled media sessions connect to the
-     authorized production DC endpoint matching `auth_key`.
-   - Multi-Session Connection Pool (6 to 8 parallel `Session(..., is_media=True)`
-     TCP streams) distributing 512 KB chunks with hardware AES-NI (`warpcrypto`).
-"""
-
 import asyncio
 import ctypes
 import gc
@@ -40,55 +9,57 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Constants for 512 KB MTProto chunk distribution and pool sizing
-CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto part
-MIN_MEDIA_POOL_SIZE: int = 6
-MAX_MEDIA_POOL_SIZE: int = 8
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "6"))
+# Constants for 512 KB MTProto chunk distribution and 12-socket Turbo pool sizing
+CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
+DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
+MIN_MEDIA_POOL_SIZE: int = 8
+MAX_MEDIA_POOL_SIZE: int = 16
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "12"))
 
 _MTPROTO_PATCHED: bool = False
 
 
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
-    max_read_ahead: int = 24,
-    max_inflight_media: int = 2,
-    max_inflight_packets: int = 16,
-    inline_crypto_max: int = 32768,
-    media_idle_timeout: int = 180,
+    max_read_ahead: int = 48,
+    max_inflight_media: int = 6,
+    max_inflight_packets: int = 32,
+    inline_crypto_max: int = 1048576,
+    media_idle_timeout: int = 300,
 ) -> Dict[str, str]:
     """
     Configure Wzgram runtime environment knobs before client initialization.
-    Optimized for zero-disconnect stability, high throughput (6-8 parallel media
-    sessions, 512 KB parts), and low RAM footprint on Render (512 MB) and Koyeb.
+    Tuned for 50-100+ MB/s Turbo throughput (12 parallel media sessions, 6 in-flight
+    requests per socket, inline 1 MiB Rust AES-NI crypto) and bounded memory.
     """
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        # Multi-session upload/download pool (6-8 parallel TCP media connections)
+        # Multi-session upload/download pool (8-16 parallel TCP media connections)
+        "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
-        # 80 parts/sec * 512 KB = 40 MB/s rate ceiling
-        "WZGRAM_UPLOAD_RATE_BOT": "80",
-        "WZGRAM_UPLOAD_RATE_USER": "80",
-        # Strictly bound read-ahead slots (24 * 512 KB = 12 MB max buffer per transfer)
-        # so 512 MB Render / Koyeb instances never hit OOM on 2 GB files
+        # High rate ceiling (240 parts/sec * 512 KB = 120 MB/s)
+        "WZGRAM_UPLOAD_RATE_BOT": "240",
+        "WZGRAM_UPLOAD_RATE_USER": "240",
+        # Read-ahead slots for pipelined transfers across 12 sockets
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
-        # 2 pipelined 512 KB chunks per TCP socket * 6-8 sockets = 12-16 chunks in flight
+        # 6 pipelined chunks per TCP media socket (matches wzgram performance guide)
         "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
         "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
-        #Generous TCP & Media timeouts so burst uploads never drop mid-frame
+        # Generous TCP & Media timeouts so burst transfers never drop mid-frame
         "WZGRAM_TCP_TIMEOUT": "30",
         "WZGRAM_MEDIA_TIMEOUT": "90",
-        # Inline hardware AES-NI threshold (<= 32 KiB runs on event loop without thread hop)
+        # Inline hardware AES-NI threshold (1 MiB covers both 512 KB upload & 1 MiB download chunks
+        # in ~150 us without paying thread-pool hand-off latency!)
         "WZGRAM_INLINE_CRYPTO_MAX": str(inline_crypto_max),
-        # Reap idle media sessions after 180s to return memory when bot is idle
+        # Keep pooled media sessions warm for 300s between transfers
         "WZGRAM_MEDIA_SESSION_IDLE_TIMEOUT": str(media_idle_timeout),
-        # Bound peer cache for low-RAM containers
-        "WZGRAM_PEER_CACHE": "1024",
-        # Keep worker threads compact
+        # Fast peer cache in front of SQLite/in-memory storage
+        "WZGRAM_PEER_CACHE": "4096",
+        # Worker threads
         "WZGRAM_CRYPTO_WORKERS": "4",
-        "WZGRAM_WORKERS": "8",
+        "WZGRAM_WORKERS": "16",
         "WZGRAM_HANDLER_WORKERS": "16",
     }
 
@@ -120,39 +91,64 @@ def _is_writer_closing(writer: Any) -> bool:
 
 def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) -> None:
     """
-    Patch Wzgram v3.1.1's `TCP`, `Session.send`, `Client.get_dc_option`, and `save_file`
-    to eliminate `Connection closed by the server` and `uvloop` closed-transport `RuntimeError`s:
-      1. Hardens `TCP.send`, `TCP.close`, and `TCP.recv` so closed/closing `uvloop`
-         `TCPTransport` handles immediately set `is_connected = False` and raise
-         `ConnectionResetError` instead of spamming `Send exception: RuntimeError`
-         across queued coroutines.
-      2. Serializes `msg_factory` + `warpcrypto.pack_message` + `connection.send`
-         per Session so `PingDelayDisconnect` / `MsgsAck` and 512 KB chunks never
-         arrive on the wire with out-of-order `msg_id` or `seq_no`.
-      3. Aligns home-DC media sessions with the production DC endpoint (`not dc.media_only`)
-         where `auth_key` was negotiated.
-      4. Configures `save_file` `POOL_SIZE` to match `pool_size` (6-8 parallel sockets).
+    Patch Wzgram v3.1.1's `TCP`, `Session.send`, `Client.get_dc_option`, `SaveFile.save_file`,
+    and `Client.get_file` for 50-100+ MB/s zero-drop transfers:
+      1. Hardens `TCP.send`, `TCP.close`, and `TCP.recv` against `uvloop` closed-transport `RuntimeError`s.
+      2. Serializes `msg_factory` + inline `warpcrypto.pack_message` + `connection.send` per Session.
+      3. Aligns home-DC media sessions with the production DC endpoint (`not dc.media_only`).
+      4. Replaces Wzgram's hardcoded 20 MB/s bot throttles in `save_file` (`rate_limit = 40`) and
+         `get_file` (`dl_rate = 20`, `dl_pool_size = 4`) with 12-socket parallel pipelined workers
+         and non-blocking progress callbacks.
     """
     global _MTPROTO_PATCHED
+    target_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
     if _MTPROTO_PATCHED:
+        try:
+            import pyrogram.methods.advanced.save_file as save_file_mod  # type: ignore
+
+            save_file_mod.POOL_SIZE = max(save_file_mod.POOL_SIZE, target_pool)
+        except Exception:
+            pass
         return
 
     try:
+        import functools
+        import inspect
+        import io
+        import math
+        from hashlib import md5, sha256
+        from pathlib import PurePath
         import warpcrypto  # type: ignore
-        from pyrogram import raw  # type: ignore
-        from pyrogram.errors import BadMsgNotification, RPCError  # type: ignore
-        from pyrogram.session import session as session_mod  # type: ignore
+        import pyrogram  # type: ignore
+        from pyrogram import StopTransmission, raw, utils  # type: ignore
+        from pyrogram.crypto import aes  # type: ignore
+        from pyrogram.errors import (  # type: ignore
+            BadMsgNotification,
+            CDNFileHashMismatch,
+            RPCError,
+            VolumeLocNotFound,
+        )
+        from pyrogram.file_id import FileId, FileType, ThumbnailSource  # type: ignore
+        from pyrogram.methods.rate_limiter import TokenBucket  # type: ignore
         from pyrogram.session.session import ConnectionLost, Result, Session  # type: ignore
         from pyrogram.connection.transport.tcp import tcp as tcp_mod  # type: ignore
         import pyrogram.methods.advanced.save_file as save_file_mod  # type: ignore
-        from pyrogram.client import Client  # type: ignore
+        from pyrogram.client import Client, ReadAhead, write_at  # type: ignore
 
-        # 1. Tune timeouts and in-flight limits on already-imported classes
+        target_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
+
+        # 1. Tune timeouts, inline crypto threshold, and in-flight limits on already-imported classes
         tcp_mod.TCP.TIMEOUT = max(getattr(tcp_mod.TCP, "TIMEOUT", 10), 30)
         Session.MEDIA_WAIT_TIMEOUT = max(getattr(Session, "MEDIA_WAIT_TIMEOUT", 60), 90)
-        Session.MAX_INFLIGHT_MEDIA = int(os.environ.get("WZGRAM_MAX_INFLIGHT_MEDIA", "2"))
+        Session.MAX_INFLIGHT_MEDIA = int(os.environ.get("WZGRAM_MAX_INFLIGHT_MEDIA", "6"))
+        Session.INLINE_CRYPTO_MAX = max(
+            getattr(Session, "INLINE_CRYPTO_MAX", 32768),
+            int(os.environ.get("WZGRAM_INLINE_CRYPTO_MAX", "1048576")),
+        )
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
-        save_file_mod.POOL_SIZE = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
+        save_file_mod.POOL_SIZE = target_pool
+        save_file_mod.READ_BUFFER = 8 * 1024 * 1024
+        save_file_mod.MAX_BATCH = 24 * 1024 * 1024
 
         # 2. Patch TCP transport send/close/recv to handle uvloop closed TCPTransport cleanly
         _orig_tcp_recv = tcp_mod.TCP.recv
@@ -230,7 +226,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             delivered = False
             msg_id = 0
 
-            # Allocate msg_id/seq_no, encrypt, and write to TCP socket atomically per Session
+            # Allocate msg_id/seq_no, encrypt in Rust AES-NI, and write to TCP socket atomically per Session
             async with send_lock:
                 protocol = getattr(self.connection, "protocol", None) if self.connection else None
                 if (
@@ -251,7 +247,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                     self.results[msg_id] = Result()
 
                 try:
-                    # warpcrypto in Rust AES-NI packs 512 KB in ~80 microseconds
+                    # warpcrypto in Rust AES-NI packs 512 KB in ~80-150 microseconds inline
                     if len(serialized) <= Session.INLINE_CRYPTO_MAX:
                         payload = warpcrypto.pack_message(
                             message.msg_id,
@@ -365,24 +361,719 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
         Client.get_dc_option = _aligned_get_dc_option
 
+        # 5. Patch SaveFile.save_file to remove Wzgram's hardcoded 20 MB/s bot sleep (`rate_limit = 40`)
+        #    and scale to 12 parallel TCP media sessions with non-blocking progress updates
+        async def _turbo_save_file(
+            self: Client,
+            path: Any,
+            file_id: Optional[int] = None,
+            file_part: int = 0,
+            progress: Optional[Callable] = None,
+            progress_args: tuple = (),
+        ) -> Any:
+            async with self.save_file_semaphore:
+                if path is None:
+                    return None
+
+                async def worker(session: Any) -> None:
+                    while True:
+                        data = await queue.get()
+                        if data is None:
+                            return
+                        try:
+                            await _send_part(session, data)
+                            _acked[0] += 1
+                            _schedule_progress(_acked[0])
+                        finally:
+                            data = None
+                            budget.release()
+
+                async def _send_part(session: Any, data: Any) -> None:
+                    for attempt in range(save_file_mod.MAX_RETRIES):
+                        try:
+                            await session.invoke(
+                                data, timeout=Session.MEDIA_WAIT_TIMEOUT
+                            )
+                            break
+                        except StopTransmission:
+                            raise
+                        except (OSError, TimeoutError, RPCError, asyncio.TimeoutError) as e:
+                            if attempt == save_file_mod.MAX_RETRIES - 1:
+                                save_file_mod.log.exception(
+                                    "Upload part failed after %d attempts",
+                                    save_file_mod.MAX_RETRIES,
+                                )
+                                raise
+                            delay = min(2 ** attempt, 15)
+                            err_str = str(e)
+                            if "FLOOD" in err_str:
+                                for part in err_str.split():
+                                    if part.isdigit():
+                                        delay = min(int(part), 300)
+                                        break
+                            await asyncio.sleep(delay)
+
+                async def read_batch() -> bytes:
+                    batch_size = min(part_size * n_workers, save_file_mod.MAX_BATCH)
+                    return await self.loop.run_in_executor(
+                        self.executor, fp.read, batch_size
+                    )
+
+                part_size = save_file_mod.PART_SIZE
+
+                if isinstance(path, (str, PurePath)):
+                    fp = open(path, "rb", buffering=save_file_mod.READ_BUFFER)
+                elif isinstance(path, io.IOBase):
+                    fp = path
+                else:
+                    raise ValueError(
+                        "Invalid file. Expected a file path as string "
+                        "or a binary (not text) file pointer"
+                    )
+
+                file_name = getattr(fp, "name", "file.jpg")
+
+                fp.seek(0, os.SEEK_END)
+                file_size = fp.tell()
+                fp.seek(0)
+
+                if file_size == 0:
+                    raise ValueError("File size equals to 0 B")
+
+                is_premium = getattr(self.me, "is_premium", False) if hasattr(self, "me") and self.me else False
+                file_size_limit_mib = 4000 if is_premium else 2000
+
+                if file_size > file_size_limit_mib * 1024 * 1024:
+                    raise ValueError(
+                        f"Can't upload files bigger than {file_size_limit_mib} MiB"
+                    )
+
+                file_total_parts = int(math.ceil(file_size / part_size))
+                is_big = file_size > 10 * 1024 * 1024
+                # Use full multi-session pool for any file > 1 MiB (capped by total parts)
+                desired_pool = (
+                    min(save_file_mod.POOL_SIZE, file_total_parts)
+                    if file_size > 1024 * 1024
+                    else min(4, max(1, file_total_parts))
+                )
+
+                is_missing_part = file_id is not None
+                file_id = file_id or self.rnd_id()
+                md5_sum = md5() if not is_big and not is_missing_part else None
+
+                dc_id = await self.storage.dc_id()
+                pool = await self._get_media_session_pool(dc_id, desired_pool)
+
+                _acked = [0]
+                _progress_task: List[Optional[asyncio.Task]] = [None]
+                _stop_requested = [False]
+
+                # 4 pipelined workers per media socket across 12 sockets = 48 upload workers (zero rate limit)
+                n_workers = max(1, min(len(pool) * 4, file_total_parts))
+                queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
+                budget = ReadAhead(self.read_ahead_slots)
+                workers = [
+                    self.loop.create_task(worker(pool[i % len(pool)]))
+                    for i in range(n_workers)
+                ]
+                next_batch_task: Optional[asyncio.Task] = None
+                _stalled_since = 0.0
+
+                async def _report(parts: int) -> None:
+                    if not progress:
+                        return
+                    func = functools.partial(
+                        progress,
+                        min(parts * part_size, file_size),
+                        file_size,
+                        *progress_args,
+                    )
+                    try:
+                        if inspect.iscoroutinefunction(progress):
+                            await func()
+                        else:
+                            await self.loop.run_in_executor(self.executor, func)
+                    except StopTransmission:
+                        _stop_requested[0] = True
+                        raise
+                    except Exception as e:
+                        save_file_mod.log.debug("Upload progress callback skipped: %s", e)
+
+                def _schedule_progress(parts: int) -> None:
+                    if not progress:
+                        return
+                    cur_task = _progress_task[0]
+                    if cur_task is None or cur_task.done():
+                        _progress_task[0] = self.loop.create_task(_report(parts))
+
+                try:
+                    fp.seek(part_size * file_part)
+                    next_batch_task = self.loop.create_task(read_batch())
+
+                    while True:
+                        if _stop_requested[0]:
+                            raise StopTransmission
+
+                        batch = await next_batch_task
+                        next_batch_task = self.loop.create_task(read_batch())
+
+                        if not batch:
+                            next_batch_task.cancel()
+                            if not is_big and not is_missing_part and md5_sum is not None:
+                                md5_sum = md5_sum.hexdigest()  # type: ignore
+                            break
+
+                        async def _check_workers() -> None:
+                            if _stop_requested[0]:
+                                raise StopTransmission
+                            for t in workers:
+                                if t.done() and not t.cancelled():
+                                    exc = t.exception()
+                                    if exc is not None:
+                                        raise exc
+
+                        await _check_workers()
+
+                        for start in range(0, len(batch), part_size):
+                            if _stop_requested[0]:
+                                raise StopTransmission
+
+                            chunk = batch[start : start + part_size]
+
+                            if is_big:
+                                rpc = raw.functions.upload.SaveBigFilePart(
+                                    file_id=file_id,
+                                    file_part=file_part,
+                                    file_total_parts=file_total_parts,
+                                    bytes=chunk,
+                                )
+                            else:
+                                rpc = raw.functions.upload.SaveFilePart(
+                                    file_id=file_id, file_part=file_part, bytes=chunk
+                                )
+
+                            await budget.acquire()
+
+                            while True:
+                                try:
+                                    await asyncio.wait_for(queue.put(rpc), timeout=30)
+                                    _stalled_since = 0.0
+                                    break
+                                except asyncio.TimeoutError:
+                                    await _check_workers()
+                                    _now = time.monotonic()
+                                    if _stalled_since == 0.0:
+                                        _stalled_since = _now
+                                    elif _now - _stalled_since > save_file_mod.STALL_TIMEOUT:
+                                        raise TimeoutError(
+                                            f"Upload stalled for {save_file_mod.STALL_TIMEOUT}s"
+                                        )
+                                    await asyncio.sleep(0.2)
+
+                            if is_missing_part:
+                                next_batch_task.cancel()
+                                results = await save_file_mod._stop_workers(queue, workers)
+                                for r in results:
+                                    if isinstance(r, BaseException) and not isinstance(
+                                        r, asyncio.CancelledError
+                                    ):
+                                        raise r
+                                return None
+
+                            if not is_big and not is_missing_part and md5_sum is not None:
+                                md5_sum.update(chunk)
+
+                            rpc = None
+                            chunk = None
+                            file_part += 1
+
+                        batch = None
+
+                except StopTransmission:
+                    raise
+                except Exception as e:
+                    save_file_mod.log.exception(e)
+                    raise
+                else:
+                    results = await save_file_mod._stop_workers(queue, workers)
+
+                    for r in results:
+                        if isinstance(r, BaseException) and not isinstance(
+                            r, asyncio.CancelledError
+                        ):
+                            raise r
+
+                    if _progress_task[0] is not None and not _progress_task[0].done():
+                        try:
+                            await _progress_task[0]
+                        except Exception:
+                            pass
+                    await _report(file_total_parts)
+
+                    if is_big:
+                        return raw.types.InputFileBig(
+                            id=file_id,
+                            parts=file_total_parts,
+                            name=file_name,
+                        )
+                    else:
+                        return raw.types.InputFile(
+                            id=file_id,
+                            parts=file_total_parts,
+                            name=file_name,
+                            md5_checksum=md5_sum,
+                        )
+                finally:
+                    if _progress_task[0] is not None and not _progress_task[0].done():
+                        _progress_task[0].cancel()
+                    if next_batch_task is not None and not next_batch_task.done():
+                        next_batch_task.cancel()
+
+                    await save_file_mod._stop_workers(queue, workers)
+                    budget.release_all()
+
+                    if isinstance(path, (str, PurePath)):
+                        fp.close()
+
+        save_file_mod.SaveFile.save_file = _turbo_save_file
+        Client.save_file = _turbo_save_file
+
+        # 6. Patch Client.get_file to remove Wzgram's 20 MB/s bot download cap (`dl_rate = 20`, `dl_pool_size = 4`)
+        #    and scale to 12 parallel TCP media sessions with non-blocking progress updates
+        async def _turbo_get_file(
+            self: Client,
+            file_id: FileId,
+            file_size: int = 0,
+            limit: int = 0,
+            offset: int = 0,
+            progress: Optional[Callable] = None,
+            progress_args: tuple = (),
+            _write_file: Any = None,
+        ) -> Any:
+            async with self.get_file_semaphore:
+                file_type = file_id.file_type
+
+                if file_type == FileType.CHAT_PHOTO:
+                    if file_id.chat_id > 0:
+                        peer = raw.types.InputPeerUser(
+                            user_id=file_id.chat_id,
+                            access_hash=file_id.chat_access_hash,
+                        )
+                    else:
+                        if file_id.chat_access_hash == 0:
+                            peer = raw.types.InputPeerChat(chat_id=-file_id.chat_id)
+                        else:
+                            peer = raw.types.InputPeerChannel(
+                                channel_id=utils.get_channel_id(file_id.chat_id),
+                                access_hash=file_id.chat_access_hash,
+                            )
+
+                    location: Any = raw.types.InputPeerPhotoFileLocation(
+                        peer=peer,
+                        photo_id=file_id.media_id,
+                        big=file_id.thumbnail_source == ThumbnailSource.CHAT_PHOTO_BIG,
+                    )
+                elif file_type == FileType.PHOTO:
+                    location = raw.types.InputPhotoFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+                else:
+                    location = raw.types.InputDocumentFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+
+                current = 0
+                total = abs(limit) or (1 << 31) - 1
+                chunk_size = DOWNLOAD_CHUNK_1MB
+                offset_bytes = abs(offset) * chunk_size
+                _last_progress_time = 0.0
+                _progress_task: List[Optional[asyncio.Task]] = [None]
+                _stop_requested = [False]
+
+                async def _report(sent: int) -> None:
+                    if not progress:
+                        return
+                    func = functools.partial(
+                        progress,
+                        min(sent, file_size) if file_size else sent,
+                        file_size,
+                        *progress_args,
+                    )
+                    try:
+                        if inspect.iscoroutinefunction(progress):
+                            await func()
+                        else:
+                            await self.loop.run_in_executor(self.executor, func)
+                    except pyrogram.StopTransmission:
+                        _stop_requested[0] = True
+                        raise
+                    except Exception as e:
+                        logger.debug("Download progress callback skipped: %s", e)
+
+                def _schedule_progress(sent: int) -> None:
+                    if not progress:
+                        return
+                    cur_task = _progress_task[0]
+                    if cur_task is None or cur_task.done():
+                        _progress_task[0] = self.loop.create_task(_report(sent))
+
+                dc_id = file_id.dc_id
+
+                try:
+                    # Turbo multi-session download parameters (12 sockets, 4 workers/socket = 48 workers, 240 MiB/s ceiling)
+                    dl_pool_size = save_file_mod.POOL_SIZE
+                    dl_workers_per_session = 4
+                    dl_rate = 240
+                    dl_burst = 64
+
+                    total_chunks = math.ceil((file_size - offset_bytes) / chunk_size) if file_size > offset_bytes else 1
+                    pool_size_needed = max(1, min(dl_pool_size, total_chunks))
+                    total_workers = max(1, min(dl_pool_size * dl_workers_per_session, total_chunks))
+                    needs_pool = min(total, total_chunks) > 1
+                    if needs_pool:
+                        pool_task = asyncio.ensure_future(
+                            self._get_media_session_pool(dc_id, pool_size_needed)
+                        )
+                        pool_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+                    session = await self.get_session(dc_id, is_media=True)
+
+                    r = await session.invoke(
+                        raw.functions.upload.GetFile(
+                            location=location,
+                            offset=offset_bytes,
+                            limit=chunk_size,
+                        ),
+                        timeout=Session.MEDIA_WAIT_TIMEOUT,
+                        sleep_threshold=30,
+                    )
+
+                    if isinstance(r, raw.types.upload.File):
+                        first_chunk = r.bytes
+                        r = None
+                        yield first_chunk
+                        current += 1
+                        offset_bytes += chunk_size
+                        if _write_file is not None:
+                            _write_file.seek(0)
+                            _write_file.write(first_chunk)
+
+                        first_len = len(first_chunk)
+                        first_chunk = None
+
+                        _schedule_progress(offset_bytes)
+
+                        if not first_len or first_len < chunk_size or current >= total:
+                            if _progress_task[0] is not None and not _progress_task[0].done():
+                                try:
+                                    await _progress_task[0]
+                                except Exception:
+                                    pass
+                            await _report(offset_bytes)
+                            return
+
+                        if file_size <= 0:
+                            while current < total:
+                                if _stop_requested[0]:
+                                    raise pyrogram.StopTransmission
+                                r = await session.invoke(
+                                    raw.functions.upload.GetFile(
+                                        location=location,
+                                        offset=offset_bytes,
+                                        limit=chunk_size,
+                                    ),
+                                    timeout=Session.MEDIA_WAIT_TIMEOUT,
+                                    sleep_threshold=30,
+                                )
+                                chunk = r.bytes
+                                if not chunk:
+                                    return
+                                yield chunk
+                                if _write_file is not None:
+                                    _write_file.write(chunk)
+                                current += 1
+                                offset_bytes += chunk_size
+
+                                _schedule_progress(offset_bytes)
+
+                                if len(chunk) < chunk_size or current >= total:
+                                    await _report(offset_bytes)
+                                    return
+                            return
+
+                        total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
+                        pool_size_needed = max(1, min(dl_pool_size, total_chunks))
+                        total_workers = max(1, min(dl_pool_size * dl_workers_per_session, total_chunks))
+                        if needs_pool:
+                            pool = await pool_task
+                        else:
+                            pool = [session]
+                        if not pool:
+                            pool = [session]
+                        n_sessions = len(pool)
+
+                        work: asyncio.Queue = asyncio.Queue()
+                        chunks_needed = min(
+                            total - current,
+                            math.ceil((file_size - offset_bytes) / chunk_size),
+                        )
+                        for i in range(chunks_needed):
+                            work.put_nowait(offset_bytes + i * chunk_size)
+
+                        _write_mode = _write_file is not None and file_size > 0
+                        data_ready = asyncio.Event()
+                        buffer_slots = ReadAhead(self.read_ahead_slots)
+                        received: Dict[int, bytes] = {}
+                        _write_fd = _write_file.fileno() if _write_mode else -1
+                        _done_count = 0
+                        _total_chunks = chunks_needed
+
+                        async def _worker(worker_session: Any) -> None:
+                            nonlocal _done_count
+                            while True:
+                                if _stop_requested[0]:
+                                    return
+                                await buffer_slots.acquire()
+
+                                try:
+                                    chunk_offset = work.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    buffer_slots.release()
+                                    return
+
+                                try:
+                                    r_part = await worker_session.invoke(
+                                        raw.functions.upload.GetFile(
+                                            location=location,
+                                            offset=chunk_offset,
+                                            limit=chunk_size,
+                                        ),
+                                        timeout=Session.MEDIA_WAIT_TIMEOUT,
+                                        sleep_threshold=30,
+                                    )
+                                except BaseException:
+                                    buffer_slots.release()
+                                    raise
+
+                                chunk_data = r_part.bytes
+                                r_part = None
+
+                                if _write_mode:
+                                    write_at(_write_fd, chunk_data, chunk_offset)
+                                    buffer_slots.release()
+                                else:
+                                    received[chunk_offset] = chunk_data
+
+                                _done_count += 1
+                                data_ready.set()
+
+                                chunk_len = len(chunk_data)
+                                chunk_data = None
+
+                                if chunk_len < chunk_size:
+                                    return
+
+                        tasks = [
+                            asyncio.ensure_future(_worker(pool[i % n_sessions]))
+                            for i in range(total_workers)
+                        ]
+
+                        for t in tasks:
+                            t.add_done_callback(lambda _: data_ready.set())
+
+                        _reported_count = -1
+
+                        try:
+                            while current < total:
+                                if _stop_requested[0]:
+                                    raise pyrogram.StopTransmission
+                                if _write_mode:
+                                    if _done_count >= _total_chunks:
+                                        if _progress_task[0] is not None and not _progress_task[0].done():
+                                            try:
+                                                await _progress_task[0]
+                                            except Exception:
+                                                pass
+                                        await _report(offset_bytes + _done_count * chunk_size)
+                                        return
+                                    for t in tasks:
+                                        if t.done() and not t.cancelled():
+                                            exc = t.exception()
+                                            if exc is not None:
+                                                raise exc
+                                    if all(t.done() for t in tasks):
+                                        return
+                                    try:
+                                        await asyncio.wait_for(data_ready.wait(), 0.25)
+                                    except asyncio.TimeoutError:
+                                        pass
+                                    data_ready.clear()
+
+                                    if _done_count != _reported_count:
+                                        _reported_count = _done_count
+                                        _schedule_progress(offset_bytes + _done_count * chunk_size)
+
+                                    yield b""
+                                else:
+                                    while offset_bytes not in received:
+                                        if _stop_requested[0]:
+                                            raise pyrogram.StopTransmission
+                                        for t in tasks:
+                                            if t.done() and not t.cancelled():
+                                                exc = t.exception()
+                                                if exc is not None:
+                                                    raise exc
+                                        if all(t.done() for t in tasks):
+                                            return
+                                        await data_ready.wait()
+                                        data_ready.clear()
+
+                                    chunk = received.pop(offset_bytes)
+                                    buffer_slots.release()
+                                    yield chunk
+                                    current += 1
+                                    offset_bytes += chunk_size
+
+                                    _schedule_progress(offset_bytes)
+
+                                    if len(chunk) < chunk_size or current >= total:
+                                        await _report(offset_bytes)
+                                        return
+                        finally:
+                            if _progress_task[0] is not None and not _progress_task[0].done():
+                                _progress_task[0].cancel()
+                            for t in tasks:
+                                if not t.done():
+                                    t.cancel()
+                            buffer_slots.release_all()
+
+                    elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                        cdn_session = await self.get_session(
+                            r.dc_id, is_media=True, is_cdn=True, temporary=True
+                        )
+                        _cdn_rate = TokenBucket(rate=dl_rate, burst=dl_burst)
+                        _report_tasks = set()
+
+                        try:
+                            while True:
+                                if _stop_requested[0]:
+                                    raise pyrogram.StopTransmission
+                                await _cdn_rate.acquire()
+                                r2 = await cdn_session.invoke(
+                                    raw.functions.upload.GetCdnFile(
+                                        file_token=r.file_token,
+                                        offset=offset_bytes,
+                                        limit=chunk_size,
+                                    ),
+                                    timeout=Session.MEDIA_WAIT_TIMEOUT,
+                                )
+
+                                if isinstance(r2, raw.types.upload.CdnFileReuploadNeeded):
+                                    try:
+                                        await session.invoke(
+                                            raw.functions.upload.ReuploadCdnFile(
+                                                file_token=r.file_token,
+                                                request_token=r2.request_token,
+                                            )
+                                        )
+                                    except VolumeLocNotFound:
+                                        break
+                                    else:
+                                        continue
+
+                                chunk = r2.bytes
+                                decrypted_chunk = await self.loop.run_in_executor(
+                                    self.crypto_executor,
+                                    aes.ctr256_decrypt,
+                                    chunk,
+                                    r.encryption_key,
+                                    bytearray(
+                                        r.encryption_iv[:-4]
+                                        + (offset_bytes // 16).to_bytes(4, "big")
+                                    ),
+                                )
+
+                                hashes = await session.invoke(
+                                    raw.functions.upload.GetCdnFileHashes(
+                                        file_token=r.file_token, offset=offset_bytes
+                                    )
+                                )
+
+                                def _check_all_hashes() -> None:
+                                    for i, h in enumerate(hashes):
+                                        cdn_chunk = decrypted_chunk[
+                                            h.limit * i : h.limit * (i + 1)
+                                        ]
+                                        CDNFileHashMismatch.check(
+                                            h.hash == sha256(cdn_chunk).digest(),
+                                            "h.hash == sha256(cdn_chunk).digest()",
+                                        )
+
+                                await self.loop.run_in_executor(
+                                    self.crypto_executor, _check_all_hashes
+                                )
+
+                                yield decrypted_chunk
+
+                                current += 1
+                                offset_bytes += chunk_size
+
+                                if progress:
+                                    _now = time.monotonic()
+                                    if _now - _last_progress_time >= 0.2:
+                                        _last_progress_time = _now
+                                        _schedule_progress(offset_bytes)
+
+                                if len(chunk) < chunk_size or current >= total:
+                                    break
+                        finally:
+                            for _t in list(_report_tasks):
+                                if not _t.done():
+                                    _t.cancel()
+                            await cdn_session.stop()
+                except Exception:
+                    raise
+
+        Client.get_file = _turbo_get_file
+
         _MTPROTO_PATCHED = True
-        logger.info("Applied Wzgram MTProto atomic send-ordering, TCP transport guard & DC alignment patches.")
+        logger.info(
+            "Applied Wzgram Turbo 50-100+ MB/s patches (pool=%d, inline_crypto=1MiB, atomic send & TCP guard).",
+            target_pool,
+        )
     except Exception as exc:
         logger.warning("Could not apply Wzgram MTProto patch: %s", exc)
 
 
 def install_fast_event_loop() -> str:
     """
-    Install uvloop on Linux (Render / Koyeb) for 2-4x faster asyncio socket I/O.
-    Safely falls back to standard asyncio on Windows.
+    Install uvloop on Linux (Render / Koyeb / Docker) for 2-4x faster asyncio socket I/O,
+    or winloop on Windows if available, falling back to standard asyncio.
     """
     if sys.platform != "win32":
         try:
             import uvloop  # type: ignore
 
             uvloop.install()
+            asyncio.set_event_loop(uvloop.new_event_loop())
             logger.info("Installed uvloop high-speed event loop policy.")
             return "uvloop"
+        except ImportError:
+            pass
+    else:
+        try:
+            import winloop  # type: ignore
+
+            winloop.install()
+            asyncio.set_event_loop(winloop.new_event_loop())
+            logger.info("Installed winloop high-speed event loop policy on Windows.")
+            return "winloop"
         except ImportError:
             pass
     return "asyncio"
@@ -627,11 +1318,33 @@ class MultiSessionMediaPool:
                     store.clear()
         release_memory()
 
+    async def warm_up(self) -> int:
+        """
+        Pre-establish and authorize the home DC media session pool in the background
+        at startup so the very first download/upload has zero handshake latency.
+        """
+        if self.client is None:
+            return 0
+        try:
+            dc_id = await self.client.storage.dc_id()
+            if not dc_id:
+                return 0
+            pool = await self.client._get_media_session_pool(dc_id, self.pool_size)
+            logger.info(
+                "Pre-warmed %d parallel TCP media sockets on DC %d.",
+                len(pool),
+                dc_id,
+            )
+            return len(pool)
+        except Exception as exc:
+            logger.debug("Media pool warm-up skipped: %s", exc)
+            return 0
+
     async def get_or_create_pool(
         self, dc_id: int, pool_size: Optional[int] = None
     ) -> List[Any]:
         """
-        Spawn or retrieve 6 to 8 dedicated TCP media sessions (`Session(..., is_media=True)`)
+        Spawn or retrieve 8 to 16 dedicated TCP media sessions (`Session(..., is_media=True)`)
         connected simultaneously to the specified Telegram Media DC.
         """
         if self.client is None:
@@ -660,7 +1373,7 @@ class MultiSessionMediaPool:
 
             media = await self.client.get_session(dc_id, is_media=True)
             while deficit > 0:
-                batch = min(deficit, 3)
+                batch = min(deficit, 6)
                 created = await asyncio.gather(
                     *(
                         self.client._make_media_session(

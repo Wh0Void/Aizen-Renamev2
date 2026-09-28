@@ -9,7 +9,13 @@ from helper.ffmpeg import (
     get_cached_user_thumb,
     add_metadata,
 )
-from helper.utils import progress_for_pyrogram, convert, humanbytes, add_prefix_suffix
+from helper.utils import (
+    progress_for_pyrogram,
+    init_progress_message,
+    convert,
+    humanbytes,
+    add_prefix_suffix,
+)
 from helper.database import Mythicbotz
 from bot.core.cache import ram_workspace
 from config import Config
@@ -191,15 +197,15 @@ async def doc(bot, update):
     metadata_path = None
     ph_path = None
 
-    # Download the file using Multi-Session Connection Pool
+    # Download the file using Multi-Session Connection Pool (12 parallel TCP sockets)
     dl_header = "<blockquote>🚀 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
-    ms = await update.message.edit(dl_header)
+    ms, dl_start = await init_progress_message(update.message, dl_header, file_size)
     try:
         path = await bot.download_media(
             message=file,
             file_name=file_path,
             progress=progress_for_pyrogram,
-            progress_args=(dl_header, ms, time.time()),
+            progress_args=(dl_header, ms, dl_start),
         )
     except FloodWait as e:
         await sleep(e.value)
@@ -277,14 +283,16 @@ async def doc(bot, update):
         logger.warning(f"Thumbnail processing failed: {e}")
         ph_path = None
 
-    # Upload the file using Multi-Session Connection Pool (6-8 parallel TCP sockets)
+    # Upload the file using Multi-Session Connection Pool (12 parallel TCP sockets)
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
     try:
-        await ms.edit(ul_header)
         upload_path = metadata_path if (_bool_metadata and metadata_path) else path
 
         if not upload_path or not os.path.exists(upload_path):
             raise FileNotFoundError(f"File not found: {upload_path}")
+
+        upload_size = os.path.getsize(upload_path) if os.path.exists(upload_path) else file_size
+        ms, ul_start = await init_progress_message(ms, ul_header, upload_size)
 
         if type_ == "document":
             sent_message = await bot.send_document(
@@ -294,7 +302,7 @@ async def doc(bot, update):
                 thumb=ph_path,
                 caption=caption,
                 progress=progress_for_pyrogram,
-                progress_args=(ul_header, ms, time.time()),
+                progress_args=(ul_header, ms, ul_start),
             )
         elif type_ == "video":
             sent_message = await bot.send_video(
@@ -305,7 +313,7 @@ async def doc(bot, update):
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=(ul_header, ms, time.time()),
+                progress_args=(ul_header, ms, ul_start),
             )
         elif type_ == "audio":
             sent_message = await bot.send_audio(
@@ -316,7 +324,7 @@ async def doc(bot, update):
                 thumb=ph_path,
                 duration=duration,
                 progress=progress_for_pyrogram,
-                progress_args=(ul_header, ms, time.time()),
+                progress_args=(ul_header, ms, ul_start),
             )
         else:
             raise ValueError(f"Unsupported upload type: {type_}")
