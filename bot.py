@@ -78,8 +78,32 @@ class Bot(Client):
 
         super().__init__(**client_kwargs)
         self.uptime = Config.BOT_UPTIME
+        self.premium_client = None
+        self.helper_client = None
 
-        # Attach Multi-Session Connection Pool (6-8 parallel TCP media sessions + AES-NI)
+        if getattr(Config, "STRING_SESSION", None):
+            self.premium_client = Client(
+                name="premium_session",
+                api_id=Config.API_ID,
+                api_hash=Config.API_HASH,
+                session_string=Config.STRING_SESSION,
+                no_updates=True,
+                in_memory=True,
+                max_concurrent_transmissions=128,
+            )
+
+        if getattr(Config, "HELPER_SESSION", None):
+            self.helper_client = Client(
+                name="helper_session",
+                api_id=Config.API_ID,
+                api_hash=Config.API_HASH,
+                session_string=Config.HELPER_SESSION,
+                no_updates=True,
+                in_memory=True,
+                max_concurrent_transmissions=128,
+            )
+
+        # Attach Multi-Session Connection Pool (16-24 parallel TCP media sessions + AES-NI)
         self.fast_pool = MultiSessionMediaPool(
             client=self,
             pool_size=Config.MEDIA_POOL_SIZE,
@@ -87,6 +111,15 @@ class Bot(Client):
 
     async def start(self):
         await super().start()
+
+        if self.premium_client:
+            await self.premium_client.start()
+            print("⚡ Premium Client Started (STRING_SESSION)")
+
+        if self.helper_client:
+            await self.helper_client.start()
+            print("⚡ Helper Client Started (HELPER_SESSION)")
+
         await self.fast_pool.start_background_reaper()
         asyncio.create_task(self.fast_pool.warm_up())
 
@@ -146,6 +179,16 @@ class Bot(Client):
 
     async def stop(self, *args):
         await self.fast_pool.stop()
+        if self.helper_client and getattr(self.helper_client, "is_connected", False):
+            try:
+                await self.helper_client.stop()
+            except Exception:
+                pass
+        if self.premium_client and getattr(self.premium_client, "is_connected", False):
+            try:
+                await self.premium_client.stop()
+            except Exception:
+                pass
         await super().stop(*args)
         print(f"{getattr(self, 'mention', 'Bot')} is stopped.")
 

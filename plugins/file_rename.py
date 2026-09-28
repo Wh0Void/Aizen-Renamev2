@@ -201,11 +201,13 @@ async def doc(bot, update):
     ph_path = None
     cover_path = None
 
-    # Download the file using Multi-Session Connection Pool (16 parallel TCP sockets)
+    # Download the file using Multi-Session Connection Pool (24 parallel TCP sockets)
+    # Uses helper/premium user session if available for higher MTProto bandwidth priority
+    dl_client = getattr(bot, "helper_client", None) or getattr(bot, "premium_client", None) or bot
     dl_header = "<blockquote>🚀 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
     ms, dl_start = await init_progress_message(update.message, dl_header, file_size)
     try:
-        path = await bot.download_media(
+        path = await dl_client.download_media(
             message=file,
             file_name=file_path,
             progress=progress_for_pyrogram,
@@ -213,7 +215,7 @@ async def doc(bot, update):
         )
     except FloodWait as e:
         await sleep(e.value)
-        path = await bot.download_media(
+        path = await dl_client.download_media(
             message=file,
             file_name=file_path,
             progress=progress_for_pyrogram,
