@@ -512,21 +512,28 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                             chunk_data = None
                             try:
-                                for _retry in range(6):
-                                    current_sess = pool[sess_idx % len(pool)]
+                                for _retry in range(10):
+                                    # Fallback to the reliable master media session if pool socket experiences churn
+                                    if _retry >= 4:
+                                        current_sess = session
+                                    else:
+                                        current_sess = pool[sess_idx % len(pool)]
+
+                                    invoke_timeout = 25.0 if _retry < 3 else 45.0
                                     try:
-                                        # Fast 8-second timeout per 1 MiB chunk instead of 120s:
-                                        # If a socket stalls, immediately failover to next session
                                         r_res = await current_sess.invoke(
                                             raw.functions.upload.GetFile(
                                                 location=location,
                                                 offset=offset_cur,
                                                 limit=chunk_size,
                                             ),
-                                            timeout=8.0,
+                                            timeout=invoke_timeout,
                                             sleep_threshold=15,
                                         )
-                                        chunk_data = r_res.bytes
+                                        if isinstance(r_res, raw.types.upload.File):
+                                            chunk_data = r_res.bytes
+                                        elif r_res is None:
+                                            chunk_data = b""
                                         r_res = None
                                         break
                                     except (FloodWait, FloodPremiumWait) as fw:
@@ -535,14 +542,17 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     except asyncio.CancelledError:
                                         return
                                     except Exception as exc:
-                                        # Rotate to next healthy session immediately
                                         sess_idx = (sess_idx + 1) % len(pool)
-                                        # Trigger background restart of failed session if disconnected
                                         if hasattr(current_sess, "is_started") and not current_sess.is_started.is_set():
                                             utils.run_in_background(current_sess.restart(), self.loop)
-                                        if _retry >= 5:
+                                        if _retry >= 9:
+                                            logger.error(
+                                                "GetFile permanently failed at offset %d after 10 attempts: %s",
+                                                offset_cur,
+                                                exc,
+                                            )
                                             raise
-                                        await asyncio.sleep(0.05 * (2 ** _retry))
+                                        await asyncio.sleep(min(0.15 * (1.5 ** _retry), 2.0))
 
                                 if chunk_data is None:
                                     buffer_slots.release()

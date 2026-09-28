@@ -222,9 +222,28 @@ async def doc(bot, update):
             progress_args=(dl_header, ms, time.time()),
         )
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        ram_workspace.cleanup_files(file_path)
-        return await ms.edit(f"<blockquote>❌ <b>ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ</b></blockquote>\n╰─ <code>{e}</code>")
+        logger.warning(f"Download initial attempt encountered error: {e}. Retrying with fresh session...")
+        try:
+            await sleep(2.0)
+            path = await dl_client.download_media(
+                message=file,
+                file_name=file_path,
+                progress=progress_for_pyrogram,
+                progress_args=(dl_header, ms, time.time()),
+            )
+        except Exception as e2:
+            logger.error(f"Download retry failed: {e2}")
+            ram_workspace.cleanup_files(file_path)
+            return await ms.edit(f"<blockquote>❌ <b>ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ</b></blockquote>\n╰─ <code>{e2}</code>")
+
+    # Display clean processing status card between Download and Upload
+    try:
+        await ms.edit(
+            "<blockquote>⚙️ <b>ᴘʀᴏᴄᴇssɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>\n"
+            "╰─ <i>Applying metadata & preparing upload...</i>"
+        )
+    except Exception:
+        pass
 
     # Handle metadata (only when enabled) — output inside isolated `meta_out/` sub-folder
     # so the file's basename remains strictly `new_filename`
