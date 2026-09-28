@@ -34,9 +34,9 @@ if sys.platform == "win32":
 # Constants for MTProto chunk distribution and pool sizing
 CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
-MIN_MEDIA_POOL_SIZE: int = 8
-MAX_MEDIA_POOL_SIZE: int = 24
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "20"))
+MIN_MEDIA_POOL_SIZE: int = 12
+MAX_MEDIA_POOL_SIZE: int = 48
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "36"))
 
 _MTPROTO_PATCHED: bool = False
 
@@ -44,8 +44,8 @@ _MTPROTO_PATCHED: bool = False
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
     max_read_ahead: int = 64,
-    max_inflight_media: int = 32,
-    max_inflight_packets: int = 128,
+    max_inflight_media: int = 64,
+    max_inflight_packets: int = 256,
     inline_crypto_max: int = 1048576,
     media_idle_timeout: int = 300,
 ) -> Dict[str, str]:
@@ -55,9 +55,9 @@ def configure_wzgram_environment(
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        "WZGRAM_WORKERS": "256",
-        "WZGRAM_CRYPTO_WORKERS": "64",
-        "WZGRAM_HANDLER_WORKERS": "128",
+        "WZGRAM_WORKERS": "512",
+        "WZGRAM_CRYPTO_WORKERS": "128",
+        "WZGRAM_HANDLER_WORKERS": "256",
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
         "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
         "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
@@ -65,13 +65,13 @@ def configure_wzgram_environment(
         "WZGRAM_MEDIA_TIMEOUT": "120",
         "WZGRAM_MEDIA_SESSION_IDLE_TIMEOUT": str(media_idle_timeout),
         "WZGRAM_TCP_TIMEOUT": "30",
-        "WZGRAM_PEER_CACHE": "16384",
-        "WZGRAM_MAX_LISTENERS": "4000",
+        "WZGRAM_PEER_CACHE": "32768",
+        "WZGRAM_MAX_LISTENERS": "8000",
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
-        "WZGRAM_UPLOAD_RATE_BOT": "1000",
-        "WZGRAM_UPLOAD_RATE_USER": "1000",
+        "WZGRAM_UPLOAD_RATE_BOT": "2000",
+        "WZGRAM_UPLOAD_RATE_USER": "2000",
         "WZGRAM_SOCKET_BUFFER": "0",  # 0 enables Linux kernel TCP window dynamic autotuning
     }
 
@@ -267,8 +267,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
         # Boost upload engine parameters
         save_file_mod.POOL_SIZE = target_pool
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
-        save_file_mod.READ_BUFFER = 32 * 1024 * 1024
-        save_file_mod.MAX_BATCH = 64 * 1024 * 1024
+        save_file_mod.READ_BUFFER = 64 * 1024 * 1024
+        save_file_mod.MAX_BATCH = 128 * 1024 * 1024
 
         if not hasattr(Client, "_wzgram_orig_get_file"):
             Client._wzgram_orig_get_file = Client.get_file
@@ -283,7 +283,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             progress_args: tuple = (),
             _write_file: Any = None,
         ):
-            async with getattr(self, "get_file_semaphore", asyncio.Semaphore(100)):
+            async with getattr(self, "get_file_semaphore", asyncio.Semaphore(128)):
                 if not isinstance(file_id, FileId):
                     file_id = FileId.decode(file_id)
 
@@ -363,11 +363,10 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 dc_id = file_id.dc_id
 
-                # ── Dedicated 16-Socket Media Pool for High-Speed Multi-Streaming ─
-                # Spawns up to 16 dedicated TCP media sessions per DC.
-                # Paired with 1 MiB chunks and 2 workers per session (32 concurrent workers),
-                # this sustains 30-50+ MB/s across both local (DC4) and trans-continental (DC5) links.
-                dl_pool_size = min(16, target_pool)
+                # ── Dedicated 36-Socket Media Pool for High-Speed Multi-Streaming ─
+                # Spawns up to 36-48 dedicated TCP media sessions per DC.
+                # Easily handles 5–7 simultaneous transfers without socket sharing bottlenecks.
+                dl_pool_size = min(36, target_pool)
                 total_chunks = (
                     math.ceil((file_size - offset_bytes) / chunk_size)
                     if file_size > offset_bytes
@@ -558,13 +557,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 _done_count += 1
                                 data_ready.set()
 
-                                chunk_len = len(chunk_data)
+                                chunk_len = len(chunk_data) if chunk_data else 0
                                 chunk_data = None
                                 if chunk_len < chunk_size:
-                                    # Final partial chunk arrived -> File download is 100% complete!
-                                    # Mark all chunks as done so master loop exits immediately without waiting
-                                    _done_count = _total_chunks
-                                    data_ready.set()
+                                    # Final partial chunk arrived for this specific worker.
+                                    # Exit this worker cleanly; all other parallel workers continue their in-flight chunks.
                                     return
                             except asyncio.CancelledError:
                                 buffer_slots.release()
@@ -585,7 +582,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         while current < total:
                             if _write_mode:
                                 if _done_count >= _total_chunks:
-                                    await _report(offset_bytes + _done_count * chunk_size)
+                                    if _write_file is not None:
+                                        try:
+                                            _write_file.flush()
+                                            if file_size > 0:
+                                                _write_file.truncate(file_size)
+                                        except Exception:
+                                            pass
+                                    await _report(file_size)
                                     return
                                 for t in tasks:
                                     if t.done() and not t.cancelled():
@@ -593,6 +597,18 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if exc is not None:
                                             raise exc
                                 if all(t.done() for t in tasks):
+                                    if _done_count < _total_chunks and not work.empty():
+                                        raise RuntimeError(
+                                            f"Download incomplete: {_done_count}/{_total_chunks} chunks written"
+                                        )
+                                    if _write_file is not None:
+                                        try:
+                                            _write_file.flush()
+                                            if file_size > 0:
+                                                _write_file.truncate(file_size)
+                                        except Exception:
+                                            pass
+                                    await _report(file_size)
                                     return
                                 try:
                                     await asyncio.wait_for(data_ready.wait(), 0.5)
@@ -602,11 +618,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                                 if _done_count != _reported_count:
                                     _reported_count = _done_count
-                                    await _report(offset_bytes + _done_count * chunk_size)
-                                # ── Removed `yield b""` here ─────────────────────────────────
-                                # Yielding empty bytes made download_media pass 0-byte chunks
-                                # to the progress callback → speed displayed as 0/null.
-                                # A plain event-loop yield keeps concurrency alive cleanly.
+                                    await _report(min(file_size, offset_bytes + _done_count * chunk_size))
                                 await asyncio.sleep(0)
                             else:
                                 while offset_bytes not in received:
@@ -833,6 +845,14 @@ class MultiSessionMediaPool:
 
     def attach(self, client: Any) -> "MultiSessionMediaPool":
         self.client = client
+        if client is not None:
+            # Upgrade session creation gate to 12 for high-speed multi-file concurrency
+            try:
+                client._session_creation_gate = asyncio.Semaphore(12)
+                client.get_file_semaphore = asyncio.Semaphore(128)
+                client.save_file_semaphore = asyncio.Semaphore(128)
+            except Exception:
+                pass
         _patch_wzgram_turbo_mtproto_engine(self.pool_size)
         return self
 
