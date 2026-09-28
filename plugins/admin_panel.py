@@ -95,6 +95,10 @@ async def _build_safe_system_stats(bot, uid: int, ping_ms: float) -> str:
     )
 
 
+SYS_REFRESH_COOLDOWN_SEC = 5.0
+_SYS_REFRESH_LAST: dict = {}
+
+
 @Client.on_message(filters.private & filters.command(["system", "sys"]))
 async def system_info_cmd(bot, message: Message):
     uid = message.from_user.id if message.from_user else 0
@@ -110,10 +114,27 @@ async def system_info_cmd(bot, message: Message):
 
 @Client.on_callback_query(filters.regex("^refresh_system$"))
 async def refresh_system_cb(bot, query: CallbackQuery):
+    import math
+
     uid = query.from_user.id if query.from_user else 0
+    now = time.monotonic()
+    last_ts = _SYS_REFRESH_LAST.get(uid, 0.0)
+    elapsed = now - last_ts
+    if elapsed < SYS_REFRESH_COOLDOWN_SEC:
+        remaining = max(1, math.ceil(SYS_REFRESH_COOLDOWN_SEC - elapsed))
+        try:
+            await query.answer(
+                f"⏳ ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ {remaining}s ʙᴇꜰᴏʀᴇ ʀᴇꜰʀᴇsʜɪɴɢ!",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        return
+
+    _SYS_REFRESH_LAST[uid] = now
     start_t = time.perf_counter()
     try:
-        await query.answer("⚡ ʀᴇꜰʀᴇsʜɪɴɢ sʏsᴛᴇᴍ sᴛᴀᴛs...")
+        await query.answer("⚡ ʀᴇꜰʀᴇsʜɪɴɢ sʏsᴛᴇᴍ sᴛᴀᴛs...", show_alert=False)
     except Exception:
         pass
     ping_ms = (time.perf_counter() - start_t) * 1000

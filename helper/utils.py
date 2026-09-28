@@ -300,10 +300,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
             _PROGRESS_LAST_EDIT.pop(msg_key, None)
 
 
+REFRESH_COOLDOWN_SEC = 5.0
+
+
 async def refresh_progress_message(query) -> None:
     """
     Handle on-demand `refresh_progress` button clicks on the progress bar card.
-    Renders the latest smoothed transfer progress and answers the callback query.
+    Enforces a 5-second cooldown per message so rapid clicks show a lightweight
+    toast notification without triggering redundant Telegram `EditMessage` RPCs.
     """
     msg = getattr(query, "message", None)
     if msg is None:
@@ -325,6 +329,21 @@ async def refresh_progress_message(query) -> None:
     start = state.get("start", now - 1.0)
     display_speed = _compute_stable_speed(state, current_clamped, now, start)
     pct = round(current_clamped * 100.0 / total_safe, 1)
+
+    last_manual = state.get("last_manual_refresh", 0.0)
+    elapsed_manual = now - last_manual
+    if elapsed_manual < REFRESH_COOLDOWN_SEC:
+        remaining = max(1, math.ceil(REFRESH_COOLDOWN_SEC - elapsed_manual))
+        try:
+            await query.answer(
+                f"⏳ ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ {remaining}s  •  ⚡ {pct}% ({humanbytes(display_speed)}/s)",
+                show_alert=False,
+            )
+        except Exception:
+            pass
+        return
+
+    state["last_manual_refresh"] = now
 
     if not state.get("in_flight", False) and now >= state.get("cooldown_until", 0.0):
         frame_idx = state.get("frame_idx", 0)
