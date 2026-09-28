@@ -28,13 +28,35 @@ def _get_msg_key(message):
 
 def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: float) -> float:
     """
-    Compute a rock-solid, non-fluctuating transfer speed using a 5-second rolling
-    sample window combined with a damped EMA (25% new window, 75% prior EMA) and
-    overall transfer average.
+    Compute a rock-solid, non-fluctuating transfer speed using a 4-second rolling
+    sample window combined with a damped EMA and transfer average, anchoring the
+    clock on the first actual transferred chunk so pre-transfer setup (such as
+    video_cover/thumbnail upload or foreign-DC auth export) never drags speed down.
     """
-    samples = state.setdefault("samples", [(start, 0)])
+    if current_clamped <= 0:
+        return 0.0
+
+    # Anchor transfer clock when the first chunk of the main file arrives if pre-transfer
+    # setup (e.g. thumb/video_cover upload or DC auth handshake) took > 0.4s
+    effective_start = state.get("first_byte_ts")
+    if effective_start is None:
+        if (now - start) > 0.4 and current_clamped <= 2 * 1024 * 1024:
+            effective_start = now - 0.15
+        else:
+            effective_start = start
+        state["first_byte_ts"] = effective_start
+        state["samples"] = [(effective_start, 0)]
+        state["last_speed_sample_ts"] = effective_start
+
+    last_sample_ts = state.get("last_speed_sample_ts", effective_start)
+    prev_ema = state.get("ema_speed", 0.0)
+    if prev_ema > 0.0 and (now - last_sample_ts) < 0.25:
+        return prev_ema
+
+    state["last_speed_sample_ts"] = now
+    samples = state.setdefault("samples", [(effective_start, 0)])
     samples.append((now, current_clamped))
-    cutoff = now - 5.0
+    cutoff = now - 4.0
     while len(samples) > 2 and samples[1][0] <= cutoff:
         samples.pop(0)
 
@@ -43,21 +65,21 @@ def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: 
     window_bytes = max(0, current_clamped - oldest_bytes)
     window_speed = window_bytes / window_dt if window_bytes > 0 else 0.0
 
-    avg_speed = current_clamped / max(now - start, 0.001) if current_clamped > 0 else 0.0
-    base_speed = (0.70 * window_speed + 0.30 * avg_speed) if window_speed > 0 else avg_speed
+    avg_speed = current_clamped / max(now - effective_start, 0.001)
+    base_speed = (0.75 * window_speed + 0.25 * avg_speed) if window_speed > 0 else avg_speed
 
-    prev_ema = state.get("ema_speed", 0.0)
     if prev_ema <= 0.0:
         ema_speed = base_speed
     else:
-        ema_speed = (0.28 * base_speed) + (0.72 * prev_ema)
-        # Clamp per-update swing to ±18% of previous EMA so transient jitter never spikes UI
-        low_bound = prev_ema * 0.82
-        high_bound = prev_ema * 1.18
+        ema_speed = (0.35 * base_speed) + (0.65 * prev_ema)
+        # Clamp per-sample swing to ±22% of previous EMA so transient jitter never spikes UI
+        low_bound = prev_ema * 0.78
+        high_bound = prev_ema * 1.22
         ema_speed = max(low_bound, min(high_bound, ema_speed))
 
     state["ema_speed"] = ema_speed
-    return max(ema_speed, avg_speed * 0.65, 1.0)
+    return max(ema_speed, avg_speed * 0.75, 1.0)
+
 
 
 def build_progress_text(

@@ -1,4 +1,5 @@
 wzgram==3.1.1
+warpcrypto>=2.0.7
 motor
 dnspython
 hachoir
@@ -12,4 +13,5 @@ requests
 python-dotenv
 pycryptodome
 psutil
-uvloop; sys_platform != 'win32'
+uvloop
+
