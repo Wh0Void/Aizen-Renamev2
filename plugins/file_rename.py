@@ -7,6 +7,7 @@ from hachoir.parser import createParser
 from helper.ffmpeg import (
     extract_auto_thumbnail,
     get_cached_user_thumb,
+    get_hd_cover_path,
     add_metadata,
 )
 from helper.utils import (
@@ -196,8 +197,9 @@ async def doc(bot, update):
     path = None
     metadata_path = None
     ph_path = None
+    cover_path = None
 
-    # Download the file using Multi-Session Connection Pool (12 parallel TCP sockets)
+    # Download the file using Multi-Session Connection Pool (16 parallel TCP sockets)
     dl_header = "<blockquote>🚀 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
     ms, dl_start = await init_progress_message(update.message, dl_header, file_size)
     try:
@@ -234,18 +236,28 @@ async def doc(bot, update):
             logger.error(f"Metadata addition failed: {e}")
             metadata_path = None
 
-    # Extract duration (works regardless of whether user metadata is ON or OFF)
-    duration = getattr(media, "duration", 0) or 0
-    if not duration:
+    # Extract duration, width, and height (works regardless of whether user metadata is ON or OFF)
+    raw_dur = getattr(media, "duration", 0)
+    duration = int(raw_dur) if isinstance(raw_dur, (int, float)) and raw_dur > 0 else 0
+    raw_w = getattr(media, "width", 0)
+    width = int(raw_w) if isinstance(raw_w, (int, float)) and raw_w > 0 else 0
+    raw_h = getattr(media, "height", 0)
+    height = int(raw_h) if isinstance(raw_h, (int, float)) and raw_h > 0 else 0
+    if not duration or not width or not height:
         try:
             parser = createParser(path)
             if parser:
                 with parser:
                     meta_info = extractMetadata(parser)
-                    if meta_info and meta_info.has("duration"):
-                        duration = meta_info.get("duration").seconds
+                    if meta_info:
+                        if not duration and meta_info.has("duration"):
+                            duration = meta_info.get("duration").seconds
+                        if not width and meta_info.has("width"):
+                            width = int(meta_info.get("width") or 0)
+                        if not height and meta_info.has("height"):
+                            height = int(meta_info.get("height") or 0)
         except Exception as e:
-            logger.debug(f"Duration extraction skipped: {e}")
+            logger.debug(f"Media dimension/duration extraction skipped: {e}")
 
     if c_caption:
         try:
@@ -261,15 +273,18 @@ async def doc(bot, update):
     else:
         caption = f"<b>{new_filename}</b>"
 
-    # Thumbnail handling:
-    # 1. If user set a custom thumbnail (`c_thumb`), fetch from RAM cache or download once.
-    # 2. If user did NOT set a custom thumbnail (even if metadata is OFF and `media.thumbs` is None),
-    #    automatically extract a frame from the video file via FFmpeg (with fallback to `media.thumbs`).
+    # Thumbnail & HD video_cover handling (NEVER uses source media.thumbs):
+    # 1. If user saved a custom thumbnail (`c_thumb`), fetch from RAM cache or download once,
+    #    and pass `c_thumb` (or `ph_path`) as `video_cover` for HD video preview.
+    # 2. Otherwise, automatically extract a non-blank frame at ~30s via FFmpeg (`extract_auto_thumbnail`),
+    #    preserving both the 320p `thumb` (`ph_path`) and the full-resolution HD `cover_path`.
+    video_cover = None
     try:
         if c_thumb:
-            _, _, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
+            thumb_w, thumb_h, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
+            video_cover = c_thumb or ph_path
         else:
-            _, _, ph_path = await extract_auto_thumbnail(
+            thumb_w, thumb_h, ph_path = await extract_auto_thumbnail(
                 bot=bot,
                 video_path=path,
                 media=media,
@@ -279,11 +294,18 @@ async def doc(bot, update):
                 media_type=file.media,
                 upload_type=type_,
             )
+            cover_path = get_hd_cover_path(ph_path)
+            video_cover = cover_path or ph_path
+        if not width and thumb_w:
+            width = int(thumb_w)
+        if not height and thumb_h:
+            height = int(thumb_h)
     except Exception as e:
         logger.warning(f"Thumbnail processing failed: {e}")
         ph_path = None
+        video_cover = None
 
-    # Upload the file using Multi-Session Connection Pool (12 parallel TCP sockets)
+    # Upload the file using Multi-Session Connection Pool (16 parallel TCP sockets)
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
     try:
         upload_path = metadata_path if (_bool_metadata and metadata_path) else path
@@ -310,8 +332,11 @@ async def doc(bot, update):
                 video=upload_path,
                 file_name=new_filename,
                 caption=caption,
-                thumb=ph_path,
                 duration=duration,
+                width=width,
+                height=height,
+                thumb=ph_path,
+                video_cover=video_cover,
                 progress=progress_for_pyrogram,
                 progress_args=(ul_header, ms, ul_start),
             )
@@ -377,7 +402,7 @@ async def doc(bot, update):
 
     finally:
         # Remove temporary files and immediately release freed heap pages back to OS
-        ram_workspace.cleanup_files(ph_path, path, metadata_path)
+        ram_workspace.cleanup_files(ph_path, cover_path, path, metadata_path)
 
     try:
         await ms.delete()

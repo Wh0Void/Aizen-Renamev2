@@ -239,6 +239,22 @@ async def take_screen_shot(
     return None
 
 
+def get_hd_cover_path(thumb_path: Optional[str]) -> Optional[str]:
+    """
+    Return the full-resolution HD video cover JPEG path paired with `thumb_path`
+    if available on disk, falling back to `thumb_path`.
+    """
+    if not thumb_path:
+        return None
+    base, ext = os.path.splitext(thumb_path)
+    cover_candidate = f"{base}_cover{ext or '.jpg'}"
+    if os.path.exists(cover_candidate) and os.path.getsize(cover_candidate) > 0:
+        return cover_candidate
+    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        return thumb_path
+    return None
+
+
 async def extract_auto_thumbnail(
     bot,
     video_path: str,
@@ -252,10 +268,11 @@ async def extract_auto_thumbnail(
     """
     Automatically obtain a thumbnail when the user has not set a custom thumbnail
     (works completely independently of whether user metadata is ON or OFF):
-      1. Extracts a non-blank video frame via FFmpeg (`take_screen_shot`, seeking ~30s in
-         to skip black intros) if the file is a video.
-      2. Falls back to downloading `media.thumbs[0]` from Telegram if FFmpeg is
-         unavailable or the file is not a video.
+      - Extracts a non-blank video frame via FFmpeg (`take_screen_shot`, seeking ~30s in
+        to skip black intros) if the file is a video.
+      - Saves a full-resolution HD copy (`*_cover.jpg`) for `send_video(..., video_cover=...)`
+        before normalizing the 320p `thumb`, and returns the native video `(width, height, ph_path)`.
+      - Never uses the source file's embedded Telegram thumbnail (`media.thumbs`).
     """
     thumb_dir = (
         ram_workspace.shm_dir
@@ -263,29 +280,28 @@ async def extract_auto_thumbnail(
         else os.path.dirname(os.path.abspath(video_path))
     )
 
-    # 1. Extract frame directly from video file (seeking to ~30s first to avoid black start frames)
+    # Extract frame directly from video file (seeking to ~30s first to avoid black start frames)
     if video_path and os.path.exists(video_path) and is_video_file(filename, media_type, upload_type):
         preferred_ttl = 30 if (not duration or duration > 35) else max(1, int(duration * 0.4))
         shot_path = await take_screen_shot(
             video_path, thumb_dir, ttl=preferred_ttl, duration=duration or 0
         )
-        if shot_path:
+        if shot_path and os.path.exists(shot_path):
+            orig_w, orig_h = 0, 0
+            try:
+                base, ext = os.path.splitext(shot_path)
+                cover_path = f"{base}_cover{ext or '.jpg'}"
+                with Image.open(shot_path) as img:
+                    rgb_cover = img.convert("RGB")
+                    orig_w, orig_h = rgb_cover.size
+                    rgb_cover.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+                    rgb_cover.save(cover_path, "JPEG", quality=92, optimize=True)
+            except Exception:
+                pass
+
             w, h, fixed = await fix_thumb(shot_path)
             if fixed:
-                return w, h, fixed
-
-    # 2. Fallback to embedded Telegram thumbnail if present
-    thumbs = getattr(media, "thumbs", None)
-    if thumbs:
-        try:
-            raw_dest = ram_workspace.resolve_thumb_path(
-                f"tg_thumb_{user_id}_{int(time.time() * 1000)}.jpg"
-            )
-            dl_thumb = await bot.download_media(thumbs[0].file_id, file_name=raw_dest)
-            if dl_thumb:
-                return await fix_thumb(dl_thumb)
-        except Exception:
-            pass
+                return (orig_w or w), (orig_h or h), fixed
 
     return 0, 0, None
 

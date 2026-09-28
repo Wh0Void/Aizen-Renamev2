@@ -56,7 +56,7 @@ class Bot(Client):
             "api_hash": Config.API_HASH,
             "bot_token": Config.BOT_TOKEN,
             "in_memory": True,
-            "workers": 160,
+            "workers": 100,
             "max_concurrent_transmissions": Config.MEDIA_POOL_SIZE,
             "plugins": {"root": "plugins"},
             "sleep_threshold": 15,

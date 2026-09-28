@@ -208,8 +208,8 @@ class SmartRAMWorkspace:
         self,
         disk_dir: str = "downloads",
         shm_root: str = "/dev/shm/rename_bot_cache",
-        max_ram_file_mb: int = int(os.environ.get("RAM_CACHE_MAX_MB", "40")),
-        min_free_ram_mb: int = 160,
+        max_ram_file_mb: int = int(os.environ.get("RAM_CACHE_MAX_MB", "128")),
+        min_free_ram_mb: int = 140,
     ) -> None:
         self.disk_dir = os.path.abspath(disk_dir)
         self.shm_dir = shm_root

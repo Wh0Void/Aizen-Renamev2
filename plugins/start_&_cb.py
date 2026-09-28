@@ -7,6 +7,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 from helper.database import Mythicbotz
+from helper.utils import refresh_progress_message
 from config import Config, Txt
 
 
@@ -107,7 +108,7 @@ async def help_cmd(client: Client, message: Message):
 
 @Client.on_callback_query(
     filters.regex(
-        r"^(start|help|meta|prefix|suffix|caption|thumbnail|about|donate|leaderboard|close|sendAlert_|noAlert_|sendUnbanAlert_|NoUnbanAlert_)"
+        r"^(start|help|meta|prefix|suffix|caption|thumbnail|about|donate|leaderboard|refresh_progress|close|sendAlert_|noAlert_|sendUnbanAlert_|NoUnbanAlert_)"
     )
 )
 async def cb_handler(client: Client, query: CallbackQuery):
@@ -263,6 +264,9 @@ async def cb_handler(client: Client, query: CallbackQuery):
                 ]
             ),
         )
+
+    elif data == "refresh_progress":
+        await refresh_progress_message(query)
 
     elif data == "close":
         try:

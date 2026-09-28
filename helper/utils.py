@@ -10,7 +10,12 @@ _PROGRESS_LAST_EDIT = {}
 _PROGRESS_STATE = {}
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _CANCEL_MARKUP = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("✖️ ᴄᴀɴᴄᴇʟ", callback_data="close")]]
+    [
+        [
+            InlineKeyboardButton("🔄 ʀᴇꜰʀᴇsʜ", callback_data="refresh_progress"),
+            InlineKeyboardButton("✖️ ᴄʟᴏsᴇ", callback_data="close"),
+        ]
+    ]
 )
 
 
@@ -19,6 +24,40 @@ def _get_msg_key(message):
         getattr(getattr(message, "chat", None), "id", 0),
         getattr(message, "id", id(message)),
     )
+
+
+def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: float) -> float:
+    """
+    Compute a rock-solid, non-fluctuating transfer speed using a 5-second rolling
+    sample window combined with a damped EMA (25% new window, 75% prior EMA) and
+    overall transfer average.
+    """
+    samples = state.setdefault("samples", [(start, 0)])
+    samples.append((now, current_clamped))
+    cutoff = now - 5.0
+    while len(samples) > 2 and samples[1][0] <= cutoff:
+        samples.pop(0)
+
+    oldest_ts, oldest_bytes = samples[0]
+    window_dt = max(now - oldest_ts, 0.001)
+    window_bytes = max(0, current_clamped - oldest_bytes)
+    window_speed = window_bytes / window_dt if window_bytes > 0 else 0.0
+
+    avg_speed = current_clamped / max(now - start, 0.001) if current_clamped > 0 else 0.0
+    base_speed = (0.70 * window_speed + 0.30 * avg_speed) if window_speed > 0 else avg_speed
+
+    prev_ema = state.get("ema_speed", 0.0)
+    if prev_ema <= 0.0:
+        ema_speed = base_speed
+    else:
+        ema_speed = (0.28 * base_speed) + (0.72 * prev_ema)
+        # Clamp per-update swing to ±18% of previous EMA so transient jitter never spikes UI
+        low_bound = prev_ema * 0.82
+        high_bound = prev_ema * 1.18
+        ema_speed = max(low_bound, min(high_bound, ema_speed))
+
+    state["ema_speed"] = ema_speed
+    return max(ema_speed, avg_speed * 0.65, 1.0)
 
 
 def build_progress_text(
@@ -66,7 +105,8 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
     seed `_PROGRESS_STATE` so chunk #1 doesn't trigger a back-to-back duplicate edit.
     """
     now = time.time()
-    text = build_progress_text(0, total, ud_type, now, frame_idx=0, speed_override=0.0)
+    total_safe = max(int(total or 0), 1)
+    text = build_progress_text(0, total_safe, ud_type, now, frame_idx=0, speed_override=0.0)
     target = edit_target or message
     edited_msg = target
     try:
@@ -82,6 +122,11 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
             "synced_legacy_last": ts,
             "last_pct": 0.0,
             "last_bytes": 0,
+            "latest_bytes": 0,
+            "latest_total": total_safe,
+            "ud_type": ud_type,
+            "start": now,
+            "samples": [(now, 0)],
             "last_sample_time": ts,
             "ema_speed": 0.0,
             "frame_idx": 1,
@@ -102,6 +147,11 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
         "synced_legacy_last": edit_done,
         "last_pct": 0.0,
         "last_bytes": 0,
+        "latest_bytes": 0,
+        "latest_total": total_safe,
+        "ud_type": ud_type,
+        "start": now,
+        "samples": [(now, 0)],
         "last_sample_time": edit_done,
         "ema_speed": 0.0,
         "frame_idx": 1,
@@ -117,6 +167,8 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
 async def progress_for_pyrogram(current, total, ud_type, message, start):
     now = time.time()
     msg_key = _get_msg_key(message)
+    total_safe = max(int(total or 0), 1)
+    current_clamped = max(0, min(int(current or 0), total_safe))
 
     state = _PROGRESS_STATE.get(msg_key)
     legacy_last = _PROGRESS_LAST_EDIT.get(msg_key)
@@ -127,6 +179,11 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
             "synced_legacy_last": init_last,
             "last_pct": 0.0,
             "last_bytes": 0,
+            "latest_bytes": current_clamped,
+            "latest_total": total_safe,
+            "ud_type": ud_type,
+            "start": start,
+            "samples": [(start, 0)],
             "last_sample_time": start,
             "ema_speed": 0.0,
             "frame_idx": 0,
@@ -141,6 +198,13 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
         state["last_edit"] = legacy_last
         state["synced_legacy_last"] = legacy_last
 
+    # Always keep live transfer snapshot up-to-date for manual Refresh button clicks
+    state["latest_bytes"] = current_clamped
+    state["latest_total"] = total_safe
+    state["ud_type"] = ud_type
+    state["start"] = start
+    display_speed = _compute_stable_speed(state, current_clamped, now, start)
+
     # Never overlap concurrent Telegram EditMessage RPCs on the same message
     if state.get("in_flight", False):
         return
@@ -149,8 +213,6 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     if now < state.get("cooldown_until", 0.0):
         return
 
-    total_safe = max(int(total or 0), 1)
-    current_clamped = max(0, min(int(current or 0), total_safe))
     percentage = current_clamped * 100.0 / total_safe
 
     elapsed_since_edit = now - state.get("last_edit", 0.0)
@@ -165,18 +227,6 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     )
     if not should_edit:
         return
-
-    # Compute smooth EMA transfer speed (blending instantaneous window and overall average)
-    sample_dt = max(now - state.get("last_sample_time", start), 0.001)
-    delta_bytes = max(0, current_clamped - state.get("last_bytes", 0))
-    inst_speed = delta_bytes / sample_dt if delta_bytes > 0 else 0.0
-    avg_speed = current_clamped / max(now - start, 0.001)
-    prev_ema = state.get("ema_speed", 0.0)
-    if prev_ema <= 0.0:
-        ema_speed = inst_speed if inst_speed > 0 else avg_speed
-    else:
-        ema_speed = (0.65 * inst_speed) + (0.35 * prev_ema)
-    display_speed = max(ema_speed, avg_speed * 0.5, 1.0)
 
     frame_idx = state.get("frame_idx", 0)
     text = build_progress_text(
@@ -197,7 +247,6 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     state["last_pct"] = percentage
     state["last_bytes"] = current_clamped
     state["last_sample_time"] = now
-    state["ema_speed"] = ema_speed
     state["frame_idx"] = frame_idx + 1
     _PROGRESS_LAST_EDIT[msg_key] = now
 
@@ -227,6 +276,72 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
         state["in_flight"] = False
         if is_complete:
             _PROGRESS_LAST_EDIT.pop(msg_key, None)
+
+
+async def refresh_progress_message(query) -> None:
+    """
+    Handle on-demand `refresh_progress` button clicks on the progress bar card.
+    Renders the latest smoothed transfer progress and answers the callback query.
+    """
+    msg = getattr(query, "message", None)
+    if msg is None:
+        return
+    msg_key = _get_msg_key(msg)
+    state = _PROGRESS_STATE.get(msg_key)
+    now = time.time()
+
+    if state is None:
+        try:
+            await query.answer("⚡ ᴛʀᴀɴsꜰᴇʀ ɪs ɪɴɪᴛɪᴀʟɪᴢɪɴɢ...", show_alert=False)
+        except Exception:
+            pass
+        return
+
+    current_clamped = state.get("latest_bytes", state.get("last_bytes", 0))
+    total_safe = max(int(state.get("latest_total", 1) or 1), 1)
+    ud_type = state.get("ud_type", "<blockquote>🚀 <b>ᴘʀᴏᴄᴇssɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>")
+    start = state.get("start", now - 1.0)
+    display_speed = _compute_stable_speed(state, current_clamped, now, start)
+    pct = round(current_clamped * 100.0 / total_safe, 1)
+
+    if not state.get("in_flight", False) and now >= state.get("cooldown_until", 0.0):
+        frame_idx = state.get("frame_idx", 0)
+        text = build_progress_text(
+            current_clamped,
+            total_safe,
+            ud_type,
+            start,
+            frame_idx=frame_idx,
+            speed_override=display_speed,
+        )
+        state["frame_idx"] = frame_idx + 1
+        if text != state.get("last_text"):
+            state["in_flight"] = True
+            try:
+                await msg.edit(text=text, reply_markup=_CANCEL_MARKUP)
+                finish_now = time.time()
+                state["last_edit"] = finish_now
+                state["synced_legacy_last"] = finish_now
+                state["last_text"] = text
+                _PROGRESS_LAST_EDIT[msg_key] = finish_now
+            except MessageNotModified:
+                state["last_text"] = text
+            except FloodWait as e:
+                wait_s = float(getattr(e, "value", getattr(e, "x", 3)) or 3)
+                state["cooldown_until"] = time.time() + wait_s + 0.5
+            except Exception:
+                pass
+            finally:
+                state["in_flight"] = False
+
+    try:
+        await query.answer(
+            f"⚡ {pct}%  •  {humanbytes(display_speed)}/s",
+            show_alert=False,
+        )
+    except Exception:
+        pass
+
 
 
 def humanbytes(size):    
