@@ -1,3 +1,34 @@
+"""
+High-Speed Telegram Transfer Engine & Multi-Session Connection Pool.
+
+Why Telegram Upload/Download Speed was Capped at ~3-5 MB/s & The Fix:
+---------------------------------------------------------------------
+1. The Root Cause:
+   Telegram's MTProto Data Centers enforce a per-connection bandwidth ceiling
+   (~3 to 5 MB/s per TCP socket). Routing all chunk uploads or downloads through
+   a single Session object caps throughput at a single TCP socket.
+
+2. Why `Connection closed by the server` Happened in Default Wzgram v3.1.1:
+   - In `pyrogram/session/session.py`, `Session.send()` allocated `msg_id` and
+     `seq_no` via `self.msg_factory()` BEFORE awaiting `run_in_executor` to
+     encrypt 512 KB chunks. Whenever `ping_worker` (`PingDelayDisconnect`) or
+     `MsgsAck` (`<= 32 KB`) ran on the inline fast-path—or two workers shared
+     one Session—packets arrived at `connection.send()` out of `msg_id`/`seq_no`
+     order, causing Telegram's MTProto server to immediately drop the socket!
+   - Additionally, `get_dc_option(is_media=True)` selected a `media_only` DC IP
+     while reusing the main production DC's `auth_key` without export.
+
+3. The Solution (`bot/core/fast_crypto.py`):
+   - Atomic Per-Session Send Lock (`_patch_wzgram_mtproto_stability`):
+     Guarantees `msg_id`/`seq_no` allocation, `warpcrypto` AES-NI encryption,
+     and TCP socket write execute in strict monotonic order on every Session,
+     while keeping response awaiting 100% concurrent across all sockets.
+   - Prod DC Endpoint Alignment: Ensures pooled media sessions connect to the
+     authorized production DC endpoint matching `auth_key`.
+   - Multi-Session Connection Pool (6 to 8 parallel `Session(..., is_media=True)`
+     TCP streams) distributing 512 KB chunks with hardware AES-NI (`warpcrypto`).
+"""
+
 import asyncio
 import ctypes
 import gc
@@ -201,7 +232,25 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
         tcp_mod.TCP.close = _safe_tcp_close
         tcp_mod.TCP.recv = _safe_tcp_recv
 
-        # 3. Patch Session.send with per-session atomic ordering lock and fast-fail transport check
+        # 3. Patch Session.send with per-session atomic ordering lock and automatic restart recovery
+        def _mark_disconnected_and_schedule_restart(sess: Any) -> None:
+            if getattr(sess, "_stopping", False):
+                return
+            is_started = getattr(sess, "is_started", None)
+            if is_started is not None and hasattr(is_started, "clear"):
+                is_started.clear()
+            if (
+                not getattr(sess, "_start_active", False)
+                and not getattr(sess, "_teardown_started", False)
+                and not getattr(sess, "is_restarting", False)
+                and hasattr(sess, "_safe_restart")
+            ):
+                try:
+                    loop = getattr(sess, "loop", None) or asyncio.get_running_loop()
+                    loop.create_task(sess._safe_restart())
+                except Exception:
+                    pass
+
         async def _atomic_ordered_send(
             self: Session,
             data: Any,
@@ -215,6 +264,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 or self.connection is None
                 or self.connection.protocol is None
             ):
+                _mark_disconnected_and_schedule_restart(self)
                 raise ConnectionResetError("Connection is not established")
 
             send_lock = getattr(self, "_atomic_send_lock", None)
@@ -238,6 +288,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 ):
                     if protocol is not None:
                         protocol.is_connected = False
+                    _mark_disconnected_and_schedule_restart(self)
                     raise ConnectionResetError("Connection is not established")
 
                 message = self.msg_factory(data, len(serialized))
@@ -277,15 +328,10 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             timeout=timeout or self.WAIT_TIMEOUT,
                         )
                     except asyncio.TimeoutError:
+                        _mark_disconnected_and_schedule_restart(self)
                         raise TimeoutError("Request send timed out")
                     except (OSError, RuntimeError) as send_err:
-                        if (
-                            self.is_started.is_set()
-                            and not getattr(self, "_stopping", False)
-                            and not getattr(self, "_teardown_started", False)
-                            and not getattr(self, "is_restarting", False)
-                        ):
-                            self.loop.create_task(self._safe_restart())
+                        _mark_disconnected_and_schedule_restart(self)
                         if isinstance(send_err, ConnectionResetError):
                             raise
                         raise ConnectionResetError(str(send_err)) from send_err
@@ -338,8 +384,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
         Session.send = _atomic_ordered_send
 
-        # 4. Patch Client.get_dc_option so media sessions on the primary DC use the
-        # production DC IP (`not dc.media_only`) that shares the bot's `auth_key`
+        # 4. Patch Client.get_dc_option so media sessions on ALL non-CDN DCs (both home DC
+        #    and foreign DCs) connect to the production DC endpoint (`not dc.media_only`)
+        #    where `Client.get_session(dc_id)` created/imported the DC's `auth_key`
         _orig_get_dc_option = Client.get_dc_option
 
         async def _aligned_get_dc_option(
@@ -350,11 +397,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             ipv6: bool = False,
         ) -> Any:
             if is_media and not is_cdn:
-                home_dc = await self.storage.dc_id()
-                if dc_id is None or dc_id == home_dc:
-                    return await _orig_get_dc_option(
-                        self, dc_id=dc_id, is_media=False, is_cdn=False, ipv6=ipv6
-                    )
+                return await _orig_get_dc_option(
+                    self, dc_id=dc_id, is_media=False, is_cdn=False, ipv6=ipv6
+                )
             return await _orig_get_dc_option(
                 self, dc_id=dc_id, is_media=is_media, is_cdn=is_cdn, ipv6=ipv6
             )
@@ -362,7 +407,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
         Client.get_dc_option = _aligned_get_dc_option
 
         # 5. Patch SaveFile.save_file to remove Wzgram's hardcoded 20 MB/s bot sleep (`rate_limit = 40`)
-        #    and scale to 12 parallel TCP media sessions with non-blocking progress updates
+        #    and scale to 12 parallel TCP media sessions with cross-session failover & non-blocking progress
         async def _turbo_save_file(
             self: Client,
             path: Any,
@@ -375,23 +420,24 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 if path is None:
                     return None
 
-                async def worker(session: Any) -> None:
+                async def worker(worker_idx: int) -> None:
                     while True:
                         data = await queue.get()
                         if data is None:
                             return
                         try:
-                            await _send_part(session, data)
+                            await _send_part(worker_idx, data)
                             _acked[0] += 1
                             _schedule_progress(_acked[0])
                         finally:
                             data = None
                             budget.release()
 
-                async def _send_part(session: Any, data: Any) -> None:
+                async def _send_part(worker_idx: int, data: Any) -> None:
                     for attempt in range(save_file_mod.MAX_RETRIES):
+                        target_session = pool[(worker_idx + attempt) % len(pool)]
                         try:
-                            await session.invoke(
+                            await target_session.invoke(
                                 data, timeout=Session.MEDIA_WAIT_TIMEOUT
                             )
                             break
@@ -404,7 +450,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     save_file_mod.MAX_RETRIES,
                                 )
                                 raise
-                            delay = min(2 ** attempt, 15)
+                            delay = min(0.5 * (2 ** min(attempt, 4)), 10.0)
                             err_str = str(e)
                             if "FLOOD" in err_str:
                                 for part in err_str.split():
@@ -463,6 +509,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
 
                 dc_id = await self.storage.dc_id()
                 pool = await self._get_media_session_pool(dc_id, desired_pool)
+                if not pool:
+                    pool = [await self.get_session(dc_id, is_media=True)]
 
                 _acked = [0]
                 _progress_task: List[Optional[asyncio.Task]] = [None]
@@ -473,7 +521,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
                 budget = ReadAhead(self.read_ahead_slots)
                 workers = [
-                    self.loop.create_task(worker(pool[i % len(pool)]))
+                    self.loop.create_task(worker(i))
                     for i in range(n_workers)
                 ]
                 next_batch_task: Optional[asyncio.Task] = None
@@ -724,6 +772,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         _progress_task[0] = self.loop.create_task(_report(sent))
 
                 dc_id = file_id.dc_id
+                pool_task: Optional[asyncio.Future] = None
 
                 try:
                     # Turbo multi-session download parameters (12 sockets, 4 workers/socket = 48 workers, 240 MiB/s ceiling)
@@ -736,13 +785,20 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                     pool_size_needed = max(1, min(dl_pool_size, total_chunks))
                     total_workers = max(1, min(dl_pool_size * dl_workers_per_session, total_chunks))
                     needs_pool = min(total, total_chunks) > 1
+
+                    # Obtain primary media session first so foreign-DC auth export finishes cleanly
+                    session = await self.get_session(dc_id, is_media=True)
+                    if not session.is_started.is_set() or getattr(session, "connection", None) is None:
+                        try:
+                            await session.restart()
+                        except Exception:
+                            pass
+
                     if needs_pool:
                         pool_task = asyncio.ensure_future(
                             self._get_media_session_pool(dc_id, pool_size_needed)
                         )
                         pool_task.add_done_callback(lambda t: t.cancelled() or t.exception())
-
-                    session = await self.get_session(dc_id, is_media=True)
 
                     r = await session.invoke(
                         raw.functions.upload.GetFile(
@@ -760,7 +816,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         yield first_chunk
                         current += 1
                         offset_bytes += chunk_size
-                        if _write_file is not None:
+                        if _write_file is not None and not getattr(_write_file, "closed", False):
                             _write_file.seek(0)
                             _write_file.write(first_chunk)
 
@@ -770,6 +826,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         _schedule_progress(offset_bytes)
 
                         if not first_len or first_len < chunk_size or current >= total:
+                            if pool_task is not None and not pool_task.done():
+                                pool_task.cancel()
                             if _progress_task[0] is not None and not _progress_task[0].done():
                                 try:
                                     await _progress_task[0]
@@ -779,6 +837,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                             return
 
                         if file_size <= 0:
+                            if pool_task is not None and not pool_task.done():
+                                pool_task.cancel()
                             while current < total:
                                 if _stop_requested[0]:
                                     raise pyrogram.StopTransmission
@@ -795,7 +855,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                 if not chunk:
                                     return
                                 yield chunk
-                                if _write_file is not None:
+                                if _write_file is not None and not getattr(_write_file, "closed", False):
                                     _write_file.write(chunk)
                                 current += 1
                                 offset_bytes += chunk_size
@@ -810,8 +870,11 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
                         pool_size_needed = max(1, min(dl_pool_size, total_chunks))
                         total_workers = max(1, min(dl_pool_size * dl_workers_per_session, total_chunks))
-                        if needs_pool:
-                            pool = await pool_task
+                        if needs_pool and pool_task is not None:
+                            try:
+                                pool = await pool_task
+                            except Exception:
+                                pool = [session]
                         else:
                             pool = [session]
                         if not pool:
@@ -830,16 +893,19 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         data_ready = asyncio.Event()
                         buffer_slots = ReadAhead(self.read_ahead_slots)
                         received: Dict[int, bytes] = {}
-                        _write_fd = _write_file.fileno() if _write_mode else -1
                         _done_count = 0
                         _total_chunks = chunks_needed
+                        _max_chunk_attempts = max(4, min(n_sessions + 1, 6))
 
-                        async def _worker(worker_session: Any) -> None:
+                        async def _worker(worker_idx: int) -> None:
                             nonlocal _done_count
                             while True:
                                 if _stop_requested[0]:
                                     return
                                 await buffer_slots.acquire()
+                                if _stop_requested[0]:
+                                    buffer_slots.release()
+                                    return
 
                                 try:
                                     chunk_offset = work.get_nowait()
@@ -847,25 +913,60 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     buffer_slots.release()
                                     return
 
-                                try:
-                                    r_part = await worker_session.invoke(
-                                        raw.functions.upload.GetFile(
-                                            location=location,
-                                            offset=chunk_offset,
-                                            limit=chunk_size,
-                                        ),
-                                        timeout=Session.MEDIA_WAIT_TIMEOUT,
-                                        sleep_threshold=30,
+                                r_part = None
+                                last_err: Optional[BaseException] = None
+                                for attempt in range(_max_chunk_attempts):
+                                    if _stop_requested[0]:
+                                        buffer_slots.release()
+                                        return
+                                    active_sess = (
+                                        pool[(worker_idx + attempt) % len(pool)]
+                                        if attempt < _max_chunk_attempts - 1
+                                        else session
                                     )
-                                except BaseException:
+                                    try:
+                                        r_part = await active_sess.invoke(
+                                            raw.functions.upload.GetFile(
+                                                location=location,
+                                                offset=chunk_offset,
+                                                limit=chunk_size,
+                                            ),
+                                            timeout=Session.MEDIA_WAIT_TIMEOUT,
+                                            sleep_threshold=30,
+                                        )
+                                        last_err = None
+                                        break
+                                    except (asyncio.CancelledError, pyrogram.StopTransmission):
+                                        buffer_slots.release()
+                                        raise
+                                    except Exception as exc:
+                                        last_err = exc
+                                        if attempt + 1 < _max_chunk_attempts:
+                                            await asyncio.sleep(0.15 * (attempt + 1))
+
+                                if last_err is not None or r_part is None:
                                     buffer_slots.release()
-                                    raise
+                                    if last_err is not None:
+                                        raise last_err
+                                    raise ConnectionResetError("Connection is not established")
+
+                                if _stop_requested[0]:
+                                    buffer_slots.release()
+                                    return
 
                                 chunk_data = r_part.bytes
                                 r_part = None
 
                                 if _write_mode:
-                                    write_at(_write_fd, chunk_data, chunk_offset)
+                                    if (
+                                        _stop_requested[0]
+                                        or _write_file is None
+                                        or getattr(_write_file, "closed", False)
+                                    ):
+                                        buffer_slots.release()
+                                        return
+                                    _write_file.seek(chunk_offset)
+                                    _write_file.write(chunk_data)
                                     buffer_slots.release()
                                 else:
                                     received[chunk_offset] = chunk_data
@@ -880,7 +981,7 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     return
 
                         tasks = [
-                            asyncio.ensure_future(_worker(pool[i % n_sessions]))
+                            asyncio.ensure_future(_worker(i))
                             for i in range(total_workers)
                         ]
 
@@ -946,12 +1047,15 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                         await _report(offset_bytes)
                                         return
                         finally:
+                            _stop_requested[0] = True
                             if _progress_task[0] is not None and not _progress_task[0].done():
                                 _progress_task[0].cancel()
                             for t in tasks:
                                 if not t.done():
                                     t.cancel()
                             buffer_slots.release_all()
+                            if tasks:
+                                await asyncio.gather(*tasks, return_exceptions=True)
 
                     elif isinstance(r, raw.types.upload.FileCdnRedirect):
                         cdn_session = await self.get_session(
@@ -1038,6 +1142,8 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                                     _t.cancel()
                             await cdn_session.stop()
                 except Exception:
+                    if pool_task is not None and not pool_task.done():
+                        pool_task.cancel()
                     raise
 
         Client.get_file = _turbo_get_file
@@ -1185,7 +1291,7 @@ class MultiSessionMediaPool:
     """
     Multi-Session Connection Pool for Telegram Media Data Centers.
 
-    - Spawns and manages 6 to 8 dedicated TCP media sessions
+    - Spawns and manages 8 to 16 dedicated TCP media sessions
       (`Session(..., is_media=True)`) per active Media DC.
     - Distributes 512 KB chunks across all parallel TCP streams using
       least-in-flight / round-robin scheduling.
@@ -1222,7 +1328,7 @@ class MultiSessionMediaPool:
         """
         Attach the Multi-Session Connection Pool to a `wzgram.Client` instance,
         applying MTProto stability patches and wrapping `_get_media_session_pool`
-        to maintain 6-8 parallel TCP media sessions.
+        to maintain staggered, resilient parallel TCP media sessions.
         """
         self.client = client
         _patch_wzgram_mtproto_stability(self.pool_size)
@@ -1243,8 +1349,6 @@ class MultiSessionMediaPool:
         ):
             client._media_session_last_used = {}
 
-        orig_get_pool = getattr(client, "_get_media_session_pool", None)
-
         async def _enhanced_get_media_session_pool(
             dc_id: int, requested_size: Optional[int] = None
         ) -> List[Any]:
@@ -1252,10 +1356,7 @@ class MultiSessionMediaPool:
                 self.pool_size,
                 min(MAX_MEDIA_POOL_SIZE, int(requested_size or self.pool_size)),
             )
-            if callable(orig_get_pool):
-                pool = await orig_get_pool(dc_id, target_size)
-            else:
-                pool = await self.get_or_create_pool(dc_id, target_size)
+            pool = await self.get_or_create_pool(dc_id, target_size)
 
             now = time.monotonic()
             for sess in pool:
@@ -1340,12 +1441,25 @@ class MultiSessionMediaPool:
             logger.debug("Media pool warm-up skipped: %s", exc)
             return 0
 
+    @staticmethod
+    def _is_session_healthy(sess: Any) -> bool:
+        """Return True if a media session is started and has an open connection."""
+        is_started = getattr(sess, "is_started", None)
+        if is_started is not None and hasattr(is_started, "is_set"):
+            if not is_started.is_set():
+                return False
+            conn = getattr(sess, "connection", None)
+            if conn is None:
+                return False
+        return True
+
     async def get_or_create_pool(
         self, dc_id: int, pool_size: Optional[int] = None
     ) -> List[Any]:
         """
-        Spawn or retrieve 8 to 16 dedicated TCP media sessions (`Session(..., is_media=True)`)
-        connected simultaneously to the specified Telegram Media DC.
+        Spawn or retrieve up to 12 dedicated TCP media sessions (`Session(..., is_media=True)`)
+        connected simultaneously to the specified Telegram Media DC using staggered
+        batches of 3 so neither cloud NAT nor Telegram DC drops the burst.
         """
         if self.client is None:
             raise RuntimeError("MultiSessionMediaPool is not attached to a Client instance.")
@@ -1359,21 +1473,45 @@ class MultiSessionMediaPool:
         async with lock:
             existing = self.client.media_session_pools.get(dc_id)
             if existing is None:
-                pool: List[Any] = []
-                self.client.media_session_pools[dc_id] = pool
+                raw_pool: List[Any] = []
             elif not isinstance(existing, list):
-                pool = [existing]
-                self.client.media_session_pools[dc_id] = pool
+                raw_pool = [existing]
             else:
-                pool = existing
+                raw_pool = list(existing)
+
+            # Evict any dead/disconnected sessions so workers never get handed a closed socket
+            pool: List[Any] = []
+            for sess in raw_pool:
+                if self._is_session_healthy(sess):
+                    pool.append(sess)
+                else:
+                    if hasattr(sess, "stop") and callable(sess.stop):
+                        try:
+                            asyncio.ensure_future(sess.stop())
+                        except Exception:
+                            pass
+            self.client.media_session_pools[dc_id] = pool
 
             deficit = target_size - len(pool)
             if deficit <= 0:
                 return pool
 
             media = await self.client.get_session(dc_id, is_media=True)
+            if not self._is_session_healthy(media) and hasattr(media, "restart"):
+                try:
+                    await media.restart()
+                except Exception:
+                    pass
+
+            if not pool and media is not None:
+                now = time.monotonic()
+                media.last_used = now
+                pool.append(media)
+                deficit = target_size - len(pool)
+
+            # Staggered batch creation (3 sockets per batch with 50ms spacing)
             while deficit > 0:
-                batch = min(deficit, 6)
+                batch = min(deficit, 3)
                 created = await asyncio.gather(
                     *(
                         self.client._make_media_session(
@@ -1384,11 +1522,21 @@ class MultiSessionMediaPool:
                     return_exceptions=True,
                 )
                 now = time.monotonic()
+                batch_added = 0
                 for item in created:
-                    if not isinstance(item, BaseException):
+                    if not isinstance(item, BaseException) and item is not None:
                         item.last_used = now
                         pool.append(item)
+                        batch_added += 1
                 deficit -= batch
+                if batch_added == 0:
+                    # Avoid hammering the DC if additional socket handshakes are being throttled
+                    break
+                if deficit > 0:
+                    await asyncio.sleep(0.05)
+
+            if not pool and media is not None:
+                pool.append(media)
 
             return pool
 
