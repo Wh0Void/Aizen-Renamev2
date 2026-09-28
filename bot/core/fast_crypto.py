@@ -56,14 +56,10 @@ _MTPROTO_PATCHED: bool = False
 
 class AdaptiveConcurrency:
     """
-    Dynamically controls the number of active transfer workers based on
-    Telegram FloodWait feedback.  Starts conservative, scales up when
-    transfers are clean, backs off immediately on FloodWait.
-
-    - Starts with ``initial`` active worker slots
-    - Every ``scale_interval`` seconds without a FloodWait hit, opens
-      ``scale_step`` additional slots (up to ``max_workers``)
-    - On any FloodWait, halves the active limit (never below ``min_workers``)
+    High-speed worker concurrency controller for Koyeb & Render.
+    Maintains a high worker baseline (24-32 active workers) for 30+ MB/s throughput.
+    Does NOT halve global workers on FloodWait — per-session cooldown handles
+    individual rate limits cleanly while remaining workers stream at full speed.
     """
 
     __slots__ = (
@@ -74,11 +70,11 @@ class AdaptiveConcurrency:
 
     def __init__(
         self,
-        initial: int = 8,
-        min_workers: int = 4,
-        max_workers: int = 48,
+        initial: int = 24,
+        min_workers: int = 20,
+        max_workers: int = 36,
         scale_interval: float = 2.0,
-        scale_step: int = 4,
+        scale_step: int = 2,
     ):
         self.active_limit = initial
         self.min_workers = min_workers
@@ -100,15 +96,13 @@ class AdaptiveConcurrency:
         self._semaphore.release()
 
     async def on_flood_wait(self, wait_seconds: float) -> None:
-        """Called when a worker hits FloodWait.  Halves the active limit."""
+        """Called when a worker hits FloodWait. Gently trims by 1 if well above floor."""
         async with self._lock:
             self._flood_count += 1
             self._last_flood = time.monotonic()
-            new_limit = max(self.min_workers, self.active_limit // 2)
-            if new_limit < self.active_limit:
-                self.active_limit = new_limit
-                # Reset scale-up timer so we don't immediately scale back up
-                self._last_scale_up = time.monotonic()
+            if self.active_limit > self.min_workers + 2:
+                self.active_limit -= 1  # Gentle trim, never halve global workers
+            self._last_scale_up = time.monotonic()
 
     async def try_scale_up(self) -> None:
         """Called periodically; opens more worker slots if no recent FloodWait."""
@@ -767,14 +761,14 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                 _progress_task: List[Optional[asyncio.Task]] = [None]
                 _stop_requested = [False]
 
-                # Adaptive concurrency: start with 8 upload workers, scale up to pool*3
-                n_workers = max(1, min(len(pool) * 3, file_total_parts))
+                # High-speed adaptive concurrency: start with 24 upload workers, min 20
+                n_workers = max(1, min(len(pool) * 2, file_total_parts))
                 _up_adaptive = AdaptiveConcurrency(
-                    initial=min(8, n_workers),
-                    min_workers=4,
+                    initial=min(24, n_workers),
+                    min_workers=min(20, n_workers),
                     max_workers=n_workers,
                     scale_interval=2.0,
-                    scale_step=4,
+                    scale_step=2,
                 )
                 queue: asyncio.Queue = asyncio.Queue(n_workers * 2)
                 budget = ReadAhead(self.read_ahead_slots)
@@ -1207,13 +1201,13 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
                         _max_chunk_attempts = max(6, min(n_sessions + 2, 10))
                         _dl_session_cooldown: Dict[int, float] = {}
 
-                        # Adaptive concurrency: start with 8 download workers, scale up
+                        # High-speed adaptive concurrency: start with 24 download workers, min 20
                         _dl_adaptive = AdaptiveConcurrency(
-                            initial=min(8, total_workers),
-                            min_workers=4,
+                            initial=min(24, total_workers),
+                            min_workers=min(20, total_workers),
                             max_workers=total_workers,
                             scale_interval=2.0,
-                            scale_step=4,
+                            scale_step=2,
                         )
 
                         def _pick_dl_session(worker_idx: int, attempt: int) -> Any:
