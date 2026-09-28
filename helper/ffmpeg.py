@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import random
+import re
 import shutil
 import time
 from typing import Any, Optional, Tuple
@@ -41,6 +43,117 @@ def is_video_file(
         if ext in VIDEO_EXTENSIONS:
             return True
     return False
+
+
+async def probe_video_dimensions_and_duration(
+    video_path: Optional[str],
+) -> Tuple[int, int, int]:
+    """
+    Probe the actual video stream `width`, `height`, and `duration` (in seconds)
+    directly from `video_path` using `ffprobe` (with `ffmpeg -i` stderr fallback).
+    Accounts for 90°/270° display rotation metadata so Telegram's video player
+    always receives true dimensions and displays the landscape/portrait rotate button.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return 0, 0, 0
+
+    width, height, duration = 0, 0, 0
+
+    if shutil.which("ffprobe"):
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration:stream_tags=rotate:side_data=rotation:format=duration",
+            "-of",
+            "json",
+            video_path,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            if stdout:
+                data = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+                streams = data.get("streams") or []
+                if streams:
+                    s0 = streams[0]
+                    width = int(s0.get("width") or 0)
+                    height = int(s0.get("height") or 0)
+                    s_dur = s0.get("duration")
+                    if s_dur is not None:
+                        try:
+                            duration = max(0, int(float(s_dur)))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Check rotation metadata (90° or 270° swaps display width & height)
+                    rot = 0
+                    tags = s0.get("tags") or {}
+                    if "rotate" in tags:
+                        try:
+                            rot = abs(int(float(tags["rotate"]))) % 360
+                        except (ValueError, TypeError):
+                            pass
+                    if not rot:
+                        for sd in s0.get("side_data_list") or []:
+                            if "rotation" in sd:
+                                try:
+                                    rot = abs(int(float(sd["rotation"]))) % 360
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    if rot in (90, 270) and width > 0 and height > 0:
+                        width, height = height, width
+
+                if duration <= 0:
+                    fmt = data.get("format") or {}
+                    f_dur = fmt.get("duration")
+                    if f_dur is not None:
+                        try:
+                            duration = max(0, int(float(f_dur)))
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    if (width <= 0 or height <= 0 or duration <= 0) and shutil.which("ffmpeg"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                video_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            info = (stderr or b"").decode("utf-8", errors="ignore")
+            if width <= 0 or height <= 0:
+                m_dim = re.search(r"Stream #.*Video:.*?,\s*(\d{2,5})x(\d{2,5})\b", info)
+                if m_dim:
+                    width = int(m_dim.group(1))
+                    height = int(m_dim.group(2))
+            if duration <= 0:
+                m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
+                if m_dur:
+                    h_v, m_v, s_v = (
+                        int(m_dur.group(1)),
+                        int(m_dur.group(2)),
+                        float(m_dur.group(3)),
+                    )
+                    duration = int(h_v * 3600 + m_v * 60 + s_v)
+        except Exception:
+            pass
+
+    return width, height, duration
+
 
 
 def _is_blank_or_dark_frame(image_path: str) -> bool:

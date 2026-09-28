@@ -8,6 +8,8 @@ from helper.ffmpeg import (
     extract_auto_thumbnail,
     get_cached_user_thumb,
     get_hd_cover_path,
+    is_video_file,
+    probe_video_dimensions_and_duration,
     add_metadata,
 )
 from helper.utils import (
@@ -243,9 +245,23 @@ async def doc(bot, update):
     width = int(raw_w) if isinstance(raw_w, (int, float)) and raw_w > 0 else 0
     raw_h = getattr(media, "height", 0)
     height = int(raw_h) if isinstance(raw_h, (int, float)) and raw_h > 0 else 0
+
+    probe_target = metadata_path if (_bool_metadata and metadata_path and os.path.exists(metadata_path)) else path
+    if (not width or not height or not duration) and is_video_file(new_filename, file.media, type_):
+        try:
+            p_w, p_h, p_dur = await probe_video_dimensions_and_duration(probe_target)
+            if not width and p_w > 0:
+                width = int(p_w)
+            if not height and p_h > 0:
+                height = int(p_h)
+            if not duration and p_dur > 0:
+                duration = int(p_dur)
+        except Exception as e:
+            logger.debug(f"ffprobe/ffmpeg dimension probe skipped: {e}")
+
     if not duration or not width or not height:
         try:
-            parser = createParser(path)
+            parser = createParser(probe_target)
             if parser:
                 with parser:
                     meta_info = extractMetadata(parser)
@@ -276,17 +292,19 @@ async def doc(bot, update):
     # Thumbnail & HD video_cover handling (NEVER uses source media.thumbs):
     # 1. If user saved a custom thumbnail (`c_thumb`), fetch from RAM cache or download once,
     #    and pass `c_thumb` (or `ph_path`) as `video_cover` for HD video preview.
+    #    Note: Custom thumbnail dimensions are NEVER used for video stream width/height.
     # 2. Otherwise, automatically extract a non-blank frame at ~30s via FFmpeg (`extract_auto_thumbnail`),
-    #    preserving both the 320p `thumb` (`ph_path`) and the full-resolution HD `cover_path`.
+    #    preserving both the 320p `thumb` (`ph_path`) and the full-resolution HD `cover_path`,
+    #    and using the extracted video frame's native resolution if `width`/`height` are still unknown.
     video_cover = None
     try:
         if c_thumb:
-            thumb_w, thumb_h, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
+            _, _, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
             video_cover = c_thumb or ph_path
         else:
-            thumb_w, thumb_h, ph_path = await extract_auto_thumbnail(
+            frame_w, frame_h, ph_path = await extract_auto_thumbnail(
                 bot=bot,
-                video_path=path,
+                video_path=probe_target,
                 media=media,
                 duration=duration,
                 user_id=user_id,
@@ -296,14 +314,21 @@ async def doc(bot, update):
             )
             cover_path = get_hd_cover_path(ph_path)
             video_cover = cover_path or ph_path
-        if not width and thumb_w:
-            width = int(thumb_w)
-        if not height and thumb_h:
-            height = int(thumb_h)
+            if not width and frame_w:
+                width = int(frame_w)
+            if not height and frame_h:
+                height = int(frame_h)
     except Exception as e:
         logger.warning(f"Thumbnail processing failed: {e}")
         ph_path = None
         video_cover = None
+
+    # Guarantee non-zero landscape dimensions (1280x720 fallback) when uploading as video
+    # so Telegram's video player always renders the rotate / fullscreen orientation button.
+    if type_ == "video":
+        if width <= 0 or height <= 0:
+            width = 1280
+            height = 720
 
     # Upload the file using Multi-Session Connection Pool (16 parallel TCP sockets)
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
@@ -335,6 +360,7 @@ async def doc(bot, update):
                 duration=duration,
                 width=width,
                 height=height,
+                supports_streaming=True,
                 thumb=ph_path,
                 video_cover=video_cover,
                 progress=progress_for_pyrogram,
