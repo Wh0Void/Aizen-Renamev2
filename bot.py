@@ -109,6 +109,11 @@ class Bot(Client):
             pool_size=Config.MEDIA_POOL_SIZE,
         ).attach(self)
 
+        if self.premium_client:
+            self.fast_pool.attach(self.premium_client)
+        if self.helper_client:
+            self.fast_pool.attach(self.helper_client)
+
     async def start(self):
         await super().start()
 
