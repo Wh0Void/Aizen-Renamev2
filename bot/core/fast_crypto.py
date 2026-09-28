@@ -43,7 +43,7 @@ _MTPROTO_PATCHED: bool = False
 
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
-    max_read_ahead: int = 512,
+    max_read_ahead: int = 64,
     max_inflight_media: int = 32,
     max_inflight_packets: int = 128,
     inline_crypto_max: int = 1048576,
@@ -64,7 +64,7 @@ def configure_wzgram_environment(
         "WZGRAM_INLINE_CRYPTO_MAX": str(inline_crypto_max),
         "WZGRAM_MEDIA_TIMEOUT": "120",
         "WZGRAM_MEDIA_SESSION_IDLE_TIMEOUT": str(media_idle_timeout),
-        "WZGRAM_TCP_TIMEOUT": "20",
+        "WZGRAM_TCP_TIMEOUT": "30",
         "WZGRAM_PEER_CACHE": "16384",
         "WZGRAM_MAX_LISTENERS": "4000",
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
@@ -72,7 +72,7 @@ def configure_wzgram_environment(
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
         "WZGRAM_UPLOAD_RATE_BOT": "1000",
         "WZGRAM_UPLOAD_RATE_USER": "1000",
-        "WZGRAM_SOCKET_BUFFER": str(32 * 1024 * 1024),
+        "WZGRAM_SOCKET_BUFFER": "0",  # 0 enables Linux kernel TCP window dynamic autotuning
     }
 
     applied: Dict[str, str] = {}
@@ -227,10 +227,42 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             FloodWait,
             VolumeLocNotFound,
         )
+        import socket
         from pyrogram.file_id import FileId, FileType, ThumbnailSource  # type: ignore
         from pyrogram.session.session import Session  # type: ignore
         from pyrogram.client import Client, ReadAhead, write_at  # type: ignore
         import pyrogram.methods.advanced.save_file as save_file_mod  # type: ignore
+        from pyrogram.connection.transport.tcp import TCP  # type: ignore
+
+        # ── Kernel TCP Keepalive Patch for Linux / Koyeb / Docker ─────────────
+        # Prevents intermediate cloud NAT edge proxies from silently dropping
+        # idle MTProto sockets after 60-120s of inactivity.
+        if not hasattr(TCP, "_turbo_patched_connect"):
+            _orig_tcp_connect = TCP.connect
+
+            async def _turbo_tcp_connect(self, address: tuple):
+                await _orig_tcp_connect(self, address)
+                try:
+                    if self.writer is not None:
+                        sock = self.writer.get_extra_info("socket")
+                        if sock is not None:
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            if hasattr(socket, "TCP_KEEPIDLE"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                            elif hasattr(socket, "TCP_KEEPALIVE"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
+                            if hasattr(socket, "TCP_KEEPINTVL"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                            if hasattr(socket, "TCP_KEEPCNT"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                            if hasattr(socket, "TCP_USER_TIMEOUT"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, 30000)
+                except OSError:
+                    pass
+
+            TCP.connect = _turbo_tcp_connect
+            TCP._turbo_patched_connect = True
 
         # Boost upload engine parameters
         save_file_mod.POOL_SIZE = target_pool
@@ -463,11 +495,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     _done_count = 0
                     _total_chunks = chunks_needed
 
-                    # Lock-Free Worker: Zero TokenBucket locks or AIMD rate reductions.
-                    # Workers are distributed round-robin across n_sessions; when only 1
-                    # session is available all workers share it (async-multiplexed, safe).
-                    async def _worker(sess: Any) -> None:
+                    # ── Dynamic Session Failover Workers ──────────────────────────────────────
+                    # If any MTProto session disconnects or drops its socket (BrokenPipe,
+                    # transport closed, or timeout), the worker immediately fails over to
+                    # the next healthy session in the pool without stalling, and schedules
+                    # an asynchronous background restart for the disconnected session.
+                    async def _worker(worker_idx: int) -> None:
                         nonlocal _done_count
+                        sess_idx = worker_idx % len(pool) if pool else 0
                         while True:
                             await buffer_slots.acquire()
                             try:
@@ -478,9 +513,10 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                             chunk_data = None
                             try:
-                                for _retry in range(5):
+                                for _retry in range(6):
+                                    current_sess = pool[sess_idx % len(pool)]
                                     try:
-                                        r_res = await sess.invoke(
+                                        r_res = await current_sess.invoke(
                                             raw.functions.upload.GetFile(
                                                 location=location,
                                                 offset=offset_cur,
@@ -495,10 +531,15 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     except (FloodWait, FloodPremiumWait) as fw:
                                         fw_sec = min(getattr(fw, "value", 1) or 1, 15)
                                         await asyncio.sleep(fw_sec)
-                                    except Exception:
-                                        if _retry >= 4:
+                                    except Exception as exc:
+                                        # Rotate to next healthy session immediately
+                                        sess_idx = (sess_idx + 1) % len(pool)
+                                        # Trigger background restart of failed session if disconnected
+                                        if hasattr(current_sess, "is_started") and not current_sess.is_started.is_set():
+                                            utils.run_in_background(current_sess.restart(), self.loop)
+                                        if _retry >= 5:
                                             raise
-                                        await asyncio.sleep(0.1 * (2 ** _retry))
+                                        await asyncio.sleep(0.05 * (2 ** _retry))
 
                                 if chunk_data is None:
                                     buffer_slots.release()
@@ -522,7 +563,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 raise
 
                     tasks = [
-                        asyncio.ensure_future(_worker(pool[i % n_sessions]))
+                        asyncio.ensure_future(_worker(i))
                         for i in range(total_workers)
                     ]
                     for t in tasks:
