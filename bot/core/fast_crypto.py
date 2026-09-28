@@ -349,6 +349,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 session = await self.get_session(dc_id, is_media=True)
 
+                # Measure RTT of first chunk to adapt chunk_size for remaining chunks
+                _t0 = time.monotonic()
                 r = await session.invoke(
                     raw.functions.upload.GetFile(
                         location=location,
@@ -358,23 +360,47 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     timeout=Session.MEDIA_WAIT_TIMEOUT,
                     sleep_threshold=15,
                 )
+                _first_rtt = time.monotonic() - _t0
+
+                # ── Adaptive chunk size based on measured RTT ────────────────────
+                # Bot-token downloads are rate-limited by Telegram in chunks/sec,
+                # not MB/s. On a high-RTT foreign DC (e.g. Frankfurt → DC1/DC5):
+                #   1 MiB @ 300ms RTT → 3.3 chunks/sec/worker → low throughput
+                #   256 KiB @ 300ms RTT → still 3.3 req/sec but 4× more requests
+                #     → pipeline fills faster → better aggregate throughput
+                # We only adapt remaining chunks; first chunk was already fetched at 1MiB.
+                if file_size > 0 and _first_rtt > 0.30:
+                    chunk_size = CHUNK_SIZE_512KB // 2  # 256 KiB for >300ms RTT
+                elif file_size > 0 and _first_rtt > 0.15:
+                    chunk_size = CHUNK_SIZE_512KB        # 512 KiB for 150–300ms RTT
+                # else keep 1 MiB for home/low-latency DCs (<150ms)
+                logger.debug(
+                    "DC%d RTT=%.3fs → remaining chunk_size=%d KiB",
+                    dc_id, _first_rtt, chunk_size // 1024,
+                )
 
                 if isinstance(r, raw.types.upload.File):
                     first_chunk = r.bytes
                     r = None
                     yield first_chunk
                     current += 1
-                    offset_bytes += chunk_size
+                    first_len = len(first_chunk)
+                    # Advance by the actual first-chunk size (always DOWNLOAD_CHUNK_1MB),
+                    # NOT the newly adapted chunk_size, since adaptive sizing only applies
+                    # to subsequent chunks.
+                    _first_chunk_size = first_len if first_len > 0 else DOWNLOAD_CHUNK_1MB
+                    offset_bytes += _first_chunk_size
                     if _write_file is not None:
                         _write_file.seek(0)
                         _write_file.write(first_chunk)
 
-                    first_len = len(first_chunk)
                     first_chunk = None
 
                     await _report(offset_bytes)
 
-                    if not first_len or first_len < chunk_size or current >= total:
+                    # Use _first_chunk_size for the "full chunk" check so we don't
+                    # stop early when first_len==1MiB but chunk_size is now 256KiB.
+                    if not first_len or first_len < _first_chunk_size or current >= total:
                         return
 
                     # Sequential fallback when file size is unknown
