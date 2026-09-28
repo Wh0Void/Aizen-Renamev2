@@ -766,11 +766,60 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 _t.cancel()
                         await cdn_session.stop()
 
-        if not hasattr(save_file_mod.SaveFile, "_wzgram_orig_save_file"):
-            save_file_mod.SaveFile._wzgram_orig_save_file = (
-                save_file_mod.SaveFile.save_file
-            )
-        _orig_save_file = save_file_mod.SaveFile._wzgram_orig_save_file
+        # ── Turbo Media Session Pool Creator (Batch size 12) ────────────────
+        if not hasattr(Client, "_wzgram_orig_get_media_session_pool"):
+            Client._wzgram_orig_get_media_session_pool = Client._get_media_session_pool
+
+            async def _turbo_get_media_session_pool(self: Any, dc_id: int, n: int) -> list:
+                lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
+                async with lock:
+                    pool = []
+                    for session in self.media_session_pools.get(dc_id, []):
+                        if session.is_started.is_set() or session.is_restarting:
+                            pool.append(session)
+                        else:
+                            utils.run_in_background(session.stop(), self.loop)
+
+                    needed = n - len(pool)
+                    if needed > 0:
+                        media = await self.get_session(dc_id, is_media=True)
+                        while needed > 0:
+                            chunk = min(needed, 12)
+                            gate = getattr(self, "_session_creation_gate", None)
+                            if gate is None:
+                                gate = asyncio.Semaphore(12)
+                                self._session_creation_gate = gate
+                            async with gate:
+                                pool.extend(await asyncio.gather(*(
+                                    self._make_media_session(
+                                        dc_id, media.auth_key, media.server_address, media.port
+                                    )
+                                    for _ in range(chunk)
+                                )))
+                            needed -= chunk
+                    self.media_session_pools[dc_id] = pool
+                    return list(pool)
+
+            Client._get_media_session_pool = _turbo_get_media_session_pool
+
+        # ── Turbo Lock-Free Multi-Socket Upload Engine ────────────────────────
+        async def _stop_workers(queue: asyncio.Queue, workers: list) -> list:
+            delivered = 0
+            for _ in workers:
+                if all(t.done() for t in workers):
+                    break
+                try:
+                    await asyncio.wait_for(queue.put(None), Session.MEDIA_WAIT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    break
+                delivered += 1
+
+            if delivered < len(workers):
+                for t in workers:
+                    if not t.done():
+                        t.cancel()
+
+            return await asyncio.gather(*workers, return_exceptions=True)
 
         async def _turbo_save_file(
             self: Any,
@@ -780,32 +829,247 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             progress: Optional[Callable] = None,
             progress_args: tuple = (),
         ):
-            orig_is_bot = (
-                getattr(self.me, "is_bot", True)
-                if hasattr(self, "me") and self.me is not None
-                else True
-            )
-            orig_is_premium = (
-                getattr(self.me, "is_premium", False)
-                if hasattr(self, "me") and self.me is not None
-                else False
-            )
-            if hasattr(self, "me") and self.me is not None:
-                self.me.is_bot = False
-                self.me.is_premium = True
-            try:
-                return await _orig_save_file(
-                    self,
-                    path=path,
-                    file_id=file_id,
-                    file_part=file_part,
-                    progress=progress,
-                    progress_args=progress_args,
-                )
-            finally:
-                if hasattr(self, "me") and self.me is not None:
-                    self.me.is_bot = orig_is_bot
-                    self.me.is_premium = orig_is_premium
+            from pyrogram.client import ReadAhead
+            from hashlib import md5
+            from pathlib import PurePath
+            import io
+
+            async with getattr(self, "save_file_semaphore", asyncio.Semaphore(128)):
+                if path is None:
+                    return None
+
+                part_size = CHUNK_SIZE_512KB
+
+                if isinstance(path, (str, PurePath)):
+                    fp = open(path, "rb", buffering=16 * 1024 * 1024)
+                elif isinstance(path, io.IOBase):
+                    fp = path
+                else:
+                    raise ValueError(
+                        "Invalid file. Expected a file path as string "
+                        "or a binary (not text) file pointer"
+                    )
+
+                file_name = getattr(fp, "name", "file.bin")
+                fp.seek(0, os.SEEK_END)
+                file_size = fp.tell()
+                fp.seek(0)
+
+                if file_size == 0:
+                    if isinstance(path, (str, PurePath)):
+                        fp.close()
+                    raise ValueError("File size equals to 0 B")
+
+                file_total_parts = int(math.ceil(file_size / part_size))
+                is_big = file_size > 10 * 1024 * 1024
+
+                # Dedicated Multi-Socket Pool: Up to target_pool (36-48) parallel TCP streams
+                ul_pool_size = min(target_pool, file_total_parts) if is_big else 1
+                is_missing_part = file_id is not None
+                file_id = file_id or self.rnd_id()
+                md5_sum = md5() if not is_big and not is_missing_part else None
+
+                dc_id = await self.storage.dc_id()
+                pool = await self._get_media_session_pool(dc_id, ul_pool_size)
+                if not pool:
+                    pool = [await self.get_session(dc_id, is_media=True)]
+
+                n_sessions = len(pool)
+                n_workers = min(n_sessions * 2, file_total_parts)
+                queue = asyncio.Queue(n_workers * 2)
+
+                read_ahead_budget = getattr(self, "read_ahead_slots", None)
+                if not isinstance(read_ahead_budget, asyncio.Semaphore):
+                    read_ahead_budget = asyncio.Semaphore(
+                        int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "256"))
+                    )
+                budget = ReadAhead(read_ahead_budget)
+
+                _acked = [0]
+
+                async def _send_part(worker_idx: int, data: Any) -> None:
+                    sess_idx = worker_idx
+                    for attempt in range(8):
+                        sess = pool[sess_idx % len(pool)]
+                        try:
+                            await sess.invoke(
+                                data, timeout=Session.MEDIA_WAIT_TIMEOUT, sleep_threshold=15
+                            )
+                            return
+                        except StopTransmission:
+                            raise
+                        except (FloodWait, FloodPremiumWait) as fw:
+                            fw_sec = min(getattr(fw, "value", 1) or 1, 15)
+                            await asyncio.sleep(fw_sec)
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as exc:
+                            sess_idx = (sess_idx + 1) % len(pool)
+                            if hasattr(sess, "is_started") and not sess.is_started.is_set():
+                                utils.run_in_background(sess.restart(), self.loop)
+                            if attempt >= 7:
+                                raise
+                            await asyncio.sleep(0.05 * (2 ** min(attempt, 4)))
+
+                async def worker(worker_idx: int) -> None:
+                    while True:
+                        data = await queue.get()
+                        if data is None:
+                            return
+                        try:
+                            await _send_part(worker_idx, data)
+                            _acked[0] += 1
+                        finally:
+                            data = None
+                            budget.release()
+
+                workers = [
+                    self.loop.create_task(worker(i))
+                    for i in range(n_workers)
+                ]
+
+                async def read_batch() -> bytes:
+                    batch_size = min(part_size * n_workers, 16 * 1024 * 1024)
+                    return await self.loop.run_in_executor(
+                        self.executor, fp.read, batch_size
+                    )
+
+                next_batch_task = None
+                _last_report_time = 0.0
+
+                async def _report(parts: int) -> None:
+                    nonlocal _last_report_time
+                    if not progress:
+                        return
+                    _now = time.monotonic()
+                    if _now - _last_report_time < 0.1 and parts < file_total_parts:
+                        return
+                    _last_report_time = _now
+                    func = functools.partial(
+                        progress,
+                        min(parts * part_size, file_size),
+                        file_size,
+                        *progress_args,
+                    )
+                    try:
+                        if inspect.iscoroutinefunction(progress):
+                            await func()
+                        else:
+                            await self.loop.run_in_executor(self.executor, func)
+                    except StopTransmission:
+                        raise
+                    except Exception as e:
+                        logger.debug("Upload progress callback error: %s", e)
+
+                try:
+                    fp.seek(part_size * file_part)
+                    next_batch_task = self.loop.create_task(read_batch())
+
+                    while True:
+                        batch = await next_batch_task
+                        next_batch_task = self.loop.create_task(read_batch())
+
+                        if not batch:
+                            next_batch_task.cancel()
+                            if not is_big and not is_missing_part:
+                                md5_sum = md5_sum.hexdigest()
+                            break
+
+                        for t in workers:
+                            if t.done() and not t.cancelled():
+                                exc = t.exception()
+                                if exc is not None:
+                                    raise exc
+
+                        for start in range(0, len(batch), part_size):
+                            chunk = batch[start : start + part_size]
+
+                            if is_big:
+                                rpc = raw.functions.upload.SaveBigFilePart(
+                                    file_id=file_id,
+                                    file_part=file_part,
+                                    file_total_parts=file_total_parts,
+                                    bytes=chunk,
+                                )
+                            else:
+                                rpc = raw.functions.upload.SaveFilePart(
+                                    file_id=file_id,
+                                    file_part=file_part,
+                                    bytes=chunk,
+                                )
+
+                            await budget.acquire()
+
+                            while True:
+                                try:
+                                    await asyncio.wait_for(queue.put(rpc), timeout=30)
+                                    break
+                                except asyncio.TimeoutError:
+                                    for t in workers:
+                                        if t.done() and not t.cancelled():
+                                            exc = t.exception()
+                                            if exc is not None:
+                                                raise exc
+                                    await asyncio.sleep(0.5)
+
+                            if is_missing_part:
+                                next_batch_task.cancel()
+                                results = await _stop_workers(queue, workers)
+                                for r in results:
+                                    if isinstance(r, BaseException) and not isinstance(
+                                        r, asyncio.CancelledError
+                                    ):
+                                        raise r
+                                return None
+
+                            if not is_big and not is_missing_part:
+                                md5_sum.update(chunk)
+
+                            rpc = None
+                            chunk = None
+                            file_part += 1
+
+                            await _report(_acked[0])
+
+                        batch = None
+
+                except StopTransmission:
+                    raise
+                except Exception as e:
+                    logger.exception("Upload failed: %s", e)
+                    raise
+                else:
+                    results = await _stop_workers(queue, workers)
+                    for r in results:
+                        if isinstance(r, BaseException) and not isinstance(
+                            r, asyncio.CancelledError
+                        ):
+                            raise r
+
+                    await _report(file_total_parts)
+
+                    if is_big:
+                        return raw.types.InputFileBig(
+                            id=file_id,
+                            parts=file_total_parts,
+                            name=file_name,
+                        )
+                    else:
+                        return raw.types.InputFile(
+                            id=file_id,
+                            parts=file_total_parts,
+                            name=file_name,
+                            md5_checksum=md5_sum,
+                        )
+                finally:
+                    if next_batch_task is not None and not next_batch_task.done():
+                        next_batch_task.cancel()
+
+                    await _stop_workers(queue, workers)
+                    budget.release_all()
+
+                    if isinstance(path, (str, PurePath)):
+                        fp.close()
 
         _turbo_get_file.__name__ = "_turbo_get_file"
         _turbo_save_file.__name__ = "_turbo_save_file"
