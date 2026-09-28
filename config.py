@@ -36,11 +36,11 @@ class Config(object):
     SHORTLINK_API = os.getenv("SHORTLINK_API", "242fb1e2951cdf981a8")
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
 
-    # ⚡ High-Speed Multi-Session Pool & Low-RAM Cache Configs (Render / Koyeb optimized)
-    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "6"))  # 6 to 8 parallel TCP media sessions
+    # ⚡ High-Speed Multi-Session Pool & Low-RAM Cache Configs (50-100+ MB/s Turbo Profile)
+    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "12"))  # 12 parallel TCP media sessions
     RAM_CACHE_MAX_MB = int(os.environ.get("RAM_CACHE_MAX_MB", "40"))  # Max file size (MB) routed through /dev/shm
     USER_CACHE_TTL = int(os.environ.get("USER_CACHE_TTL", "1800"))  # In-memory user DB cache TTL in seconds
-    WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "24"))  # Read-ahead slots (24 * 512KB = 12MB)
+    WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "48"))  # Read-ahead slots for pipelined transfers
 
 
 
