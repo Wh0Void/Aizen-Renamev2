@@ -124,49 +124,50 @@ class AdaptiveConcurrency:
 
 def configure_wzgram_environment(
     pool_size: int = DEFAULT_MEDIA_POOL_SIZE,
-    max_read_ahead: int = 96,
+    max_read_ahead: int = 256,
     max_inflight_media: int = 16,
     max_inflight_packets: int = 64,
-    inline_crypto_max: int = 2097152,
+    inline_crypto_max: int = 65536,
     media_idle_timeout: int = 300,
 ) -> Dict[str, str]:
     """
     Configure Wzgram runtime environment knobs before client initialization.
-    Tuned for sustained 50-100+ MB/s Turbo throughput (16 parallel media sessions,
-    3 in-flight workers/session = 48 workers, 96 read-ahead slots, 16 MiB TCP socket buffers,
-    8 MiB StreamReader/StreamWriter watermarks, and inline Rust AES-NI packing).
+    Tuned to match high-performance Auto-Rename reference (18-30+ MB/s on Koyeb):
+    32 Rust crypto worker threads, 256 read-ahead chunks, 64KB inline crypto
+    threshold (offloading 1MB/512KB chunks to Rust AES-NI worker threads so uvloop
+    is 100% unblocked), 128 workers, and 24 parallel streams.
     """
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        # Multi-session upload/download pool (8-24 parallel TCP media connections)
+        # Multi-session upload/download pool (24 parallel TCP media connections)
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
         # High rate ceiling (400 parts/sec * 512 KB = 200 MB/s)
         "WZGRAM_UPLOAD_RATE_BOT": "400",
         "WZGRAM_UPLOAD_RATE_USER": "400",
-        # 96 read-ahead slots for pipelined transfers across 16 sockets
+        # 256 read-ahead slots for smooth pipelined streaming across 24 sockets
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
-        # 16 pipelined chunks per TCP media socket (up to 256 in-flight across 16 sockets)
+        # 16 pipelined chunks per TCP media socket
         "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
         "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
         # 16 MiB OS TCP send/recv socket buffers (SO_SNDBUF / SO_RCVBUF) for high-BDP links
         "WZGRAM_SOCKET_BUFFER": str(16 * 1024 * 1024),
         # Generous TCP & Media timeouts so burst transfers never drop mid-frame
-        "WZGRAM_TCP_TIMEOUT": "30",
-        "WZGRAM_MEDIA_TIMEOUT": "90",
-        # Inline hardware AES-NI threshold (2 MiB inline so 512 KB / 1 MB chunks pack in ~70us
-        # without holding Session._atomic_send_lock across run_in_executor thread hops)
+        "WZGRAM_TCP_TIMEOUT": "20",
+        "WZGRAM_MEDIA_TIMEOUT": "120",
+        # 64 KB inline hardware AES-NI threshold (offloads 512KB/1MB chunks to 32 Rust crypto threads)
         "WZGRAM_INLINE_CRYPTO_MAX": str(inline_crypto_max),
         # Keep pooled media sessions warm for 300s between transfers
         "WZGRAM_MEDIA_SESSION_IDLE_TIMEOUT": str(media_idle_timeout),
         # Fast peer cache in front of SQLite/in-memory storage
-        "WZGRAM_PEER_CACHE": "4096",
-        # Worker threads / update handler workers (100 concurrent handlers so other users are never queued)
-        "WZGRAM_CRYPTO_WORKERS": "8",
-        "WZGRAM_WORKERS": "100",
-        "WZGRAM_HANDLER_WORKERS": "100",
+        "WZGRAM_PEER_CACHE": "8192",
+        # 32 Rust WarpCrypto threads, 128 workers, 64 handler workers, 2000 listeners
+        "WZGRAM_CRYPTO_WORKERS": "32",
+        "WZGRAM_WORKERS": "128",
+        "WZGRAM_HANDLER_WORKERS": "64",
+        "WZGRAM_MAX_LISTENERS": "2000",
     }
 
     applied: Dict[str, str] = {}
@@ -255,9 +256,9 @@ def _patch_wzgram_mtproto_stability(pool_size: int = DEFAULT_MEDIA_POOL_SIZE) ->
             int(os.environ.get("WZGRAM_SOCKET_BUFFER", str(16 * 1024 * 1024))),
         )
         Session.MEDIA_WAIT_TIMEOUT = max(getattr(Session, "MEDIA_WAIT_TIMEOUT", 60), 90)
-        Session.MAX_INFLIGHT_MEDIA = int(os.environ.get("WZGRAM_MAX_INFLIGHT_MEDIA", "24"))
-        Session.MAX_INFLIGHT_PACKETS = int(os.environ.get("WZGRAM_MAX_INFLIGHT_PACKETS", "128"))
-        Session.INLINE_CRYPTO_MAX = int(os.environ.get("WZGRAM_INLINE_CRYPTO_MAX", "2097152"))
+        Session.MAX_INFLIGHT_MEDIA = int(os.environ.get("WZGRAM_MAX_INFLIGHT_MEDIA", "16"))
+        Session.MAX_INFLIGHT_PACKETS = int(os.environ.get("WZGRAM_MAX_INFLIGHT_PACKETS", "64"))
+        Session.INLINE_CRYPTO_MAX = int(os.environ.get("WZGRAM_INLINE_CRYPTO_MAX", "65536"))
         Session.ACKS_THRESHOLD = 64
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
         save_file_mod.POOL_SIZE = target_pool

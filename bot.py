@@ -35,6 +35,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 import wzgram  # noqa: E402
+sys.modules["pyrogram"] = wzgram
 from wzgram import Client, __version__  # noqa: E402
 import pyrogram.utils  # noqa: E402
 from route import web_server  # noqa: E402
@@ -45,7 +46,7 @@ pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
 
 class Bot(Client):
     """
-    High-Speed Wzgram Bot Client with Multi-Session Media Connection Pool (6-8 TCP sockets),
+    High-Speed Wzgram Bot Client with Multi-Session Media Connection Pool (24 TCP sockets),
     Hardware AES-NI Crypto (`WarpCrypto`), and Low-RAM In-Memory Session Storage.
     """
 
@@ -56,7 +57,7 @@ class Bot(Client):
             "api_hash": Config.API_HASH,
             "bot_token": Config.BOT_TOKEN,
             "in_memory": True,
-            "workers": 100,
+            "workers": 500,
             "max_concurrent_transmissions": Config.MEDIA_POOL_SIZE,
             "plugins": {"root": "plugins"},
             "sleep_threshold": 15,
