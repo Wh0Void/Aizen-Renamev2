@@ -1,21 +1,29 @@
 import os
 import re
 import time
+import shutil
 import asyncio
 import logging
 from asyncio import sleep
 
 from pyrogram import Client, filters, StopTransmission
-from pyrogram.types import ForceReply
+from pyrogram.enums import MessageMediaType
 from pyrogram.errors import FloodWait
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply,
+    Message,
+)
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
 
-from helper.database import Mythicbotz
 from helper.ffmpeg import (
-    is_video_file,
-    probe_video_dimensions_and_duration,
     extract_auto_thumbnail,
     get_cached_user_thumb,
     get_hd_cover_path,
+    is_video_file,
+    probe_video_dimensions_and_duration,
     add_metadata,
 )
 from helper.utils import (
@@ -23,264 +31,456 @@ from helper.utils import (
     init_progress_message,
     convert,
     humanbytes,
+    add_prefix_suffix,
     clear_transfer_cancellation,
 )
+from helper.database import Mythicbotz
 from bot.core.cache import ram_workspace
 from config import Config
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# State cache mapping user_id -> ongoing process metadata
-# {user_id: {"torrent_path": str, "orig_filename": str, "file_size": int, "step": str}}
-TORRENT_MERGE_SESSIONS = {}
+# User active tasks: user_id -> task_dict
+# Format: { "torrent_file": path, "torrent_dir": path, "torrent_name": name, "timestamp": time.time(), "prompt_id": msg_id }
+ACTIVE_TORRENT_TASKS = {}
+
+VIDEO_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v", ".flv")
+AUDIO_EXTENSIONS = (".mp3", ".aac", ".m4a", ".flac", ".wav", ".opus", ".ogg", ".ac3", ".eac3", ".dts")
 
 
-async def _aria2_download(magnet_or_url: str, output_dir: str, ms) -> str:
-    """Download torrent/magnet via aria2c CLI, throttling CPU usage for Koyeb."""
+async def _delayed_delete(*messages, delay: float = 1800.0) -> None:
+    """Background task to auto-delete messages after `delay` seconds."""
+    await asyncio.sleep(delay)
+    for msg in messages:
+        if msg is not None:
+            try:
+                await msg.delete()
+            except Exception as e:
+                logger.debug(f"Delayed message delete skipped: {e}")
+
+
+def _find_primary_video(target_dir: str) -> str | None:
+    """Finds the largest video file within the downloaded directory."""
+    if os.path.isfile(target_dir):
+        return target_dir
+
+    candidate = None
+    max_size = 0
+    for root, _, files in os.walk(target_dir):
+        for file in files:
+            if file.lower().endswith(VIDEO_EXTENSIONS):
+                full_path = os.path.join(root, file)
+                sz = os.path.getsize(full_path)
+                if sz > max_size:
+                    max_size = sz
+                    candidate = full_path
+    return candidate
+
+
+async def _download_torrent_aria2(torrent_source: str, download_dir: str, status_msg: Message) -> bool:
+    """
+    Downloads torrent using aria2c without overwhelming CPU on Koyeb.
+    Parses progress every 4-5 seconds to avoid Telegram FloodWait.
+    """
+    if not shutil.which("aria2c"):
+        raise RuntimeError("`aria2c` is not installed on this system.")
+
+    os.makedirs(download_dir, exist_ok=True)
+
     cmd = [
         "aria2c",
-        "--allow-overwrite=true",
+        f"--dir={download_dir}",
+        "--seed-time=0",
+        "--max-upload-limit=1K",
+        "--max-connection-per-server=8",
+        "--split=8",
+        "--summary-interval=3",
+        "--follow-torrent=mem",
         "--auto-file-renaming=false",
-        "--file-allocation=none",   # Saves CPU/disk overhead on containerized FS
-        "--seed-time=0",            # Stop immediately after download completes
-        "--max-connection-per-server=4",
-        f"--dir={output_dir}",
-        magnet_or_url,
+        "--allow-overwrite=true",
+        torrent_source,
     ]
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.STDOUT,
     )
 
-    last_update = 0
-    while process.returncode is None:
-        await asyncio.sleep(3.0)  # Gentle interval to prevent Koyeb worker saturation
-        if process.stdout:
-            line = await process.stdout.readline()
-            if not line:
-                if process.returncode is not None:
-                    break
-                continue
-            text = line.decode(errors="ignore").strip()
-            # Catch Aria2 progress line format (e.g., [#... 12MiB/100MiB(12%) CN:1 ETA:1m])
-            if text.startswith("[#") and time.time() - last_update > 4.0:
+    last_update = time.time()
+    aria_regex = re.compile(r"\((\d+)\%\).*?DL:([0-9.]+[A-Za-z]+).*?ETA:([0-9A-Za-z]+)")
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        decoded_line = line.decode("utf-8", errors="ignore").strip()
+
+        # Throttled progress update to keep Koyeb CPU/RAM calm
+        if time.time() - last_update > 4.5:
+            match = aria_regex.search(decoded_line)
+            if match:
+                percent, speed, eta = match.groups()
                 try:
-                    await ms.edit(
-                        f"<blockquote>📥 <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ...</b></blockquote>\n"
-                        f"╰─ <code>{text[:120]}</code>"
+                    await status_msg.edit(
+                        "<blockquote>⚡ <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ᴛᴏʀʀᴇɴᴛ...</b></blockquote>\n"
+                        f"╭─ 📊 <b>ᴘʀᴏɢʀᴇss :</b> <code>{percent}%</code>\n"
+                        f"├─ 🚀 <b>sᴘᴇᴇᴅ :</b> <code>{speed}/s</code>\n"
+                        f"╰─ ⏱️ <b>ᴇᴛᴀ :</b> <code>{eta}</code>"
                     )
                     last_update = time.time()
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
                 except Exception:
                     pass
 
-    await process.wait()
+        # Give back time to the event loop
+        await asyncio.sleep(0.05)
 
-    # Find the largest media file inside output_dir
-    largest_file = None
-    max_size = 0
-    for root, _, files in os.walk(output_dir):
-        for f in files:
-            fp = os.path.join(root, f)
-            sz = os.path.getsize(fp)
-            if sz > max_size:
-                max_size = sz
-                largest_file = fp
-
-    if not largest_file:
-        raise FileNotFoundError("No downloaded file found from torrent.")
-    return largest_file
+    return_code = await process.wait()
+    return return_code == 0
 
 
-async def _merge_and_set_default_audio(video_in: str, audio_source: str, output_file: str) -> bool:
+async def _mux_audio_stream_copy(video_input: str, audio_input: str, output_path: str) -> bool:
     """
-    Merges audio into video with ZERO re-encoding (-c copy).
-    Marks the new track as the default audio track.
-    Accepts both audio-only files or existing video files as audio source.
+    Fast stream-copy muxing using FFmpeg with ZERO re-encoding.
+    Maps:
+      - Torrent video: 0:v:0
+      - User's audio: 1:a:0 (placed first)
+      - Torrent's original audios: 0:a? (preserved as secondary tracks)
+      - Subtitles: 0:s? (all subtitles preserved)
+    Sets user audio track as the default audio track.
     """
     cmd = [
-        "ffmpeg", "-y",
-        "-i", video_in,           # [0:v] video stream
-        "-i", audio_source,       # [1:a] audio stream
-        "-map", "0:v:0",          # Retain primary video
-        "-map", "1:a:0",          # Add new track as primary audio
-        "-map", "0:a?",           # Keep remaining existing audio tracks (optional)
-        "-c", "copy",             # No CPU-heavy re-encoding
-        "-disposition:a:0", "default",  # Set new audio track as default
-        "-disposition:a:1", "0",        # Demote previous default
-        output_file
+        "ffmpeg",
+        "-y",
+        "-i", video_input,
+        "-i", audio_input,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-map", "0:a?",
+        "-map", "0:s?",
+        "-c", "copy",
+        "-disposition:a", "0",          # Clear default flag on all audio tracks
+        "-disposition:a:0", "default",  # Set newly added audio track as default
+        output_path,
     ]
 
-    proc = await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
-    return proc.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0
+
+    _, stderr = await process.communicate()
+
+    # Small pause to yield CPU on Koyeb
+    await asyncio.sleep(0.5)
+
+    if process.returncode != 0:
+        logger.error(f"FFmpeg stream copy error: {stderr.decode('utf-8', errors='ignore')}")
+        return False
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
-@Client.on_message(filters.private & filters.regex(r"^(magnet:\?xt=urn:btih:|http[s]?://.*\.torrent)"))
-async def start_torrent_process(client: Client, message):
-    user_id = message.from_user.id
+# ==========================================
+# STEP 1: INITIATE TORRENT DOWNLOAD
+# ==========================================
 
+@Client.on_message(filters.private & (filters.command(["tmux", "torrent", "torrent_audio"]) | filters.regex(r"^(magnet:\?xt=|https?://.*?\.(torrent))")))
+async def torrent_start(client: Client, message: Message):
+    user_id = int(message.from_user.id)
+
+    # Fast RAM-cached ban check
     if await Mythicbotz.is_banned(user_id):
-        return await message.reply("<blockquote>🚫 <b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ.</b></blockquote>")
+        return await message.reply(
+            "<blockquote>🚫 <b>ᴀᴄᴄᴇss ᴅᴇɴɪᴇᴅ</b></blockquote>\n"
+            "╰─ <b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ꜰʀᴏᴍ ᴜsɪɴɢ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CosmicBotz.</b>"
+        )
 
-    link = message.text.strip()
-    status_msg = await message.reply("<blockquote>⚡ <b>ɪɴɪᴛɪᴀʟɪᴢɪɴɢ ᴛᴏʀʀᴇɴᴛ...</b></blockquote>")
+    # Extract source link/magnet
+    torrent_source = None
+    if message.matches:
+        torrent_source = message.text.strip()
+    elif len(message.command) > 1:
+        torrent_source = message.text.split(None, 1)[1].strip()
+    elif message.reply_to_message and message.reply_to_message.text:
+        reply_txt = message.reply_to_message.text.strip()
+        if reply_txt.startswith("magnet:?xt=") or ".torrent" in reply_txt:
+            torrent_source = reply_txt
 
-    job_dir = os.path.join("/tmp", f"torrent_{user_id}_{int(time.time())}")
-    os.makedirs(job_dir, exist_ok=True)
+    if not torrent_source:
+        return await message.reply_text(
+            "<blockquote>⚠️ <b>ᴍɪssɪɴɢ ᴛᴏʀʀᴇɴᴛ sᴏᴜʀᴄᴇ</b></blockquote>\n\n"
+            "╰─ <i>Send the command along with a magnet link or .torrent URL:</i>\n"
+            "<code>/tmux magnet:?xt=urn:btih:...</code>",
+            reply_to_message_id=message.id,
+        )
+
+    # Clean up previous pending task if exists
+    old_task = ACTIVE_TORRENT_TASKS.pop(user_id, None)
+    if old_task:
+        ram_workspace.cleanup_files(old_task.get("torrent_file"))
+        if os.path.exists(old_task.get("torrent_dir", "")):
+            shutil.rmtree(old_task.get("torrent_dir"), ignore_errors=True)
+
+    status_msg = await message.reply_text(
+        "<blockquote>🚀 <b>ɪɴɪᴛɪᴀʟɪᴢɪɴɢ ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅ...</b></blockquote>",
+        reply_to_message_id=message.id,
+    )
+
+    # Isolated job directory
+    work_dir = os.path.join("/tmp", f"torrent_{user_id}_{int(time.time())}")
+    os.makedirs(work_dir, exist_ok=True)
 
     try:
-        downloaded_file = await _aria2_download(link, job_dir, status_msg)
+        success = await _download_torrent_aria2(torrent_source, work_dir, status_msg)
+        if not success:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return await status_msg.edit("<blockquote>❌ <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴛʜᴇ ʟɪɴᴋ ᴏʀ sᴇᴇᴅs.</b></blockquote>")
     except Exception as e:
-        logger.error(f"Torrent DL error: {e}")
-        return await status_msg.edit(f"<blockquote>❌ <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ:</b></blockquote>\n<code>{e}</code>")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        logger.error(f"Torrent error: {e}")
+        return await status_msg.edit(f"<blockquote>❌ <b>ᴇʀʀᴏʀ :</b> <code>{e}</code></blockquote>")
 
-    file_size = os.path.getsize(downloaded_file)
-    orig_name = os.path.basename(downloaded_file)
+    video_file = _find_primary_video(work_dir)
+    if not video_file:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return await status_msg.edit("<blockquote>❌ <b>ɴᴏ ᴠᴀʟɪᴅ ᴠɪᴅᴇᴏ ꜰɪʟᴇ ꜰᴏᴜɴᴅ ɪɴ ᴛᴏʀʀᴇɴᴛ.</b></blockquote>")
 
-    if file_size > 2000 * 1024 * 1024:
-        ram_workspace.cleanup_files(downloaded_file)
-        return await status_msg.edit("<blockquote>⚠️ <b>ꜰɪʟᴇ ᴇxᴄᴇᴇᴅs 2 ɢʙ ʟɪᴍɪᴛ.</b></blockquote>")
+    vid_name = os.path.basename(video_file)
+    vid_size = humanbytes(os.path.getsize(video_file))
 
-    # Save session awaiting the user's audio track
-    TORRENT_MERGE_SESSIONS[user_id] = {
-        "torrent_path": downloaded_file,
-        "orig_filename": orig_name,
-        "file_size": file_size,
-        "job_dir": job_dir,
-        "status_msg_id": status_msg.id,
+    # Ask user for replacement audio/video
+    prompt = await message.reply_text(
+        "<blockquote>🎵 <b>sᴇɴᴅ ᴀᴜᴅɪᴏ / ᴠɪᴅᴇᴏ ᴛᴏ sᴇᴛ ᴀs ᴅᴇꜰᴀᴜʟᴛ</b></blockquote>\n\n"
+        f"╭─ 🎬 <b>ᴛᴏʀʀᴇɴᴛ ᴠɪᴅᴇᴏ :</b> <code>{vid_name}</code>\n"
+        f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{vid_size}</code>\n"
+        "╰─ <i>Reply to this message with an Audio or Video file whose audio track you want to inject as default.</i>",
+        reply_markup=ForceReply(True),
+    )
+
+    ACTIVE_TORRENT_TASKS[user_id] = {
+        "torrent_video": video_file,
+        "torrent_dir": work_dir,
+        "torrent_name": vid_name,
+        "prompt_id": prompt.id,
+        "timestamp": time.time(),
     }
 
-    # Yield execution so Koyeb worker remains responsive
-    await asyncio.sleep(1.0)
-
-    prompt = (
-        "<blockquote>🎵 <b>sᴇɴᴅ ᴀᴜᴅɪᴏ ᴏʀ ᴠɪᴅᴇᴏ ꜰɪʟᴇ</b></blockquote>\n\n"
-        f"╭─ 📦 <b>ᴛᴏʀʀᴇɴᴛ ꜰɪʟᴇ:</b> <code>{orig_name}</code>\n"
-        f"╰─ ⏱️ <i>Send the audio/video whose default track you want to inject. Reply to this prompt.</i>"
-    )
-
-    await status_msg.edit(prompt)
-    await message.reply_text(
-        "╰─ <b>ᴘʟᴇᴀsᴇ ʀᴇᴘʟʏ ʜᴇʀᴇ ᴡɪᴛʜ ᴛʜᴇ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ ᴍᴇᴅɪᴀ:</b>",
-        reply_markup=ForceReply(selective=True),
-    )
-
-
-@Client.on_message(filters.private & (filters.audio | filters.video | filters.document) & filters.reply)
-async def receive_audio_and_merge(bot: Client, message):
-    user_id = message.from_user.id
-    reply_msg = message.reply_to_message
-
-    if not reply_msg or not reply_msg.reply_markup or not isinstance(reply_msg.reply_markup, ForceReply):
-        return
-
-    session = TORRENT_MERGE_SESSIONS.pop(user_id, None)
-    if not session:
-        return await message.reply("<blockquote>⚠️ <b>ɴᴏ ᴀᴄᴛɪᴠᴇ ᴛᴏʀʀᴇɴᴛ sᴇssɪᴏɴ ꜰᴏᴜɴᴅ.</b></blockquote>")
-
-    torrent_path = session["torrent_path"]
-    job_dir = session["job_dir"]
-    orig_filename = session["orig_filename"]
-
-    # Target output naming
-    output_filename = f"Merged_{orig_filename}"
-    if not output_filename.endswith(".mkv"):
-        output_filename = f"{os.path.splitext(output_filename)[0]}.mkv"
-
-    merged_output = os.path.join(job_dir, output_filename)
-    audio_temp_path = os.path.join(job_dir, "incoming_audio")
-
-    ms = await message.reply("<blockquote>📥 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ᴀᴜᴅɪᴏ sᴏᴜʀᴄᴇ...</b></blockquote>")
-
-    dl_client = getattr(bot, "helper_client", None) or bot
     try:
-        # Download incoming audio/video track
-        audio_file = await dl_client.download_media(
-            message=message,
-            file_name=audio_temp_path
-        )
-        await ms.edit("<blockquote>⚙️ <b>ᴍᴇʀɢɪɴɢ ᴀᴜᴅɪᴏ (sᴛʀᴇᴀᴍ ᴄᴏᴘʏ)...</b></blockquote>")
-        await asyncio.sleep(1.0)  # Gentle spacing for Koyeb resources
-
-        # Zero-encoding merge
-        success = await _merge_and_set_default_audio(torrent_path, audio_file, merged_output)
-        if not success:
-            raise RuntimeError("FFmpeg stream-copy muxing failed.")
-
-    except Exception as e:
-        logger.error(f"Merge error: {e}")
-        ram_workspace.cleanup_files(torrent_path, job_dir)
-        return await ms.edit(f"<blockquote>❌ <b>ᴍᴇʀɢᴇ ꜰᴀɪʟᴇᴅ:</b></blockquote>\n<code>{e}</code>")
-
-    # Apply Metadata (Zero-encoding)
-    user_data = await Mythicbotz.get_user_data(user_id) or {}
-    bool_metadata = bool(user_data.get("metadata", False))
-    meta_code = user_data.get("metadata_code") or "By :- @CosmicBotz"
-    c_thumb = user_data.get("file_id")
-
-    final_upload_path = merged_output
-    metadata_path = None
-
-    if bool_metadata:
-        await ms.edit("<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b></blockquote>")
-        meta_dir = os.path.join(job_dir, "meta_out")
-        os.makedirs(meta_dir, exist_ok=True)
-        metadata_path = os.path.join(meta_dir, output_filename)
-        try:
-            res_meta = await add_metadata(merged_output, metadata_path, meta_code, ms)
-            if res_meta and os.path.exists(metadata_path):
-                final_upload_path = metadata_path
-        except Exception as err:
-            logger.warning(f"Metadata skipping: {err}")
-
-    # Probe duration and dimension
-    width, height, duration = 1280, 720, 0
-    try:
-        p_w, p_h, p_dur = await probe_video_dimensions_and_duration(final_upload_path)
-        width = int(p_w) if p_w > 0 else width
-        height = int(p_h) if p_h > 0 else height
-        duration = int(p_dur) if p_dur > 0 else 0
+        await status_msg.delete()
     except Exception:
         pass
 
-    # Thumbnail extraction / User thumb
-    ph_path, video_cover = None, None
+    # Expire pending session after 15 minutes to save storage
+    async def _auto_abort():
+        await asyncio.sleep(900)
+        task = ACTIVE_TORRENT_TASKS.get(user_id)
+        if task and task.get("prompt_id") == prompt.id:
+            ACTIVE_TORRENT_TASKS.pop(user_id, None)
+            if os.path.exists(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            try:
+                await prompt.edit("<blockquote>⏱️ <b>ᴛᴏʀʀᴇɴᴛ ᴍᴜxɪɴɢ sᴇssɪᴏɴ ᴇxᴘɪʀᴇᴅ.</b></blockquote>")
+            except Exception:
+                pass
+
+    asyncio.create_task(_auto_abort())
+
+
+# ==========================================
+# STEP 2: RECEIVE AUDIO/VIDEO & MUX & UPLOAD
+# ==========================================
+
+@Client.on_message(filters.private & filters.reply & (filters.audio | filters.video | filters.document))
+async def handle_mux_reply(bot: Client, message: Message):
+    user_id = int(message.from_user.id)
+    reply_msg = message.reply_to_message
+
+    if not (reply_msg and reply_msg.reply_markup and isinstance(reply_msg.reply_markup, ForceReply)):
+        return
+
+    task = ACTIVE_TORRENT_TASKS.get(user_id)
+    if not task or task.get("prompt_id") != reply_msg.id:
+        return
+
+    # Check if replied media is valid audio or video
+    media = getattr(message, message.media.value) if message.media else None
+    if not media:
+        return await message.reply_text("<blockquote>⚠️ <b>ᴘʟᴇᴀsᴇ sᴇɴᴅ ᴀ ᴠᴀʟɪᴅ ᴍᴇᴅɪᴀ ꜰɪʟᴇ.</b></blockquote>")
+
+    fname = getattr(media, "file_name", "") or ""
+    is_valid_media = (
+        message.media in (MessageMediaType.AUDIO, MessageMediaType.VIDEO)
+        or fname.lower().endswith(AUDIO_EXTENSIONS + VIDEO_EXTENSIONS)
+        or (getattr(media, "mime_type", "") or "").startswith(("audio/", "video/"))
+    )
+
+    if not is_valid_media:
+        return await message.reply_text("<blockquote>⚠️ <b>ᴛʜɪs ꜰɪʟᴇ ᴅᴏᴇs ɴᴏᴛ ᴄᴏɴᴛᴀɪɴ ᴀ ʀᴇᴄᴏɢɴɪᴢᴇᴅ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ sᴛʀᴇᴀᴍ.</b></blockquote>")
+
+    # Lock session so duplicate messages are ignored
+    ACTIVE_TORRENT_TASKS.pop(user_id, None)
+
+    torrent_video = task["torrent_video"]
+    torrent_dir = task["torrent_dir"]
+    torrent_name = task["torrent_name"]
+
+    user_data = await Mythicbotz.get_user_data(user_id) or {}
+    prefix = user_data.get("prefix")
+    suffix = user_data.get("suffix")
+    _bool_metadata = bool(user_data.get("metadata", False))
+    user_metadata_code = user_data.get("metadata_code") or "By :- @CosmicBotz"
+    c_caption = user_data.get("caption")
+    c_thumb = user_data.get("file_id")
+    dest_channel = user_data.get("destination_channel")
+
+    # Ensure output has .mkv extension for lossless multi-stream copying
+    base_out_name = os.path.splitext(torrent_name)[0] + ".mkv"
+    try:
+        new_filename = add_prefix_suffix(base_out_name, prefix, suffix)
+    except Exception:
+        new_filename = base_out_name
+
+    # Prepare temporary paths
+    user_media_path = os.path.join(torrent_dir, f"input_audio_{media.file_id[:8]}")
+    muxed_output_path = os.path.join(torrent_dir, f"muxed_{new_filename}")
+    meta_output_path = None
+    ph_path = None
+    cover_path = None
+
+    # Step A: Download user's audio/video
+    dl_header = "<blockquote>📥 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ʏᴏᴜʀ ᴀᴜᴅɪᴏ ꜰɪʟᴇ...</b> ⚡</blockquote>"
+    ms, dl_start = await init_progress_message(message, dl_header, getattr(media, "file_size", 0) or 0)
+
+    dl_client = getattr(bot, "helper_client", None) or getattr(bot, "premium_client", None) or bot
+    try:
+        user_media_path = await dl_client.download_media(
+            message=message,
+            file_name=user_media_path,
+            progress=progress_for_pyrogram,
+            progress_args=(dl_header, ms, dl_start),
+        )
+    except Exception as e:
+        logger.error(f"Failed downloading user audio: {e}")
+        clear_transfer_cancellation(user_id, ms.id)
+        shutil.rmtree(torrent_dir, ignore_errors=True)
+        return await ms.edit(f"<blockquote>❌ <b>ᴀᴜᴅɪᴏ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+
+    # Step B: Stream-copy Muxing without re-encoding
+    await ms.edit(
+        "<blockquote>⚙️ <b>ᴍᴜxɪɴɢ ᴀᴜᴅɪᴏ sᴛʀᴇᴀᴍ...</b> ⚡</blockquote>\n"
+        "╰─ <i>Lossless stream-copy in progress (no re-encoding)...</i>"
+    )
+    # Koyeb pause
+    await asyncio.sleep(1.0)
+
+    success_mux = await _mux_audio_stream_copy(torrent_video, user_media_path, muxed_output_path)
+    if not success_mux:
+        shutil.rmtree(torrent_dir, ignore_errors=True)
+        return await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴀᴜᴅɪᴏ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ.</b></blockquote>")
+
+    final_upload_path = muxed_output_path
+
+    # Step C: Metadata Addition (if enabled)
+    if _bool_metadata:
+        try:
+            await ms.edit(
+                "<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b> ⚡</blockquote>\n"
+                "╰─ <i>Writing metadata tags...</i>"
+            )
+            meta_dir = os.path.join(torrent_dir, "meta_out")
+            os.makedirs(meta_dir, exist_ok=True)
+            meta_output_path = os.path.join(meta_dir, new_filename)
+
+            res_meta = await add_metadata(muxed_output_path, meta_output_path, user_metadata_code, ms)
+            if res_meta and os.path.exists(meta_output_path):
+                final_upload_path = meta_output_path
+        except Exception as e:
+            logger.error(f"Metadata application failed: {e}")
+            final_upload_path = muxed_output_path
+
+    # Step D: Probe media information (duration, width, height)
+    duration, width, height = 0, 1280, 720
+    try:
+        p_w, p_h, p_dur = await probe_video_dimensions_and_duration(final_upload_path)
+        if p_w > 0:
+            width = int(p_w)
+        if p_h > 0:
+            height = int(p_h)
+        if p_dur > 0:
+            duration = int(p_dur)
+    except Exception as e:
+        logger.debug(f"ffprobe extraction fallback: {e}")
+
+    if not duration or not width or not height:
+        try:
+            parser = createParser(final_upload_path)
+            if parser:
+                with parser:
+                    meta_info = extractMetadata(parser)
+                    if meta_info:
+                        if not duration and meta_info.has("duration"):
+                            duration = meta_info.get("duration").seconds
+                        if meta_info.has("width"):
+                            width = int(meta_info.get("width") or 1280)
+                        if meta_info.has("height"):
+                            height = int(meta_info.get("height") or 720)
+        except Exception as e:
+            logger.debug(f"Hachoir extraction skipped: {e}")
+
+    # Step E: Handle Custom Thumbnail / Auto-thumbnail
+    video_cover = None
     try:
         if c_thumb:
             _, _, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
             video_cover = c_thumb or ph_path
         else:
-            _, _, ph_path = await extract_auto_thumbnail(
+            frame_w, frame_h, ph_path = await extract_auto_thumbnail(
                 bot=bot,
                 video_path=final_upload_path,
-                media=None,
+                media=media,
                 duration=duration,
                 user_id=user_id,
-                filename=output_filename,
-                media_type="video",
+                filename=new_filename,
+                media_type=MessageMediaType.VIDEO,
                 upload_type="video",
             )
-            video_cover = get_hd_cover_path(ph_path) or ph_path
+            cover_path = get_hd_cover_path(ph_path)
+            video_cover = cover_path or ph_path
+            if not width and frame_w:
+                width = int(frame_w)
+            if not height and frame_h:
+                height = int(frame_h)
     except Exception as e:
-        logger.warning(f"Thumb extraction error: {e}")
+        logger.warning(f"Thumbnail generation skipped: {e}")
 
-    # Upload final video
-    ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴇʀɢᴇᴅ ᴠɪᴅᴇᴏ...</b> ⚡</blockquote>"
-    upload_size = os.path.getsize(final_upload_path)
-    ms, ul_start = await init_progress_message(ms, ul_header, upload_size)
+    # Step F: Format Caption
+    final_size = os.path.getsize(final_upload_path)
+    if c_caption:
+        try:
+            caption = c_caption.format(
+                filename=f"<b>{new_filename}</b>",
+                filesize=humanbytes(final_size),
+                duration=convert(duration),
+            )
+        except Exception:
+            caption = f"<b>{new_filename}</b>"
+    else:
+        caption = f"<b>{new_filename}</b>"
+
+    # Step G: Upload Video to Telegram
+    ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴜxᴇᴅ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
+    ms, ul_start = await init_progress_message(ms, ul_header, final_size)
 
     try:
         sent_message = await bot.send_video(
             chat_id=user_id,
             video=final_upload_path,
-            file_name=output_filename,
-            caption=f"<b>{output_filename}</b>\n╰─ ⏱️ <code>{convert(duration)}</code> | 📦 <code>{humanbytes(upload_size)}</code>",
+            file_name=new_filename,
+            caption=caption,
             duration=duration,
             width=width,
             height=height,
@@ -291,14 +491,61 @@ async def receive_audio_and_merge(bot: Client, message):
             progress_args=(ul_header, ms, ul_start),
         )
 
-        await ms.delete()
+        # Mirror to BIN_CHANNEL
+        if Config.BIN_CHANNEL:
+            try:
+                bin_caption = (
+                    f"<blockquote>🎬 <b>{new_filename}</b></blockquote>\n"
+                    f"╭─ 👤 <b>ᴜsᴇʀ :</b> {message.chat.first_name} (<code>{user_id}</code>)\n"
+                    f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(final_size)}</code>\n"
+                    f"╰─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{convert(duration)}</code>"
+                )
+                await bot.copy_message(
+                    chat_id=Config.BIN_CHANNEL,
+                    from_chat_id=user_id,
+                    message_id=sent_message.id,
+                    caption=bin_caption,
+                )
+            except Exception as e:
+                logger.error(f"Failed copying to BIN_CHANNEL: {e}")
+
+        # Mirror to Destination Channel
+        if dest_channel:
+            try:
+                await bot.copy_message(
+                    chat_id=int(dest_channel),
+                    from_chat_id=user_id,
+                    message_id=sent_message.id,
+                )
+            except Exception as e:
+                logger.error(f"Failed copying to dest_channel: {e}")
+
+        # Update stats
         await Mythicbotz.increase_rename_count(user_id)
 
+        deletion_msg = await sent_message.reply(
+            "<blockquote>🗑️ <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɴᴏᴛɪᴄᴇ</b></blockquote>\n"
+            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
+        )
+        asyncio.create_task(_delayed_delete(sent_message, deletion_msg, delay=1800.0))
+
+    except StopTransmission:
+        clear_transfer_cancellation(user_id, ms.id)
+        return
     except FloodWait as e:
         await sleep(e.value)
+        return
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ:</b></blockquote>\n<code>{e}</code>")
-    finally:
+        logger.error(f"Upload failed: {e}")
         clear_transfer_cancellation(user_id, ms.id)
-        ram_workspace.cleanup_files(job_dir, ph_path, video_cover)
+        return await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+    finally:
+        # Full workspace cleanup to maintain Koyeb disk quota
+        ram_workspace.cleanup_files(ph_path, cover_path, meta_output_path)
+        if os.path.exists(torrent_dir):
+            shutil.rmtree(torrent_dir, ignore_errors=True)
+        try:
+            await ms.delete()
+            await reply_msg.delete()
+        except Exception:
+            pass
