@@ -558,7 +558,13 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if getattr(s, "is_started", None) and s.is_started.is_set()
                                     ]
                                     if not live_sessions:
-                                        live_sessions = pool if pool else [session]
+                                        await asyncio.sleep(0.2)
+                                        live_sessions = [
+                                            s for s in pool
+                                            if getattr(s, "is_started", None) and s.is_started.is_set()
+                                        ]
+                                        if not live_sessions:
+                                            live_sessions = pool if pool else [session]
                                     current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
 
                                     try:
@@ -597,7 +603,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                             )
                                         await asyncio.sleep(min(0.15 * (1.5 ** _retry), 2.0))
 
-                                if chunk_data is None:
+                                if not chunk_data and offset_cur + chunk_size < file_size:
                                     # Never crash download on transient socket drop: re-queue offset and retry
                                     if offset_cur not in written_offsets:
                                         work.put_nowait(offset_cur)
@@ -620,7 +626,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                                 chunk_len = len(chunk_data) if chunk_data else 0
                                 chunk_data = None
-                                if chunk_len < chunk_size:
+                                # Pacing delay to prevent DC edge socket bursts and BrokenPipe drops
+                                await asyncio.sleep(0.02)
+                                if chunk_len < chunk_size and (offset_cur + chunk_size >= file_size):
                                     return
                             except StopTransmission:
                                 buffer_slots.release()
@@ -968,7 +976,13 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             if getattr(s, "is_started", None) and s.is_started.is_set()
                         ]
                         if not live_sessions:
-                            live_sessions = pool if pool else [session]
+                            await asyncio.sleep(0.2)
+                            live_sessions = [
+                                s for s in pool
+                                if getattr(s, "is_started", None) and s.is_started.is_set()
+                            ]
+                            if not live_sessions:
+                                live_sessions = pool if pool else [session]
                         sess = live_sessions[(sess_idx + attempt) % len(live_sessions)]
                         try:
                             await sess.invoke(
