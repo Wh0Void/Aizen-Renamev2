@@ -9,45 +9,78 @@ import math
 import os
 import re
 import shutil
+import socket
 import sys
 import time
+from hashlib import md5, sha256
 from pathlib import PurePath
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from pyrogram import Client, filters, StopTransmission, raw, utils
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
+from pyrogram import Client, StopTransmission, filters, raw, utils
+from pyrogram.connection.transport.tcp import TCP
 from pyrogram.enums import MessageMediaType
-from pyrogram.errors import FloodWait, FloodPremiumWait
+from pyrogram.errors import CDNFileHashMismatch, FloodPremiumWait, FloodWait, VolumeLocNotFound
+from pyrogram.file_id import FileId, FileType, ThumbnailSource
+from pyrogram.session.session import Session
 from pyrogram.types import ForceReply, Message
 
+from bot.core.cache import ram_workspace
+from config import Config
 from helper.database import Mythicbotz
 from helper.ffmpeg import (
+    add_metadata,
     extract_auto_thumbnail,
     get_cached_user_thumb,
     get_hd_cover_path,
     probe_video_dimensions_and_duration,
-    add_metadata,
 )
 from helper.utils import (
-    progress_for_pyrogram,
-    init_progress_message,
-    convert,
-    humanbytes,
     add_prefix_suffix,
     clear_transfer_cancellation,
+    convert,
+    humanbytes,
+    init_progress_message,
+    progress_for_pyrogram,
 )
-from bot.core.cache import ram_workspace
-from config import Config
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================================================================
-# PART 1: HIGH-SPEED LOCK-FREE MULTI-SOCKET MTPROTO ACCELERATION ENGINE
+# SECTION 1: TURBO MTPROTO MULTI-SOCKET ACCELERATION ENGINE
 # =========================================================================
 
 CHUNK_SIZE_512KB: int = 512 * 1024
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024
+MIN_MEDIA_POOL_SIZE: int = 16
+MAX_MEDIA_POOL_SIZE: int = 48
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "24"))
 _MTPROTO_PATCHED: bool = False
+
+if sys.platform == "win32":
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
+def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> Tuple[int, int]:
+    """Calculate optimal media socket pool size and worker concurrency based on file size."""
+    mb = file_size_bytes / (1024 * 1024)
+    if is_upload:
+        pool_size = 16 if mb <= 200 else 24
+        workers = 32 if mb <= 200 else 48
+        part_size = CHUNK_SIZE_512KB
+    else:
+        pool_size = 16
+        workers = 32
+        part_size = DOWNLOAD_CHUNK_1MB
+
+    total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
+    actual_pool = min(pool_size, total_parts)
+    actual_workers = min(workers, total_parts * 2 if is_upload else total_parts)
+    return actual_pool, actual_workers
 
 
 class FastCryptoEngine:
@@ -75,7 +108,7 @@ class FastCryptoEngine:
             self._pycryptodome_aes = AES
             self.backend_name = "pycryptodome (C AES-NI)"
         except ImportError:
-            self.backend_name = "pyrogram-fallback"
+            self.backend_name = "fallback"
 
     def ige256_encrypt(self, data: bytes, key: bytes, iv: bytes) -> bytes:
         if not data:
@@ -99,18 +132,17 @@ class FastCryptoEngine:
         return bytes(aes.ige256_decrypt(data, key, iv))
 
 
-def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
+def _patch_turbo_mtproto_engine(target_pool: int = DEFAULT_MEDIA_POOL_SIZE) -> None:
     global _MTPROTO_PATCHED
     if _MTPROTO_PATCHED:
         return
 
     try:
-        import socket
-        from pyrogram.session.session import Session  # type: ignore
         from pyrogram.client import ReadAhead, write_at  # type: ignore
+        from pyrogram.crypto import aes  # type: ignore
         import pyrogram.methods.advanced.save_file as save_file_mod  # type: ignore
-        from pyrogram.connection.transport.tcp import TCP  # type: ignore
 
+        # Linux/Docker TCP keepalive optimization
         if not hasattr(TCP, "_turbo_patched_connect"):
             _orig_tcp_connect = TCP.connect
 
@@ -141,16 +173,14 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
         save_file_mod.POOL_SIZE = target_pool
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
 
-        # Turbo Multi-Session Pool Creator
-        if not hasattr(Client, "_wzgram_orig_get_media_session_pool"):
-            Client._wzgram_orig_get_media_session_pool = Client._get_media_session_pool
-
+        # Parallel TCP Session Pool Creator
+        if not hasattr(Client, "_turbo_get_media_session_pool_patched"):
             async def _turbo_get_media_session_pool(self: Any, dc_id: int, n: int) -> list:
                 lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
                 async with lock:
                     pool = []
                     for session in self.media_session_pools.get(dc_id, []):
-                        if session.is_started.is_set() or session.is_restarting:
+                        if getattr(session, "is_started", None) and session.is_started.is_set():
                             pool.append(session)
                         else:
                             utils.run_in_background(session.stop(), self.loop)
@@ -185,12 +215,13 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
                     return list(pool)
 
             Client._get_media_session_pool = _turbo_get_media_session_pool
+            Client._turbo_get_media_session_pool_patched = True
 
-        # Lock-Free Multi-Socket Turbo Upload Implementation
+        # High-Speed Lock-Free Save File Patch
         async def _stop_workers(queue: asyncio.Queue, workers: list) -> list:
             for _ in workers:
                 try:
-                    await asyncio.wait_for(queue.put(None), 5.0)
+                    await asyncio.wait_for(queue.put(None), 4.0)
                 except asyncio.TimeoutError:
                     break
             for t in workers:
@@ -206,8 +237,6 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
             progress: Optional[Callable] = None,
             progress_args: tuple = (),
         ):
-            from hashlib import md5
-
             async with getattr(self, "save_file_semaphore", asyncio.Semaphore(128)):
                 if path is None:
                     return None
@@ -232,7 +261,9 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
 
                 file_total_parts = int(math.ceil(file_size / part_size))
                 is_big = file_size > 10 * 1024 * 1024
-                ul_pool_size = min(target_pool, file_total_parts) if is_big else 1
+                dyn_ul_pool, dyn_ul_workers = compute_dynamic_pool_size(file_size, is_upload=True)
+                ul_pool_size = min(dyn_ul_pool, min(target_pool, file_total_parts)) if is_big else 1
+
                 file_id = file_id or self.rnd_id()
                 md5_sum = md5() if not is_big else None
 
@@ -242,7 +273,7 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
                     pool = [await self.get_session(dc_id, is_media=True)]
 
                 n_sessions = len(pool)
-                n_workers = min(48, min(n_sessions * 2, file_total_parts))
+                n_workers = min(dyn_ul_workers, min(n_sessions * 2, file_total_parts))
                 queue = asyncio.Queue(n_workers * 2)
 
                 read_ahead_budget = getattr(self, "read_ahead_slots", None)
@@ -309,7 +340,7 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
                         else:
                             await self.loop.run_in_executor(self.executor, func)
                     except Exception as e:
-                        logger.debug("Upload progress error: %s", e)
+                        logger.debug("Upload progress callback error: %s", e)
 
                 async def _producer() -> None:
                     nonlocal file_part
@@ -375,13 +406,13 @@ def _patch_turbo_mtproto_engine(target_pool: int = 24) -> None:
         save_file_mod.SaveFile.save_file = _turbo_save_file
         Client.save_file = _turbo_save_file
         _MTPROTO_PATCHED = True
-        logger.info("Installed Lock-Free Multi-Socket Turbo MTProto Engine.")
+        logger.info("Applied Lock-Free Multi-Socket Turbo Engine (pool=%d).", target_pool)
     except Exception as exc:
-        logger.warning("Could not patch Turbo MTProto engine: %s", exc)
+        logger.warning("Turbo MTProto engine patch skipped: %s", exc)
 
 
 def auto_boost_client(client: Client) -> None:
-    """Preps Client instance with high concurrency primitives and socket hooks."""
+    """Pre-configures client concurrency gates and applies MTProto turbo hooks."""
     try:
         client._session_creation_gate = asyncio.Semaphore(16)
         client.get_file_semaphore = asyncio.Semaphore(128)
@@ -392,14 +423,14 @@ def auto_boost_client(client: Client) -> None:
 
 
 # =========================================================================
-# PART 2: ANIMATED PROGRESS BAR & ARIA2 TELEMETRY PARSER
+# SECTION 2: ANIMATED PROGRESS BAR & TELEMETRY PARSER
 # =========================================================================
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def render_animated_bar(percentage: float, length: int = 10, frame_idx: int = 0) -> str:
-    """Renders a smooth animated progress bar with a spinning pulse head."""
+    """Renders a smooth animated progress bar with rotating indicator pulses."""
     clamped_pct = max(0.0, min(100.0, percentage))
     filled_len = int(round((clamped_pct / 100.0) * length))
     spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
@@ -414,7 +445,7 @@ def render_animated_bar(percentage: float, length: int = 10, frame_idx: int = 0)
 
 
 # =========================================================================
-# PART 3: RE-ENCODING-FREE TORRENT AUDIO MUX ENGINE
+# SECTION 3: RE-ENCODING-FREE TORRENT AUDIO MUX ENGINE
 # =========================================================================
 
 ACTIVE_TORRENT_TASKS: Dict[int, Dict[str, Any]] = {}
@@ -447,6 +478,10 @@ def _find_primary_video(target_dir: str) -> Optional[str]:
 
 
 async def _download_torrent_aria2(torrent_source: str, download_dir: str, status_msg: Message) -> bool:
+    """
+    Downloads torrent with aria2c configured for maximum peer saturation.
+    Displays dynamic speed, animated progress bar, seeds, and leechers.
+    """
     if not shutil.which("aria2c"):
         raise RuntimeError("`aria2c` binary not found in PATH.")
 
@@ -466,6 +501,7 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
         "--enable-peer-exchange=true",
         "--bt-enable-lpd=true",
         "--bt-max-peers=128",
+        "--bt-request-peer-speed-limit=100M",
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
         torrent_source,
@@ -479,10 +515,6 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
 
     last_update = time.time()
     frame_idx = 0
-    # Aria2 stdout regex: captures progress, speed, ETA, connection/peer count, and seed ratio
-    aria_regex = re.compile(
-        r"\((\d+)\%\).*?DL:([0-9.]+[A-Za-z]+)(?:.*?ETA:([0-9A-Za-z]+))?(?:.*?CN:(\d+))?(?:.*?SD:(\d+))?"
-    )
 
     while True:
         line = await process.stdout.readline()
@@ -491,26 +523,33 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
         decoded = line.decode("utf-8", errors="ignore").strip()
 
         now = time.time()
-        if now - last_update > 4.0:
-            match = aria_regex.search(decoded)
-            if match:
-                pct_str, speed, eta, cn, sd = match.groups()
-                pct = float(pct_str)
-                bar = render_animated_bar(pct, length=12, frame_idx=frame_idx)
-                frame_idx += 1
-                eta = eta or "N/A"
-                peers = cn or "0"
-                seeds = sd or "0"
+        # Throttled to 4.0s to completely avoid Telegram FloodWait
+        if now - last_update >= 4.0:
+            pct_m = re.search(r"\((\d+(?:\.\d+)?)\%\)", decoded)
+            dl_m = re.search(r"DL:([0-9.]+[A-Za-z]+)", decoded)
+            eta_m = re.search(r"ETA:([0-9A-Za-z]+)", decoded)
+            cn_m = re.search(r"CN:(\d+)", decoded)
+            sd_m = re.search(r"SD:(\d+)", decoded)
 
-                text = (
+            if pct_m and dl_m:
+                pct = float(pct_m.group(1))
+                speed = dl_m.group(1)
+                eta = eta_m.group(1) if eta_m else "N/A"
+                leechers = cn_m.group(1) if cn_m else "0"
+                seeds = sd_m.group(1) if sd_m else "0"
+
+                bar = render_animated_bar(pct, length=10, frame_idx=frame_idx)
+                frame_idx += 1
+
+                progress_text = (
                     "<blockquote>⚡ <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ...</b></blockquote>\n"
-                    f"╭─ 📊 <b>ᴘʀᴏɢʀᴇss :</b> <code>{bar} {pct_str}%</code>\n"
+                    f"╭─ 📊 <b>ᴘʀᴏɢʀᴇss :</b> <code>{bar} {pct:.1f}%</code>\n"
                     f"├─ 🚀 <b>sᴘᴇᴇᴅ :</b> <code>{speed}/s</code>\n"
                     f"├─ ⏱️ <b>ᴇᴛᴀ :</b> <code>{eta}</code>\n"
-                    f"╰─ 👥 <b>sᴇᴇᴅs :</b> <code>{seeds}</code> | <b>ᴘᴇᴇʀs :</b> <code>{peers}</code>"
+                    f"╰─ 👥 <b>sᴇᴇᴅs :</b> <code>{seeds}</code> | <b>ʟᴇᴇᴄʜᴇʀs :</b> <code>{leechers}</code>"
                 )
                 try:
-                    await status_msg.edit(text)
+                    await status_msg.edit(progress_text)
                     last_update = now
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value)
@@ -524,6 +563,7 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
 
 
 async def _mux_audio_stream_copy(video_input: str, audio_input: str, output_path: str) -> bool:
+    """Stream-copy muxing with FFmpeg using ZERO re-encoding to preserve CPU."""
     cmd = [
         "ffmpeg",
         "-y",
@@ -554,7 +594,7 @@ async def _mux_audio_stream_copy(video_input: str, audio_input: str, output_path
 
 
 # =========================================================================
-# PART 4: PYROGRAM BOT HANDLERS
+# SECTION 4: PYROGRAM BOT HANDLERS
 # =========================================================================
 
 @Client.on_message(
@@ -587,7 +627,7 @@ async def torrent_start(client: Client, message: Message):
     if not torrent_source:
         return await message.reply_text(
             "<blockquote>⚠️ <b>ᴍɪssɪɴɢ ᴛᴏʀʀᴇɴᴛ sᴏᴜʀᴄᴇ</b></blockquote>\n\n"
-            "╰─ <i>Send magnet or .torrent link:</i>\n"
+            "╰─ <i>Send the command along with a magnet link or .torrent URL:</i>\n"
             "<code>/tmux magnet:?xt=urn:btih:...</code>",
             reply_to_message_id=message.id,
         )
@@ -627,7 +667,7 @@ async def torrent_start(client: Client, message: Message):
         "<blockquote>🎵 <b>sᴇɴᴅ ᴀᴜᴅɪᴏ / ᴠɪᴅᴇᴏ ᴛᴏ sᴇᴛ ᴀs ᴅᴇꜰᴀᴜʟᴛ</b></blockquote>\n\n"
         f"╭─ 🎬 <b>ᴛᴏʀʀᴇɴᴛ ᴠɪᴅᴇᴏ :</b> <code>{vid_name}</code>\n"
         f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{vid_size}</code>\n"
-        "╰─ <i>Reply to this prompt with the Audio or Video track you want to inject as default.</i>",
+        "╰─ <i>Reply to this message with an Audio or Video file whose audio track you want to inject as default.</i>",
         reply_markup=ForceReply(True),
     )
 
@@ -652,7 +692,7 @@ async def torrent_start(client: Client, message: Message):
             if os.path.exists(work_dir):
                 shutil.rmtree(work_dir, ignore_errors=True)
             try:
-                await prompt.edit("<blockquote>⏱️ <b>sᴇssɪᴏɴ ᴇxᴘɪʀᴇᴅ.</b></blockquote>")
+                await prompt.edit("<blockquote>⏱️ <b>ᴛᴏʀʀᴇɴᴛ ᴍᴜxɪɴɢ sᴇssɪᴏɴ ᴇxᴘɪʀᴇᴅ.</b></blockquote>")
             except Exception:
                 pass
 
@@ -684,7 +724,7 @@ async def handle_mux_reply(bot: Client, message: Message):
     )
 
     if not is_valid_media:
-        return await message.reply_text("<blockquote>⚠️ <b>ɴᴏ ᴠᴀʟɪᴅ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ sᴛʀᴇᴀᴍ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        return await message.reply_text("<blockquote>⚠️ <b>ᴛʜɪs ꜰɪʟᴇ ᴅᴏᴇs ɴᴏᴛ ᴄᴏɴᴛᴀɪɴ ᴀ ʀᴇᴄᴏɢɴɪᴢᴇᴅ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ sᴛʀᴇᴀᴍ.</b></blockquote>")
 
     ACTIVE_TORRENT_TASKS.pop(user_id, None)
 
@@ -711,11 +751,12 @@ async def handle_mux_reply(bot: Client, message: Message):
     muxed_output_path = os.path.join(torrent_dir, f"muxed_{new_filename}")
     meta_output_path, ph_path, cover_path = None, None, None
 
-    # Step A: Download Audio Source via Multi-Socket Engine
+    # Step A: Download Audio/Video Replacement Track
     dl_header = "<blockquote>📥 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ʏᴏᴜʀ ᴀᴜᴅɪᴏ...</b> ⚡</blockquote>"
     ms, dl_start = await init_progress_message(message, dl_header, getattr(media, "file_size", 0) or 0)
 
     dl_client = getattr(bot, "helper_client", None) or getattr(bot, "premium_client", None) or bot
+    auto_boost_client(dl_client)
     try:
         user_media_path = await dl_client.download_media(
             message=message,
@@ -728,7 +769,7 @@ async def handle_mux_reply(bot: Client, message: Message):
         shutil.rmtree(torrent_dir, ignore_errors=True)
         return await ms.edit(f"<blockquote>❌ <b>ᴀᴜᴅɪᴏ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
 
-    # Step B: Zero-encoding Muxing
+    # Step B: Zero-encoding Stream Copy Muxing
     await ms.edit(
         "<blockquote>⚙️ <b>ᴍᴜxɪɴɢ ᴀᴜᴅɪᴏ sᴛʀᴇᴀᴍ...</b> ⚡</blockquote>\n"
         "╰─ <i>Lossless stream-copy in progress (zero re-encoding)...</i>"
@@ -738,24 +779,29 @@ async def handle_mux_reply(bot: Client, message: Message):
     success_mux = await _mux_audio_stream_copy(torrent_video, user_media_path, muxed_output_path)
     if not success_mux:
         shutil.rmtree(torrent_dir, ignore_errors=True)
-        return await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ.</b></blockquote>")
+        return await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴀᴜᴅɪᴏ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ.</b></blockquote>")
 
     final_upload_path = muxed_output_path
 
-    # Step C: Metadata Addition
+    # Step C: Metadata Application
     if _bool_metadata:
         try:
-            await ms.edit("<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b> ⚡</blockquote>")
+            await ms.edit(
+                "<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b> ⚡</blockquote>\n"
+                "╰─ <i>Writing metadata tags...</i>"
+            )
             meta_dir = os.path.join(torrent_dir, "meta_out")
             os.makedirs(meta_dir, exist_ok=True)
             meta_output_path = os.path.join(meta_dir, new_filename)
+
             res_meta = await add_metadata(muxed_output_path, meta_output_path, user_metadata_code, ms)
             if res_meta and os.path.exists(meta_output_path):
                 final_upload_path = meta_output_path
         except Exception as e:
-            logger.error("Metadata error: %s", e)
+            logger.error("Metadata application failed: %s", e)
+            final_upload_path = muxed_output_path
 
-    # Step D: Probe Media Dimensions
+    # Step D: Media Probing (Duration, Width, Height)
     duration, width, height = 0, 1280, 720
     try:
         p_w, p_h, p_dur = await probe_video_dimensions_and_duration(final_upload_path)
@@ -767,6 +813,22 @@ async def handle_mux_reply(bot: Client, message: Message):
             duration = int(p_dur)
     except Exception:
         pass
+
+    if not duration or not width or not height:
+        try:
+            parser = createParser(final_upload_path)
+            if parser:
+                with parser:
+                    meta_info = extractMetadata(parser)
+                    if meta_info:
+                        if not duration and meta_info.has("duration"):
+                            duration = meta_info.get("duration").seconds
+                        if meta_info.has("width"):
+                            width = int(meta_info.get("width") or 1280)
+                        if meta_info.has("height"):
+                            height = int(meta_info.get("height") or 720)
+        except Exception:
+            pass
 
     # Step E: Thumbnail Generation
     video_cover = None
@@ -792,9 +854,9 @@ async def handle_mux_reply(bot: Client, message: Message):
             if not height and frame_h:
                 height = int(frame_h)
     except Exception as e:
-        logger.warning("Thumbnail skipping: %s", e)
+        logger.warning("Thumbnail extraction skipped: %s", e)
 
-    # Step F: Caption Preparation
+    # Step F: Caption Construction
     final_size = os.path.getsize(final_upload_path)
     if c_caption:
         try:
@@ -808,7 +870,7 @@ async def handle_mux_reply(bot: Client, message: Message):
     else:
         caption = f"<b>{new_filename}</b>"
 
-    # Step G: Accelerated Multi-Socket Upload (24 parallel sockets)
+    # Step G: Multi-Socket Turbo Upload
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴜxᴇᴅ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
     ms, ul_start = await init_progress_message(ms, ul_header, final_size)
 
@@ -843,7 +905,7 @@ async def handle_mux_reply(bot: Client, message: Message):
                     caption=bin_caption,
                 )
             except Exception as e:
-                logger.error("Failed BIN_CHANNEL mirror: %s", e)
+                logger.error("Failed copying to BIN_CHANNEL: %s", e)
 
         if dest_channel:
             try:
@@ -853,13 +915,13 @@ async def handle_mux_reply(bot: Client, message: Message):
                     message_id=sent_message.id,
                 )
             except Exception as e:
-                logger.error("Failed destination channel mirror: %s", e)
+                logger.error("Failed copying to dest_channel: %s", e)
 
         await Mythicbotz.increase_rename_count(user_id)
 
         deletion_msg = await sent_message.reply(
             "<blockquote>🗑️ <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɴᴏᴛɪᴄᴇ</b></blockquote>\n"
-            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>.</b>"
+            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
         )
         asyncio.create_task(_delayed_delete(sent_message, deletion_msg, delay=1800.0))
 
@@ -870,7 +932,7 @@ async def handle_mux_reply(bot: Client, message: Message):
         await asyncio.sleep(e.value)
         return
     except Exception as e:
-        logger.error("Upload failure: %s", e)
+        logger.error("Upload failed: %s", e)
         clear_transfer_cancellation(user_id, ms.id)
         return await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
     finally:
