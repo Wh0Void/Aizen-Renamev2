@@ -1,7 +1,13 @@
 from pyrogram import Client, filters, StopTransmission
 from pyrogram.enums import MessageMediaType
 from pyrogram.errors import FloodWait
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from pyrogram.types import (
+    Message,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply,
+    CallbackQuery,
+)
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from helper.ffmpeg import (
