@@ -7,7 +7,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ParseMode
 from helper.database import Mythicbotz
-from helper.utils import refresh_progress_message
+from helper.utils import refresh_progress_message, cancel_transfer
 from config import Config, Txt
 
 
@@ -108,7 +108,7 @@ async def help_cmd(client: Client, message: Message):
 
 @Client.on_callback_query(
     filters.regex(
-        r"^(start|help|meta|prefix|suffix|caption|thumbnail|about|donate|leaderboard|refresh_progress|close|sendAlert_|noAlert_|sendUnbanAlert_|NoUnbanAlert_)"
+        r"^(start|help|meta|prefix|suffix|caption|thumbnail|about|donate|leaderboard|refresh_progress|cancel_transfer|close|sendAlert_|noAlert_|sendUnbanAlert_|NoUnbanAlert_)"
     )
 )
 async def cb_handler(client: Client, query: CallbackQuery):
@@ -268,7 +268,17 @@ async def cb_handler(client: Client, query: CallbackQuery):
     elif data == "refresh_progress":
         await refresh_progress_message(query)
 
-    elif data == "close":
+    elif data in ("cancel_transfer", "close"):
+        try:
+            chat_id = query.message.chat.id
+            msg_id = query.message.id
+            cancel_transfer(chat_id, msg_id)
+        except Exception:
+            pass
+        try:
+            await query.answer("🛑 ᴄᴀɴᴄᴇʟʟɪɴɢ ᴛʀᴀɴsꜰᴇʀ...", show_alert=False)
+        except Exception:
+            pass
         try:
             await query.message.delete()
             if query.message.reply_to_message:

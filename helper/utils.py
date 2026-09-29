@@ -8,15 +8,31 @@ import shutil
 
 _PROGRESS_LAST_EDIT = {}
 _PROGRESS_STATE = {}
+_CANCEL_TRANSFERS = {}
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _CANCEL_MARKUP = InlineKeyboardMarkup(
     [
         [
             InlineKeyboardButton("🔄 ʀᴇꜰʀᴇsʜ", callback_data="refresh_progress"),
-            InlineKeyboardButton("✖️ ᴄʟᴏsᴇ", callback_data="close"),
+            InlineKeyboardButton("✖️ ᴄᴀɴᴄᴇʟ", callback_data="cancel_transfer"),
         ]
     ]
 )
+
+
+def cancel_transfer(chat_id: int, message_id: int) -> None:
+    """Flag an active download/upload transfer as cancelled by user."""
+    _CANCEL_TRANSFERS[(chat_id, message_id)] = True
+
+
+def is_transfer_cancelled(chat_id: int, message_id: int) -> bool:
+    """Check if the given message transfer was cancelled."""
+    return _CANCEL_TRANSFERS.get((chat_id, message_id), False)
+
+
+def clear_transfer_cancellation(chat_id: int, message_id: int) -> None:
+    """Clear cancellation status when a job finishes or is cleaned up."""
+    _CANCEL_TRANSFERS.pop((chat_id, message_id), None)
 
 
 def _get_msg_key(message):
@@ -189,6 +205,13 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
 
 
 async def progress_for_pyrogram(current, total, ud_type, message, start):
+    from pyrogram import StopTransmission
+
+    chat_id = getattr(getattr(message, "chat", None), "id", 0)
+    msg_id = getattr(message, "id", id(message))
+    if is_transfer_cancelled(chat_id, msg_id):
+        raise StopTransmission
+
     now = time.time()
     msg_key = _get_msg_key(message)
     total_safe = max(int(total or 0), 1)

@@ -1,4 +1,4 @@
-from pyrogram import Client, filters
+from pyrogram import Client, filters, StopTransmission
 from pyrogram.enums import MessageMediaType
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
@@ -18,6 +18,7 @@ from helper.utils import (
     convert,
     humanbytes,
     add_prefix_suffix,
+    clear_transfer_cancellation,
 )
 from helper.database import Mythicbotz
 from bot.core.cache import ram_workspace
@@ -213,14 +214,23 @@ async def doc(bot, update):
             progress=progress_for_pyrogram,
             progress_args=(dl_header, ms, dl_start),
         )
+    except StopTransmission:
+        ram_workspace.cleanup_files(file_path)
+        clear_transfer_cancellation(user_id, ms.id)
+        return
     except FloodWait as e:
         await sleep(e.value)
-        path = await dl_client.download_media(
-            message=file,
-            file_name=file_path,
-            progress=progress_for_pyrogram,
-            progress_args=(dl_header, ms, time.time()),
-        )
+        try:
+            path = await dl_client.download_media(
+                message=file,
+                file_name=file_path,
+                progress=progress_for_pyrogram,
+                progress_args=(dl_header, ms, time.time()),
+            )
+        except StopTransmission:
+            ram_workspace.cleanup_files(file_path)
+            clear_transfer_cancellation(user_id, ms.id)
+            return
     except Exception as e:
         logger.warning(f"Download initial attempt encountered error: {e}. Retrying with fresh session...")
         try:
@@ -231,10 +241,20 @@ async def doc(bot, update):
                 progress=progress_for_pyrogram,
                 progress_args=(dl_header, ms, time.time()),
             )
+        except StopTransmission:
+            ram_workspace.cleanup_files(file_path)
+            clear_transfer_cancellation(user_id, ms.id)
+            return
         except Exception as e2:
             logger.error(f"Download retry failed: {e2}")
             ram_workspace.cleanup_files(file_path)
+            clear_transfer_cancellation(user_id, ms.id)
             return await ms.edit(f"<blockquote>❌ <b>ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ</b></blockquote>\n╰─ <code>{e2}</code>")
+
+    if not path or not os.path.exists(path):
+        ram_workspace.cleanup_files(file_path)
+        clear_transfer_cancellation(user_id, ms.id)
+        return
 
     # Display clean processing status card between Download and Upload
     try:
@@ -439,11 +459,15 @@ async def doc(bot, update):
             "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
         )
 
+    except StopTransmission:
+        clear_transfer_cancellation(user_id, ms.id)
+        return
     except FloodWait as e:
         await sleep(e.value)
         await ms.edit(f"<blockquote>⏳ <b>ꜰʟᴏᴏᴅᴡᴀɪᴛ :</b> <code>ʀᴇᴛʀʏɪɴɢ ɪɴ {e.value}s...</code></blockquote>")
         return await doc(bot, update)
     except Exception as e:
+        clear_transfer_cancellation(user_id, ms.id)
         logger.error(f"Upload error: {e}")
         return await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ</b></blockquote>\n╰─ <code>{e}</code>")
 
