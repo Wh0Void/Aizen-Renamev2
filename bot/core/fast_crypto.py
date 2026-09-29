@@ -85,23 +85,23 @@ def configure_wzgram_environment(
     clamped_pool = max(MIN_MEDIA_POOL_SIZE, min(MAX_MEDIA_POOL_SIZE, int(pool_size)))
 
     defaults = {
-        "WZGRAM_WORKERS": "512",
-        "WZGRAM_CRYPTO_WORKERS": "128",
-        "WZGRAM_HANDLER_WORKERS": "256",
+        "WZGRAM_WORKERS": "1024",
+        "WZGRAM_CRYPTO_WORKERS": "256",
+        "WZGRAM_HANDLER_WORKERS": "512",
         "WZGRAM_MAX_READ_AHEAD": str(max_read_ahead),
-        "WZGRAM_MAX_INFLIGHT_MEDIA": str(max_inflight_media),
-        "WZGRAM_MAX_INFLIGHT_PACKETS": str(max_inflight_packets),
+        "WZGRAM_MAX_INFLIGHT_MEDIA": "128",
+        "WZGRAM_MAX_INFLIGHT_PACKETS": "512",
         "WZGRAM_INLINE_CRYPTO_MAX": str(inline_crypto_max),
         "WZGRAM_MEDIA_TIMEOUT": "120",
         "WZGRAM_MEDIA_SESSION_IDLE_TIMEOUT": str(media_idle_timeout),
         "WZGRAM_TCP_TIMEOUT": "30",
-        "WZGRAM_PEER_CACHE": "32768",
-        "WZGRAM_MAX_LISTENERS": "8000",
+        "WZGRAM_PEER_CACHE": "65536",
+        "WZGRAM_MAX_LISTENERS": "16000",
         "WZGRAM_MEDIA_POOL_SIZE": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_BOT": str(clamped_pool),
         "WZGRAM_UPLOAD_POOL_USER": str(clamped_pool),
-        "WZGRAM_UPLOAD_RATE_BOT": "2000",
-        "WZGRAM_UPLOAD_RATE_USER": "2000",
+        "WZGRAM_UPLOAD_RATE_BOT": "4000",
+        "WZGRAM_UPLOAD_RATE_USER": "4000",
         "WZGRAM_SOCKET_BUFFER": "0",  # 0 enables Linux kernel TCP window dynamic autotuning
     }
 
@@ -256,6 +256,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             FloodPremiumWait,
             FloodWait,
             VolumeLocNotFound,
+            ServiceUnavailable,
+            InternalServerError,
+            BadMsgNotification,
         )
         import socket
         from pyrogram.file_id import FileId, FileType, ThumbnailSource  # type: ignore
@@ -364,10 +367,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                 current = 0
                 total = abs(limit) or (1 << 31) - 1
                 # ── 1 MiB MTProto Download Chunks with Dedicated Socket Pipelining ─────
-                # 1 MiB chunks double bandwidth-delay product saturation. With 16 dedicated
-                # sockets and 2 pipelined workers per socket (32 in-flight max), Telegram DC
-                # storage queues remain 100% stable with ZERO [-503 Timeout] errors.
-                chunk_size = DOWNLOAD_CHUNK_1MB  # 1 MiB (1048576 bytes)
+                # Dynamic adaptive download chunk size: 512 KB for small files (<=100MB) to minimize latency,
+                # 1 MiB for large files (>100MB up to 2GB) to maximize TCP throughput.
+                chunk_size = 512 * 1024 if (0 < file_size <= 100 * 1024 * 1024) else DOWNLOAD_CHUNK_1MB
                 offset_bytes = abs(offset) * chunk_size
                 _last_progress_time = 0.0
 
@@ -595,6 +597,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     except (FloodWait, FloodPremiumWait) as fw:
                                         fw_sec = min(getattr(fw, "value", 1) or 1, 10)
                                         await asyncio.sleep(fw_sec)
+                                    except (ServiceUnavailable, InternalServerError, BadMsgNotification) as err:
+                                        logger.debug("Download 503/transient server error: %s", err)
+                                        await asyncio.sleep(0.3 * (1.5 ** min(_retry, 3)))
                                     except asyncio.CancelledError:
                                         if offset_cur not in written_offsets:
                                             work.put_nowait(offset_cur)
@@ -864,6 +869,12 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     needed = n - len(pool)
                     if needed > 0:
                         media = await self.get_session(dc_id, is_media=True)
+                        server_addr = getattr(media, "server_address", None)
+                        if not server_addr and getattr(media, "connection", None) and getattr(media.connection, "address", None):
+                            server_addr = media.connection.address[0]
+                        main_sess = getattr(self, "session", None) or media
+                        time_offset = getattr(main_sess, "time_offset", 0) or getattr(media, "time_offset", 0)
+
                         PORTS = [443, 80, 5222]
                         while needed > 0:
                             chunk = min(needed, 16)
@@ -873,15 +884,19 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 self._session_creation_gate = gate
                             async with gate:
                                 start_idx = len(pool)
-                                pool.extend(await asyncio.gather(*(
+                                created = await asyncio.gather(*(
                                     self._make_media_session(
                                         dc_id,
                                         media.auth_key,
-                                        media.server_address,
+                                        server_addr,
                                         PORTS[(start_idx + i) % len(PORTS)],
                                     )
                                     for i in range(chunk)
-                                )))
+                                ))
+                                for s in created:
+                                    if hasattr(s, "time_offset"):
+                                        s.time_offset = time_offset
+                                pool.extend(created)
                             needed -= chunk
                     self.media_session_pools[dc_id] = pool
                     return list(pool)
@@ -1000,6 +1015,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         except (FloodWait, FloodPremiumWait) as fw:
                             fw_sec = min(getattr(fw, "value", 1) or 1, 10)
                             await asyncio.sleep(fw_sec)
+                        except (ServiceUnavailable, InternalServerError, BadMsgNotification) as err:
+                            logger.debug("Upload transient 503/server error (attempt %d): %s", attempt, err)
+                            await asyncio.sleep(0.3 * (1.5 ** min(attempt, 3)))
                         except asyncio.CancelledError:
                             return
                         except Exception as exc:
