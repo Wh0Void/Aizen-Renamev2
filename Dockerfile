@@ -4,15 +4,15 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MALLOC_ARENA_MAX=2 \
-    MEDIA_POOL_SIZE=6 \
-    RAM_CACHE_MAX_MB=40 \
-    WZGRAM_MAX_READ_AHEAD=24
+    MEDIA_POOL_SIZE=36 \
+    RAM_CACHE_MAX_MB=128 \
+    WZGRAM_MAX_READ_AHEAD=256
 
 WORKDIR /app
 
-# Install FFmpeg with minimal footprint
+# Install FFmpeg & Git with minimal footprint
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg git && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/
