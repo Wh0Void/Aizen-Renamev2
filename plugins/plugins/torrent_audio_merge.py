@@ -734,18 +734,21 @@ async def cancel_tmux_callback(bot: Client, query: CallbackQuery):
         pass
 
 
-@Client.on_message(filters.private & filters.reply & (filters.audio | filters.video | filters.document))
-async def handle_mux_reply(bot: Client, message: Message):
+@Client.on_message(filters.private & (filters.audio | filters.video | filters.document), group=-2)
+async def handle_mux_incoming_file(bot: Client, message: Message):
     auto_boost_client(bot)
     user_id = int(message.from_user.id)
-    reply_msg = message.reply_to_message
-
-    if not reply_msg:
-        return
 
     task = ACTIVE_TORRENT_TASKS.get(user_id)
-    if not task or task.get("prompt_id") != reply_msg.id:
+    if not task:
         return
+
+    prompt_id = task.get("prompt_id")
+    if prompt_id:
+        try:
+            await bot.delete_messages(chat_id=user_id, message_ids=prompt_id)
+        except Exception:
+            pass
 
     media = getattr(message, message.media.value) if message.media else None
     if not media:
@@ -762,6 +765,10 @@ async def handle_mux_reply(bot: Client, message: Message):
         return await message.reply_text("<blockquote>⚠️ <b>ᴛʜɪs ꜰɪʟᴇ ᴅᴏᴇs ɴᴏᴛ ᴄᴏɴᴛᴀɪɴ ᴀ ʀᴇᴄᴏɢɴɪᴢᴇᴅ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ sᴛʀᴇᴀᴍ.</b></blockquote>")
 
     ACTIVE_TORRENT_TASKS.pop(user_id, None)
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
 
     torrent_video = task["torrent_video"]
     torrent_dir = task["torrent_dir"]

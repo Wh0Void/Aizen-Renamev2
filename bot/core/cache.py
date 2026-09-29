@@ -365,3 +365,5 @@ class CacheManager:
 
 ram_workspace = SmartRAMWorkspace()
 cache_manager = CacheManager()
+LAST_USER_MEDIA: Dict[int, Any] = {}
+

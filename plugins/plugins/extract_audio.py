@@ -141,34 +141,19 @@ async def extract_audio_from_video(
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
-@Client.on_message(
-    filters.private
-    & (
-        filters.command(["extract_audio", "extract", "ea", "audio_extract"])
-    )
-)
-async def extract_audio_command(client: Client, message: Message):
-    user_id = int(message.from_user.id)
+async def show_extract_audio_menu(bot: Client, message_or_query: Any, target_msg: Message):
+    user_id = getattr(message_or_query.from_user, "id", message_or_query.chat.id) if getattr(message_or_query, "from_user", None) else getattr(message_or_query, "chat", getattr(message_or_query, "message", None)).id
+    media = getattr(target_msg, target_msg.media.value) if target_msg and getattr(target_msg, "media", None) else None
+    if not media:
+        if hasattr(message_or_query, "reply_text"):
+            return await message_or_query.reply_text("<blockquote>❌ <b>ɴᴏ ᴠᴀʟɪᴅ ᴍᴇᴅɪᴀ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        elif hasattr(message_or_query, "message") and hasattr(message_or_query.message, "edit"):
+            return await message_or_query.message.edit("<blockquote>❌ <b>ɴᴏ ᴠᴀʟɪᴅ ᴍᴇᴅɪᴀ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        return
 
-    if await Mythicbotz.is_banned(user_id):
-        return await message.reply(
-            "<blockquote>🚫 <b>ᴀᴄᴄᴇss ᴅᴇɴɪᴇᴅ</b></blockquote>\n"
-            "╰─ <b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ꜰᴏᴍ ᴜsɪɴɢ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CosmicBotz.</b>"
-        )
-
-    target_msg = message.reply_to_message
-    if not target_msg or not getattr(target_msg, "media", None):
-        return await message.reply_text(
-            "<blockquote>🎧 <b>ᴀᴜᴅɪᴏ ᴇxᴛʀᴀᴄᴛɪᴏɴ ᴇɴɢɪɴᴇ</b></blockquote>\n\n"
-            "╰─ <i>Reply to any Video or Document message with <code>/extract_audio</code> or <code>/ea</code> to extract its audio track instantly!</i>",
-            reply_to_message_id=message.id,
-        )
-
-    media = getattr(target_msg, target_msg.media.value)
     filename = getattr(media, "file_name", None) or "video.mkv"
     file_size = getattr(media, "file_size", 0) or 0
 
-    # Inline format selection keyboard
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -185,14 +170,58 @@ async def extract_audio_command(client: Client, message: Message):
         ]
     )
 
-    await message.reply_text(
+    text = (
         "<blockquote>🎧 <b>sᴇʟᴇᴄᴛ ᴀᴜᴅɪᴏ ᴇxᴛʀᴀᴄᴛɪᴏɴ ꜰᴏʀᴍᴀᴛ</b></blockquote>\n\n"
         f"╭─ 🎬 <b>ꜰɪʟᴇ :</b> <code>{filename}</code>\n"
         f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(file_size)}</code>\n"
-        "╰─ <i>Choose your preferred audio output format below:</i>",
-        reply_to_message_id=message.id,
-        reply_markup=keyboard,
+        "╰─ <i>Choose your preferred audio output format below:</i>"
     )
+
+    if hasattr(message_or_query, "edit_text"):
+        return await message_or_query.edit_text(text, reply_markup=keyboard)
+    elif hasattr(message_or_query, "message") and hasattr(message_or_query.message, "edit"):
+        return await message_or_query.message.edit(text, reply_markup=keyboard)
+    else:
+        return await message_or_query.reply_text(text, reply_to_message_id=target_msg.id, reply_markup=keyboard)
+
+
+@Client.on_message(
+    filters.private
+    & (
+        filters.command(["extract_audio", "extract", "ea", "audio_extract"])
+    )
+)
+async def extract_audio_command(client: Client, message: Message):
+    user_id = int(message.from_user.id)
+
+    if await Mythicbotz.is_banned(user_id):
+        return await message.reply(
+            "<blockquote>🚫 <b>ᴀᴄᴄᴇss ᴅᴇɴɪᴇᴅ</b></blockquote>\n"
+            "╰─ <b>ʏᴏᴜ ᴀʀᴇ ʙᴀɴɴᴇᴅ ꜰʀᴏᴍ ᴜsɪɴɢ ᴛʜɪs ʙᴏᴛ. ᴄᴏɴᴛᴀᴄᴛ @CosmicBotz.</b>"
+        )
+
+    target_msg = message.reply_to_message
+    if not target_msg or not getattr(target_msg, "media", None):
+        from bot.core.cache import LAST_USER_MEDIA
+        target_msg = LAST_USER_MEDIA.get(user_id)
+
+    if not target_msg or not getattr(target_msg, "media", None):
+        try:
+            async for hist_msg in client.get_chat_history(message.chat.id, limit=10):
+                if hist_msg.media and hist_msg.media in (MessageMediaType.VIDEO, MessageMediaType.DOCUMENT, MessageMediaType.AUDIO):
+                    target_msg = hist_msg
+                    break
+        except Exception:
+            pass
+
+    if not target_msg or not getattr(target_msg, "media", None):
+        return await message.reply_text(
+            "<blockquote>🎧 <b>ᴀᴜᴅɪᴏ ᴇxᴛʀᴀᴄᴛɪᴏɴ ᴇɴɢɪɴᴇ</b></blockquote>\n\n"
+            "╰─ <i>Please send or forward a Video or Document file first!</i>",
+            reply_to_message_id=message.id,
+        )
+
+    await show_extract_audio_menu(client, message, target_msg)
 
 
 @Client.on_callback_query(filters.regex(r"^extaudio_(\d+)_(copy|mp3|aac|opus)$"))
