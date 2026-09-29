@@ -294,6 +294,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             TCP.connect = _turbo_tcp_connect
             TCP._turbo_patched_connect = True
 
+        # Configure fast-failover MTProto session parameters (eliminates 10-retry hang loop)
+        Session.MAX_RETRIES = 2
+        Session.WAIT_TIMEOUT = 8.0
+        Session.MEDIA_WAIT_TIMEOUT = 12.0
+
         # Boost upload engine parameters
         save_file_mod.POOL_SIZE = target_pool
         save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
@@ -511,6 +516,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     # Bounded to exactly 2 chunks per socket (32 in-flight max) to eliminate DC bufferbloat
                     budget = asyncio.Semaphore(max(2, n_sessions * 2))
                     buffer_slots = ReadAhead(budget)
+                    written_offsets = set()
 
                     if not _write_mode:
                         received = {}
@@ -521,30 +527,40 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     # ── Dedicated Pipelined Socket Workers (2:1 Ratio) ─────────────────────────
                     # Each worker pair (2i, 2i+1) is dedicated to pool socket i.
-                    # Exactly 2 requests in flight per socket prevents MTProto sequence
-                    # congestion and eliminates [-503 Timeout] errors.
+                    # Fast-failover with retries=1 and timeout=6.0 eliminates 10-retry hang storms.
                     async def _worker(worker_idx: int) -> None:
                         nonlocal _done_count
                         sess_idx = worker_idx % len(pool) if pool else 0
                         dedicated_sess = pool[sess_idx] if pool else session
 
                         while True:
-                            await buffer_slots.acquire()
+                            try:
+                                await buffer_slots.acquire()
+                            except asyncio.CancelledError:
+                                return
                             try:
                                 offset_cur = work.get_nowait()
                             except asyncio.QueueEmpty:
                                 buffer_slots.release()
                                 return
 
+                            if offset_cur in written_offsets:
+                                buffer_slots.release()
+                                continue
+
                             chunk_data = None
                             try:
-                                for _retry in range(16):
-                                    if _retry >= 5:
-                                        current_sess = session
-                                    else:
-                                        current_sess = dedicated_sess
+                                for _retry in range(6):
+                                    if offset_cur in written_offsets:
+                                        break
 
-                                    invoke_timeout = 15.0 if _retry < 4 else 25.0
+                                    if _retry == 0:
+                                        current_sess = dedicated_sess
+                                    elif _retry == 1:
+                                        current_sess = pool[(sess_idx + 1) % len(pool)] if pool else session
+                                    else:
+                                        current_sess = session
+
                                     try:
                                         r_res = await current_sess.invoke(
                                             raw.functions.upload.GetFile(
@@ -552,8 +568,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                                 offset=offset_cur,
                                                 limit=chunk_size,
                                             ),
-                                            timeout=invoke_timeout,
-                                            sleep_threshold=15,
+                                            retries=1,
+                                            timeout=6.0,
+                                            sleep_threshold=5,
                                         )
                                         if isinstance(r_res, raw.types.upload.File):
                                             chunk_data = r_res.bytes
@@ -561,59 +578,61 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                             chunk_data = b""
                                         r_res = None
                                         break
+                                    except StopTransmission:
+                                        raise
                                     except (FloodWait, FloodPremiumWait) as fw:
-                                        fw_sec = min(getattr(fw, "value", 1) or 1, 15)
+                                        fw_sec = min(getattr(fw, "value", 1) or 1, 10)
                                         await asyncio.sleep(fw_sec)
                                     except asyncio.CancelledError:
-                                        work.put_nowait(offset_cur)
+                                        if offset_cur not in written_offsets:
+                                            work.put_nowait(offset_cur)
                                         return
                                     except Exception as exc:
-                                        exc_str = str(exc)
-                                        is_503 = (
-                                            "-503" in exc_str
-                                            or "Timeout" in exc_str
-                                            or "internal problems" in exc_str
-                                        )
                                         if (
                                             hasattr(current_sess, "is_started")
-                                            and not current_sess.is_started.is_set()
+                                             and not current_sess.is_started.is_set()
                                         ):
                                             utils.run_in_background(
                                                 current_sess.restart(), self.loop
                                             )
-                                        if _retry >= 15:
+                                        if _retry >= 5:
                                             logger.error(
-                                                "GetFile permanently failed at offset %d after 16 attempts: %s",
+                                                "GetFile failed at offset %d after 6 attempts: %s",
                                                 offset_cur,
                                                 exc,
                                             )
-                                            work.put_nowait(offset_cur)
+                                            if offset_cur not in written_offsets:
+                                                work.put_nowait(offset_cur)
                                             raise
-                                        if is_503:
-                                            current_sess = session
-                                            await asyncio.sleep(1.0 + (_retry * 0.2))
-                                        else:
-                                            await asyncio.sleep(
-                                                min(0.15 * (1.5 ** _retry), 2.0)
-                                            )
+                                        await asyncio.sleep(0.1 * (2 ** _retry))
 
                                 if chunk_data is None:
                                     buffer_slots.release()
                                     return
 
-                                if _write_mode:
-                                    write_at(_write_fd, chunk_data, offset_cur)
-                                    buffer_slots.release()
-                                else:
-                                    received[offset_cur] = chunk_data
+                                if offset_cur not in written_offsets:
+                                    written_offsets.add(offset_cur)
+                                    if _write_mode:
+                                        write_at(_write_fd, chunk_data, offset_cur)
+                                        buffer_slots.release()
+                                    else:
+                                        received[offset_cur] = chunk_data
 
-                                _done_count += 1
-                                data_ready.set()
+                                    _done_count += 1
+                                    data_ready.set()
+                                else:
+                                    buffer_slots.release()
 
                                 chunk_len = len(chunk_data) if chunk_data else 0
                                 chunk_data = None
                                 if chunk_len < chunk_size:
                                     return
+                            except StopTransmission:
+                                buffer_slots.release()
+                                for t in tasks:
+                                    if not t.done() and t is not asyncio.current_task():
+                                        t.cancel()
+                                raise
                             except asyncio.CancelledError:
                                 buffer_slots.release()
                                 return
@@ -647,6 +666,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         exc = t.exception()
                                         if exc is not None:
                                             raise exc
+                                if (_total_chunks - _done_count) <= max(8, n_sessions) and not work.empty():
+                                    data_ready.set()
                                 if all(t.done() for t in tasks):
                                     if _done_count < _total_chunks and not work.empty():
                                         raise RuntimeError(
@@ -662,7 +683,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     await _report(file_size)
                                     return
                                 try:
-                                    await asyncio.wait_for(data_ready.wait(), 0.5)
+                                    await asyncio.wait_for(data_ready.wait(), 0.3)
                                 except asyncio.TimeoutError:
                                     pass
                                 data_ready.clear()
@@ -834,6 +855,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     needed = n - len(pool)
                     if needed > 0:
                         media = await self.get_session(dc_id, is_media=True)
+                        PORTS = [443, 80, 5222]
                         while needed > 0:
                             chunk = min(needed, 16)
                             gate = getattr(self, "_session_creation_gate", None)
@@ -841,11 +863,15 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 gate = asyncio.Semaphore(16)
                                 self._session_creation_gate = gate
                             async with gate:
+                                start_idx = len(pool)
                                 pool.extend(await asyncio.gather(*(
                                     self._make_media_session(
-                                        dc_id, media.auth_key, media.server_address, media.port
+                                        dc_id,
+                                        media.auth_key,
+                                        media.server_address,
+                                        PORTS[(start_idx + i) % len(PORTS)],
                                     )
-                                    for _ in range(chunk)
+                                    for i in range(chunk)
                                 )))
                             needed -= chunk
                     self.media_session_pools[dc_id] = pool
@@ -941,17 +967,17 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 async def _send_part(worker_idx: int, data: Any) -> None:
                     sess_idx = worker_idx
-                    for attempt in range(8):
+                    for attempt in range(6):
                         sess = pool[sess_idx % len(pool)]
                         try:
                             await sess.invoke(
-                                data, timeout=Session.MEDIA_WAIT_TIMEOUT, sleep_threshold=15
+                                data, retries=1, timeout=8.0, sleep_threshold=5
                             )
                             return
                         except StopTransmission:
                             raise
                         except (FloodWait, FloodPremiumWait) as fw:
-                            fw_sec = min(getattr(fw, "value", 1) or 1, 15)
+                            fw_sec = min(getattr(fw, "value", 1) or 1, 10)
                             await asyncio.sleep(fw_sec)
                         except asyncio.CancelledError:
                             return
@@ -959,9 +985,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             sess_idx = (sess_idx + 1) % len(pool)
                             if hasattr(sess, "is_started") and not sess.is_started.is_set():
                                 utils.run_in_background(sess.restart(), self.loop)
-                            if attempt >= 7:
+                            if attempt >= 5:
                                 raise
-                            await asyncio.sleep(0.05 * (2 ** min(attempt, 4)))
+                            await asyncio.sleep(0.05 * (2 ** min(attempt, 3)))
 
                 async def worker(worker_idx: int) -> None:
                     while True:
@@ -1164,15 +1190,22 @@ class MultiSessionMediaPool:
         release_memory()
 
     async def warm_up(self) -> int:
-        """Pre-warm 16 parallel media sessions on primary DC so bot is ready instantly."""
+        """Pre-warm parallel media sessions on primary DC and major media DCs (DC2, DC4) so bot is ready instantly."""
         total_warmed = 0
         clients = getattr(self, "clients", [self.client] if self.client else [])
         for cl in clients:
             if cl is not None and getattr(cl, "is_connected", False):
                 try:
-                    dc_id = await cl.storage.dc_id()
-                    pool = await cl._get_media_session_pool(dc_id, 16)
-                    total_warmed += len(pool)
+                    primary_dc = await cl.storage.dc_id()
+                    target_dcs = [primary_dc]
+                    if primary_dc != 2:
+                        target_dcs.append(2)
+                    for dc_id in target_dcs:
+                        try:
+                            pool = await cl._get_media_session_pool(dc_id, 16)
+                            total_warmed += len(pool)
+                        except Exception as dce:
+                            logger.debug("DC %d pre-warm notice: %s", dc_id, dce)
                 except Exception as e:
                     logger.debug("Media pool pre-warm error: %s", e)
         return total_warmed
