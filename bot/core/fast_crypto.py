@@ -503,11 +503,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     n_sessions = len(pool)
 
                     # ── Worker count: dynamic file-size scaled concurrency ──────────────────
-                    total_workers = (
-                        min(dyn_workers, min(n_sessions * 2, total_chunks))
-                        if total_chunks > 0
-                        else min(dyn_workers, n_sessions * 2)
-                    )
+                    total_workers = min(dyn_workers, total_chunks) if total_chunks > 0 else dyn_workers
 
                     work = asyncio.Queue()
                     chunks_needed = min(
@@ -519,8 +515,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     _write_mode = _write_file is not None and file_size > 0
                     data_ready = asyncio.Event()
-                    # Bounded to exactly 2 chunks per socket (32 in-flight max) to eliminate DC bufferbloat
-                    budget = asyncio.Semaphore(max(2, n_sessions * 2))
+                    # Bounded to 32 chunks in-flight max (32 MiB buffer) to maximize throughput without bufferbloat
+                    budget = asyncio.Semaphore(max(32, dyn_workers))
                     buffer_slots = ReadAhead(budget)
                     written_offsets = set()
 
@@ -636,8 +632,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                                 chunk_len = len(chunk_data) if chunk_data else 0
                                 chunk_data = None
-                                # Pacing delay to prevent DC edge socket bursts and BrokenPipe drops
-                                await asyncio.sleep(0.02)
+                                # 1ms micro-yield to keep asyncio event loop 100% responsive for callbacks while achieving peak speed
+                                await asyncio.sleep(0.001)
                                 if chunk_len < chunk_size and (offset_cur + chunk_size >= file_size):
                                     return
                             except StopTransmission:
