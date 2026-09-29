@@ -12,7 +12,7 @@ WORKDIR /app
 
 # Install FFmpeg & Git with minimal footprint
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg git && \
+    apt-get install -y --no-install-recommends aria2 ffmpeg git && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/
