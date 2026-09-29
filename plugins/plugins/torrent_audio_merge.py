@@ -24,7 +24,7 @@ from pyrogram.enums import MessageMediaType
 from pyrogram.errors import CDNFileHashMismatch, FloodPremiumWait, FloodWait, VolumeLocNotFound
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session.session import Session
-from pyrogram.types import ForceReply, Message
+from pyrogram.types import ForceReply, Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
 from bot.core.cache import ram_workspace
 from config import Config
@@ -562,8 +562,17 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
     return return_code == 0
 
 
-async def _mux_audio_stream_copy(video_input: str, audio_input: str, output_path: str) -> bool:
-    """Stream-copy muxing with FFmpeg using ZERO re-encoding to preserve CPU."""
+async def _mux_audio_stream_copy(
+    video_input: str,
+    audio_input: str,
+    output_path: str,
+    max_duration: int = 0,
+) -> bool:
+    """
+    Stream-copy muxing with FFmpeg using ZERO re-encoding to preserve CPU.
+    Trims audio at video duration if audio is longer than video.
+    """
+    dur_args = ["-t", str(max_duration)] if max_duration > 0 else []
     cmd = [
         "ffmpeg",
         "-y",
@@ -574,6 +583,8 @@ async def _mux_audio_stream_copy(video_input: str, audio_input: str, output_path
         "-map", "0:a?",
         "-map", "0:s?",
         "-c", "copy",
+        "-shortest",
+        *dur_args,
         "-disposition:a", "0",
         "-disposition:a:0", "default",
         output_path,
@@ -668,7 +679,9 @@ async def torrent_start(client: Client, message: Message):
         f"╭─ 🎬 <b>ᴛᴏʀʀᴇɴᴛ ᴠɪᴅᴇᴏ :</b> <code>{vid_name}</code>\n"
         f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{vid_size}</code>\n"
         "╰─ <i>Reply to this message with an Audio or Video file whose audio track you want to inject as default.</i>",
-        reply_markup=ForceReply(True),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✖️ Cancel Task & Clean Workspace", callback_data=f"cancel_tmux_{user_id}")]]
+        ),
     )
 
     ACTIVE_TORRENT_TASKS[user_id] = {
@@ -699,13 +712,35 @@ async def torrent_start(client: Client, message: Message):
     asyncio.create_task(_auto_abort())
 
 
+@Client.on_callback_query(filters.regex(r"^cancel_tmux_(\d+)$"))
+async def cancel_tmux_callback(bot: Client, query: CallbackQuery):
+    target_user_id = int(query.matches[0].group(1))
+    if query.from_user.id != target_user_id:
+        return await query.answer("⚠️ This is not your task!", show_alert=True)
+
+    task = ACTIVE_TORRENT_TASKS.pop(target_user_id, None)
+    if task:
+        torrent_dir = task.get("torrent_dir")
+        if torrent_dir and os.path.exists(torrent_dir):
+            shutil.rmtree(torrent_dir, ignore_errors=True)
+
+    try:
+        await query.message.edit("<blockquote>❌ <b>ᴛᴏʀʀᴇɴᴛ ᴍᴜxɪɴɢ ᴛᴀsᴋ ᴄᴀɴᴄᴇʟʟᴇᴅ & ᴄʟᴇᴀɴᴇᴅ ᴜᴘ.</b></blockquote>")
+    except Exception:
+        pass
+    try:
+        await query.answer("Task cancelled & workspace cleaned up.", show_alert=False)
+    except Exception:
+        pass
+
+
 @Client.on_message(filters.private & filters.reply & (filters.audio | filters.video | filters.document))
 async def handle_mux_reply(bot: Client, message: Message):
     auto_boost_client(bot)
     user_id = int(message.from_user.id)
     reply_msg = message.reply_to_message
 
-    if not (reply_msg and reply_msg.reply_markup and isinstance(reply_msg.reply_markup, ForceReply)):
+    if not reply_msg:
         return
 
     task = ACTIVE_TORRENT_TASKS.get(user_id)
@@ -769,14 +804,23 @@ async def handle_mux_reply(bot: Client, message: Message):
         shutil.rmtree(torrent_dir, ignore_errors=True)
         return await ms.edit(f"<blockquote>❌ <b>ᴀᴜᴅɪᴏ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
 
-    # Step B: Zero-encoding Stream Copy Muxing
+    # Step B: Zero-encoding Stream Copy Muxing & Audio Trimming
+    _, _, video_dur = await probe_video_dimensions_and_duration(torrent_video)
+    _, _, audio_dur = await probe_video_dimensions_and_duration(user_media_path)
+    target_dur = video_dur or audio_dur
+    dur_str = convert(target_dur) if target_dur > 0 else "N/A"
+    trim_notice = " (audio trimmed to video length)" if (video_dur > 0 and audio_dur > video_dur) else ""
+
     await ms.edit(
         "<blockquote>⚙️ <b>ᴍᴜxɪɴɢ ᴀᴜᴅɪᴏ sᴛʀᴇᴀᴍ...</b> ⚡</blockquote>\n"
+        f"╭─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{dur_str}</code>{trim_notice}\n"
         "╰─ <i>Lossless stream-copy in progress (zero re-encoding)...</i>"
     )
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.5)
 
-    success_mux = await _mux_audio_stream_copy(torrent_video, user_media_path, muxed_output_path)
+    success_mux = await _mux_audio_stream_copy(
+        torrent_video, user_media_path, muxed_output_path, max_duration=video_dur
+    )
     if not success_mux:
         shutil.rmtree(torrent_dir, ignore_errors=True)
         return await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴀᴜᴅɪᴏ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ.</b></blockquote>")

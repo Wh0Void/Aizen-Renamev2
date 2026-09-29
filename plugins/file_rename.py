@@ -75,14 +75,18 @@ async def rename_start(client, message):
         prompt_msg = await message.reply_text(
             text=prompt_text,
             reply_to_message_id=message.id,
-            reply_markup=ForceReply(True),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")]]
+            ),
         )
     except FloodWait as e:
         await sleep(e.value)
         prompt_msg = await message.reply_text(
             text=prompt_text,
             reply_to_message_id=message.id,
-            reply_markup=ForceReply(True),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")]]
+            ),
         )
     except Exception as e:
         logger.error(f"Error in rename_start: {e}")
@@ -95,11 +99,27 @@ async def rename_start(client, message):
     asyncio.create_task(_delayed_delete(prompt_msg, delay=600.0))
 
 
+@Client.on_callback_query(filters.regex(r"^cancel_rename_prompt$"))
+async def cancel_rename_prompt_cb(client, query):
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    try:
+        await query.answer("✖️ Rename prompt cancelled.", show_alert=False)
+    except Exception:
+        pass
+
+
 @Client.on_message(filters.private & filters.reply)
 async def refunc(client, message):
     reply_message = message.reply_to_message
-    if not (reply_message and reply_message.reply_markup and isinstance(reply_message.reply_markup, ForceReply)):
+    if not (reply_message and reply_message.from_user and reply_message.from_user.is_self):
         return
+    reply_txt = (reply_message.text or "") + (reply_message.caption or "")
+    if "ᴇɴᴛᴇʀ ɴᴇᴡ ꜰɪʟᴇ ɴᴀᴍᴇ" not in reply_txt and "ENTER NEW FILE NAME" not in reply_txt:
+        if not (reply_message.reply_markup and isinstance(reply_message.reply_markup, ForceReply)):
+            return
 
     new_name = (message.text or "").strip()
     if not new_name:
@@ -255,6 +275,22 @@ async def doc(bot, update):
         ram_workspace.cleanup_files(file_path)
         clear_transfer_cancellation(user_id, ms.id)
         return
+
+    # Extract duration, width, and height upfront to display duration during processing
+    raw_dur = getattr(media, "duration", 0)
+    duration = int(raw_dur) if isinstance(raw_dur, (int, float)) and raw_dur > 0 else 0
+    raw_w = getattr(media, "width", 0)
+    width = int(raw_w) if isinstance(raw_w, (int, float)) and raw_w > 0 else 0
+    raw_h = getattr(media, "height", 0)
+    height = int(raw_h) if isinstance(raw_h, (int, float)) and raw_h > 0 else 0
+
+    if not duration and path and os.path.exists(path):
+        try:
+            _, _, p_dur = await probe_video_dimensions_and_duration(path)
+            if p_dur > 0:
+                duration = int(p_dur)
+        except Exception:
+            pass
 
     # Display clean processing status card between Download and Upload
     try:
