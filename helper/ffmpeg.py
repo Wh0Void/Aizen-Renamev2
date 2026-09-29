@@ -217,10 +217,7 @@ def _build_seek_candidates(duration: int = 0, preferred_ttl: int = 30) -> list[i
     return ordered
 
 
-async def fix_thumb(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
-    """
-    Normalize a thumbnail image to RGB JPEG (<= 320x320) suitable for Telegram uploads.
-    """
+def _fix_thumb_sync(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
     width = 0
     height = 0
     try:
@@ -235,6 +232,13 @@ async def fix_thumb(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
         thumb = None
 
     return width, height, thumb
+
+
+async def fix_thumb(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
+    """
+    Normalize a thumbnail image to RGB JPEG (<= 320x320) suitable for Telegram uploads.
+    """
+    return await asyncio.to_thread(_fix_thumb_sync, thumb)
 
 
 async def get_cached_user_thumb(
@@ -325,7 +329,8 @@ async def take_screen_shot(
             )
             await process.communicate()
             if os.path.lexists(out_put_file_name) and os.path.getsize(out_put_file_name) > 0:
-                if not _is_blank_or_dark_frame(out_put_file_name):
+                is_dark = await asyncio.to_thread(_is_blank_or_dark_frame, out_put_file_name)
+                if not is_dark:
                     # Clean up any saved fallback frame and return this rich frame
                     if os.path.lexists(fallback_file_name):
                         try:
@@ -400,17 +405,21 @@ async def extract_auto_thumbnail(
             video_path, thumb_dir, ttl=preferred_ttl, duration=duration or 0
         )
         if shot_path and os.path.exists(shot_path):
-            orig_w, orig_h = 0, 0
-            try:
-                base, ext = os.path.splitext(shot_path)
-                cover_path = f"{base}_cover{ext or '.jpg'}"
-                with Image.open(shot_path) as img:
-                    rgb_cover = img.convert("RGB")
-                    orig_w, orig_h = rgb_cover.size
-                    rgb_cover.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
-                    rgb_cover.save(cover_path, "JPEG", quality=92, optimize=True)
-            except Exception:
-                pass
+            def _create_cover_sync(s_path):
+                orig_w, orig_h = 0, 0
+                try:
+                    base, ext = os.path.splitext(s_path)
+                    cover_path = f"{base}_cover{ext or '.jpg'}"
+                    with Image.open(s_path) as img:
+                        rgb_cover = img.convert("RGB")
+                        orig_w, orig_h = rgb_cover.size
+                        rgb_cover.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+                        rgb_cover.save(cover_path, "JPEG", quality=92, optimize=True)
+                except Exception:
+                    pass
+                return orig_w, orig_h
+
+            orig_w, orig_h = await asyncio.to_thread(_create_cover_sync, shot_path)
 
             w, h, fixed = await fix_thumb(shot_path)
             if fixed:

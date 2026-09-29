@@ -133,12 +133,15 @@ class Bot(Client):
         self.username = me.username
         self.uptime = Config.BOT_UPTIME
 
-        if Config.WEBHOOK:
+        # Start dummy HTTP webserver unconditionally on PORT (default 8000) for Koyeb / UptimeRobot health checks
+        try:
             app = web.AppRunner(await web_server())
             await app.setup()
             port = int(os.environ.get("PORT", 8000))
             await web.TCPSite(app, "0.0.0.0", port).start()
-            print(f"🌐 Webhook server started on port {port}")
+            print(f"🌐 Dummy HTTP webserver started on port {port} (Long-Polling Mode Active)")
+        except Exception as e:
+            print(f"Webserver start notice: {e}")
 
         print(
             f"⚡ {me.first_name} Started | Wzgram v{__version__} | "

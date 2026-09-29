@@ -94,6 +94,12 @@ async def query_metadata(bot: Client, query: CallbackQuery):
                     "╰─▸ <i>ʀᴇsᴛᴀʀᴛ ʙʏ ᴜsɪɴɢ</i> <code>/metadata</code>",
                 )
                 return
+            finally:
+                try:
+                    if hasattr(bot, "stop_listening"):
+                        bot.stop_listening(chat_id=query.from_user.id)
+                except Exception:
+                    pass
             ms = await query.message.reply_text(
                 "<blockquote>⏳ <b>sᴀᴠɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b></blockquote>",
                 reply_to_message_id=metadata.id,

@@ -34,9 +34,9 @@ if sys.platform == "win32":
 # Constants for MTProto chunk distribution and pool sizing
 CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
-MIN_MEDIA_POOL_SIZE: int = 16
+MIN_MEDIA_POOL_SIZE: int = 4
 MAX_MEDIA_POOL_SIZE: int = 48
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "36"))
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "12"))
 
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> Tuple[int, int]:
@@ -910,7 +910,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                 if all(t.done() for t in workers):
                     break
                 try:
-                    await asyncio.wait_for(queue.put(None), Session.MEDIA_WAIT_TIMEOUT)
+                    await asyncio.wait_for(queue.put(None), 1.0)
                 except asyncio.TimeoutError:
                     break
                 delivered += 1
@@ -1243,7 +1243,7 @@ class MultiSessionMediaPool:
                         target_dcs.append(2)
                     for dc_id in target_dcs:
                         try:
-                            pool = await cl._get_media_session_pool(dc_id, 16)
+                            pool = await cl._get_media_session_pool(dc_id, self.pool_size)
                             total_warmed += len(pool)
                         except Exception as dce:
                             logger.debug("DC %d pre-warm notice: %s", dc_id, dce)

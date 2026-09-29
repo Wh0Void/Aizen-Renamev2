@@ -39,7 +39,7 @@ class Config(object):
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
 
     # ⚡ High-Speed Multi-Session Pool & Smart RAM Cache Configs (Auto-Rename High Performance Profile)
-    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "36"))  # Up to 36-48 parallel TCP media sessions for multi-file concurrency (5-7 files)
+    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "12"))  # Up to 12-24 parallel TCP media sessions for multi-file concurrency
     RAM_CACHE_MAX_MB = int(os.environ.get("RAM_CACHE_MAX_MB", "128"))  # Max file size (MB) routed through /dev/shm when free RAM allows
     USER_CACHE_TTL = int(os.environ.get("USER_CACHE_TTL", "1800"))  # In-memory user DB cache TTL in seconds
     WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "256"))  # 256 read-ahead slots for smooth pipelined streaming

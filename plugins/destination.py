@@ -173,13 +173,20 @@ async def cb_set_dest(c: Client, q: CallbackQuery):
         reply_markup=cancel_kb,
     )
     try:
-        resp = await c.listen(chat_id=uid, timeout=DEST_WAIT_TIMEOUT)
-    except (ListenerTimeout, asyncio.TimeoutError):
-        await Mythicbotz.clear_waiting_for_channel(uid)
-        return await prompt.edit_text(
-            "<blockquote>⌛ <b>sᴇᴛᴜᴘ ᴛɪᴍᴇᴅ ᴏᴜᴛ</b></blockquote>\n"
-            "╰─▸ <i>ᴜsᴇ</i> <code>/setchannel</code> <i>ᴛᴏ ᴛʀʏ ᴀɢᴀɪɴ.</i>"
-        )
+        try:
+            resp = await c.listen(chat_id=uid, timeout=DEST_WAIT_TIMEOUT)
+        except (ListenerTimeout, asyncio.TimeoutError):
+            await Mythicbotz.clear_waiting_for_channel(uid)
+            return await prompt.edit_text(
+                "<blockquote>⌛ <b>sᴇᴛᴜᴘ ᴛɪᴍᴇᴅ ᴏᴜᴛ</b></blockquote>\n"
+                "╰─▸ <i>ᴜsᴇ</i> <code>/setchannel</code> <i>ᴛᴏ ᴛʀʏ ᴀɢᴀɪɴ.</i>"
+            )
+    finally:
+        try:
+            if hasattr(c, "stop_listening"):
+                c.stop_listening(chat_id=uid)
+        except Exception:
+            pass
 
     if resp is None or (resp.text and resp.text.startswith("/")):
         await Mythicbotz.clear_waiting_for_channel(uid)

@@ -485,17 +485,18 @@ async def run_audio_extraction_task(
         except Exception:
             ph_path = None
 
+    auto_delete_notice = "\n\n<blockquote>🗑️ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b></blockquote>"
     if c_caption:
         try:
             caption = c_caption.format(
                 filename=f"<b>{final_filename}</b>",
                 filesize=humanbytes(extracted_size),
                 duration=convert(duration),
-            )
+            ) + auto_delete_notice
         except Exception:
-            caption = f"<b>{final_filename}</b>"
+            caption = f"<b>{final_filename}</b>" + auto_delete_notice
     else:
-        caption = f"🎵 <b>{final_filename}</b>\n📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(extracted_size)}</code>"
+        caption = f"🎵 <b>{final_filename}</b>\n📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(extracted_size)}</code>" + auto_delete_notice
 
     # Step 5: Multi-Socket Upload Audio
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴇxᴛʀᴀᴄᴛᴇᴅ ᴀᴜᴅɪᴏ...</b> ⚡</blockquote>"
@@ -542,11 +543,7 @@ async def run_audio_extraction_task(
 
         await Mythicbotz.increase_rename_count(user_id)
 
-        deletion_msg = await sent_message.reply(
-            "<blockquote>🗑️ <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɴᴏᴛɪᴄᴇ</b></blockquote>\n"
-            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
-        )
-        asyncio.create_task(_delayed_delete(sent_message, deletion_msg, delay=1800.0))
+        asyncio.create_task(_delayed_delete(sent_message, delay=1800.0))
 
     except StopTransmission:
         clear_transfer_cancellation(user_id, ms.id)

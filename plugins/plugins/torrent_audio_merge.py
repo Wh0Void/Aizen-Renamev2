@@ -48,378 +48,17 @@ from helper.utils import (
 logger = logging.getLogger(__name__)
 
 # =========================================================================
-# SECTION 1: TURBO MTPROTO MULTI-SOCKET ACCELERATION ENGINE
+# SECTION 1: CONCURRENCY CONFIGURE UTILS
 # =========================================================================
 
-CHUNK_SIZE_512KB: int = 512 * 1024
-DOWNLOAD_CHUNK_1MB: int = 1024 * 1024
-MIN_MEDIA_POOL_SIZE: int = 16
-MAX_MEDIA_POOL_SIZE: int = 48
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "24"))
-_MTPROTO_PATCHED: bool = False
-
-if sys.platform == "win32":
-    try:
-        ctypes.windll.winmm.timeBeginPeriod(1)
-    except Exception:
-        pass
-
-
-def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> Tuple[int, int]:
-    """Calculate optimal media socket pool size and worker concurrency based on file size."""
-    mb = file_size_bytes / (1024 * 1024)
-    if is_upload:
-        pool_size = 16 if mb <= 200 else 24
-        workers = 32 if mb <= 200 else 48
-        part_size = CHUNK_SIZE_512KB
-    else:
-        pool_size = 16
-        workers = 32
-        part_size = DOWNLOAD_CHUNK_1MB
-
-    total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
-    actual_pool = min(pool_size, total_parts)
-    actual_workers = min(workers, total_parts * 2 if is_upload else total_parts)
-    return actual_pool, actual_workers
-
-
-class FastCryptoEngine:
-    """Hardware-accelerated AES-NI MTProto Crypto Engine using warpcrypto or pycryptodome."""
-
-    def __init__(self) -> None:
-        self.backend_name: str = "pure-python"
-        self._warpcrypto: Any = None
-        self._pycryptodome_aes: Any = None
-        self._init_backend()
-
-    def _init_backend(self) -> None:
-        try:
-            import warpcrypto  # type: ignore
-
-            self._warpcrypto = warpcrypto
-            self.backend_name = "warpcrypto (Rust AES-NI)"
-            return
-        except ImportError:
-            pass
-
-        try:
-            from Crypto.Cipher import AES  # type: ignore
-
-            self._pycryptodome_aes = AES
-            self.backend_name = "pycryptodome (C AES-NI)"
-        except ImportError:
-            self.backend_name = "fallback"
-
-    def ige256_encrypt(self, data: bytes, key: bytes, iv: bytes) -> bytes:
-        if not data:
-            return b""
-        pad_len = (-len(data)) % 16
-        if pad_len:
-            data = data + os.urandom(pad_len)
-        if self._warpcrypto is not None:
-            return bytes(self._warpcrypto.ige256_encrypt(data, key, iv))
-        from pyrogram.crypto import aes  # type: ignore
-
-        return bytes(aes.ige256_encrypt(data, key, iv))
-
-    def ige256_decrypt(self, data: bytes, key: bytes, iv: bytes) -> bytes:
-        if not data:
-            return b""
-        if self._warpcrypto is not None:
-            return bytes(self._warpcrypto.ige256_decrypt(data, key, iv))
-        from pyrogram.crypto import aes  # type: ignore
-
-        return bytes(aes.ige256_decrypt(data, key, iv))
-
-
-def _patch_turbo_mtproto_engine(target_pool: int = DEFAULT_MEDIA_POOL_SIZE) -> None:
-    global _MTPROTO_PATCHED
-    if _MTPROTO_PATCHED:
-        return
-
-    try:
-        from pyrogram.client import ReadAhead, write_at  # type: ignore
-        from pyrogram.crypto import aes  # type: ignore
-        import pyrogram.methods.advanced.save_file as save_file_mod  # type: ignore
-
-        # Linux/Docker TCP keepalive optimization
-        if not hasattr(TCP, "_turbo_patched_connect"):
-            _orig_tcp_connect = TCP.connect
-
-            async def _turbo_tcp_connect(self, address: tuple):
-                await _orig_tcp_connect(self, address)
-                try:
-                    if self.writer is not None:
-                        sock = self.writer.get_extra_info("socket")
-                        if sock is not None:
-                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                            if hasattr(socket, "TCP_KEEPIDLE"):
-                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-                            if hasattr(socket, "TCP_KEEPINTVL"):
-                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                            if hasattr(socket, "TCP_KEEPCNT"):
-                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-                except OSError:
-                    pass
-
-            TCP.connect = _turbo_tcp_connect
-            TCP._turbo_patched_connect = True
-
-        Session.MAX_RETRIES = 2
-        Session.WAIT_TIMEOUT = 8.0
-        Session.MEDIA_WAIT_TIMEOUT = 12.0
-
-        save_file_mod.POOL_SIZE = target_pool
-        save_file_mod.PART_SIZE = CHUNK_SIZE_512KB
-
-        # Parallel TCP Session Pool Creator
-        if not hasattr(Client, "_turbo_get_media_session_pool_patched"):
-            async def _turbo_get_media_session_pool(self: Any, dc_id: int, n: int) -> list:
-                lock = self._media_sessions_locks.setdefault(dc_id, asyncio.Lock())
-                async with lock:
-                    pool = []
-                    for session in self.media_session_pools.get(dc_id, []):
-                        if getattr(session, "is_started", None) and session.is_started.is_set():
-                            pool.append(session)
-                        else:
-                            utils.run_in_background(session.stop(), self.loop)
-
-                    needed = n - len(pool)
-                    if needed > 0:
-                        media = await self.get_session(dc_id, is_media=True)
-                        ports = [443, 80, 5222]
-                        while needed > 0:
-                            chunk = min(needed, 16)
-                            gate = getattr(self, "_session_creation_gate", None)
-                            if gate is None:
-                                gate = asyncio.Semaphore(16)
-                                self._session_creation_gate = gate
-                            async with gate:
-                                start_idx = len(pool)
-                                pool.extend(
-                                    await asyncio.gather(
-                                        *(
-                                            self._make_media_session(
-                                                dc_id,
-                                                media.auth_key,
-                                                media.server_address,
-                                                ports[(start_idx + i) % len(ports)],
-                                            )
-                                            for i in range(chunk)
-                                        )
-                                    )
-                                )
-                            needed -= chunk
-                    self.media_session_pools[dc_id] = pool
-                    return list(pool)
-
-            Client._get_media_session_pool = _turbo_get_media_session_pool
-            Client._turbo_get_media_session_pool_patched = True
-
-        # High-Speed Lock-Free Save File Patch
-        async def _stop_workers(queue: asyncio.Queue, workers: list) -> list:
-            for _ in workers:
-                try:
-                    await asyncio.wait_for(queue.put(None), 4.0)
-                except asyncio.TimeoutError:
-                    break
-            for t in workers:
-                if not t.done():
-                    t.cancel()
-            return await asyncio.gather(*workers, return_exceptions=True)
-
-        async def _turbo_save_file(
-            self: Any,
-            path: Any,
-            file_id: Optional[int] = None,
-            file_part: int = 0,
-            progress: Optional[Callable] = None,
-            progress_args: tuple = (),
-        ):
-            async with getattr(self, "save_file_semaphore", asyncio.Semaphore(128)):
-                if path is None:
-                    return None
-                part_size = CHUNK_SIZE_512KB
-
-                if isinstance(path, (str, PurePath)):
-                    fp = open(path, "rb", buffering=16 * 1024 * 1024)
-                elif isinstance(path, io.IOBase):
-                    fp = path
-                else:
-                    raise ValueError("Invalid file pointer/path")
-
-                file_name = getattr(fp, "name", "file.bin")
-                fp.seek(0, os.SEEK_END)
-                file_size = fp.tell()
-                fp.seek(0)
-
-                if file_size == 0:
-                    if isinstance(path, (str, PurePath)):
-                        fp.close()
-                    raise ValueError("File size equals 0 B")
-
-                file_total_parts = int(math.ceil(file_size / part_size))
-                is_big = file_size > 10 * 1024 * 1024
-                dyn_ul_pool, dyn_ul_workers = compute_dynamic_pool_size(file_size, is_upload=True)
-                ul_pool_size = min(dyn_ul_pool, min(target_pool, file_total_parts)) if is_big else 1
-
-                file_id = file_id or self.rnd_id()
-                md5_sum = md5() if not is_big else None
-
-                dc_id = await self.storage.dc_id()
-                pool = await self._get_media_session_pool(dc_id, ul_pool_size)
-                if not pool:
-                    pool = [await self.get_session(dc_id, is_media=True)]
-
-                n_sessions = len(pool)
-                n_workers = min(dyn_ul_workers, min(n_sessions * 2, file_total_parts))
-                queue = asyncio.Queue(n_workers * 2)
-
-                read_ahead_budget = getattr(self, "read_ahead_slots", None)
-                if not isinstance(read_ahead_budget, asyncio.Semaphore):
-                    read_ahead_budget = asyncio.Semaphore(256)
-                budget = ReadAhead(read_ahead_budget)
-                _acked = [0]
-
-                async def _send_part(worker_idx: int, data: Any) -> None:
-                    sess_idx = worker_idx
-                    for attempt in range(8):
-                        live_sessions = [
-                            s for s in pool if getattr(s, "is_started", None) and s.is_started.is_set()
-                        ]
-                        if not live_sessions:
-                            await asyncio.sleep(0.2)
-                            live_sessions = pool if pool else [self]
-                        sess = live_sessions[(sess_idx + attempt) % len(live_sessions)]
-                        try:
-                            await sess.invoke(data, retries=2, timeout=8.0, sleep_threshold=5)
-                            return
-                        except StopTransmission:
-                            raise
-                        except (FloodWait, FloodPremiumWait) as fw:
-                            await asyncio.sleep(min(getattr(fw, "value", 1) or 1, 10))
-                        except asyncio.CancelledError:
-                            return
-                        except Exception:
-                            if attempt >= 7:
-                                raise
-                            await asyncio.sleep(0.05 * (2 ** min(attempt, 3)))
-
-                async def worker(worker_idx: int) -> None:
-                    while True:
-                        data = await queue.get()
-                        if data is None:
-                            return
-                        try:
-                            await _send_part(worker_idx, data)
-                            _acked[0] += 1
-                        finally:
-                            budget.release()
-
-                workers = [self.loop.create_task(worker(i)) for i in range(n_workers)]
-                _last_report_time = 0.0
-
-                async def _report(parts: int) -> None:
-                    nonlocal _last_report_time
-                    if not progress:
-                        return
-                    _now = time.monotonic()
-                    if _now - _last_report_time < 0.1 and parts < file_total_parts:
-                        return
-                    _last_report_time = _now
-                    func = functools.partial(
-                        progress,
-                        min(parts * part_size, file_size),
-                        file_size,
-                        *progress_args,
-                    )
-                    try:
-                        if inspect.iscoroutinefunction(progress):
-                            await func()
-                        else:
-                            await self.loop.run_in_executor(self.executor, func)
-                    except Exception as e:
-                        logger.debug("Upload progress callback error: %s", e)
-
-                async def _producer() -> None:
-                    nonlocal file_part
-                    read_ahead_bytes = min(32 * part_size, 16 * 1024 * 1024)
-                    fp.seek(part_size * file_part)
-                    while file_part < file_total_parts:
-                        batch = await self.loop.run_in_executor(
-                            self.executor, fp.read, read_ahead_bytes
-                        )
-                        if not batch:
-                            break
-                        for start in range(0, len(batch), part_size):
-                            chunk = batch[start : start + part_size]
-                            if not is_big and md5_sum is not None:
-                                md5_sum.update(chunk)
-                            if is_big:
-                                rpc = raw.functions.upload.SaveBigFilePart(
-                                    file_id=file_id,
-                                    file_part=file_part,
-                                    file_total_parts=file_total_parts,
-                                    bytes=chunk,
-                                )
-                            else:
-                                rpc = raw.functions.upload.SaveFilePart(
-                                    file_id=file_id,
-                                    file_part=file_part,
-                                    bytes=chunk,
-                                )
-                            file_part += 1
-                            await budget.acquire()
-                            await queue.put(rpc)
-
-                producer_task = self.loop.create_task(_producer())
-                try:
-                    while _acked[0] < file_total_parts:
-                        for t in workers:
-                            if t.done() and not t.cancelled() and t.exception():
-                                producer_task.cancel()
-                                raise t.exception()
-                        await _report(_acked[0])
-                        await asyncio.sleep(0.05)
-                finally:
-                    if not producer_task.done():
-                        producer_task.cancel()
-                    await _stop_workers(queue, workers)
-                    budget.release_all()
-                    if isinstance(path, (str, PurePath)):
-                        fp.close()
-
-                await _report(file_total_parts)
-
-                if is_big:
-                    return raw.types.InputFileBig(
-                        id=file_id, parts=file_total_parts, name=file_name
-                    )
-                return raw.types.InputFile(
-                    id=file_id,
-                    parts=file_total_parts,
-                    name=file_name,
-                    md5_checksum=md5_sum.hexdigest() if md5_sum else None,
-                )
-
-        save_file_mod.SaveFile.save_file = _turbo_save_file
-        Client.save_file = _turbo_save_file
-        _MTPROTO_PATCHED = True
-        logger.info("Applied Lock-Free Multi-Socket Turbo Engine (pool=%d).", target_pool)
-    except Exception as exc:
-        logger.warning("Turbo MTProto engine patch skipped: %s", exc)
-
-
 def auto_boost_client(client: Client) -> None:
-    """Pre-configures client concurrency gates and applies MTProto turbo hooks."""
+    """Pre-configures client concurrency gates."""
     try:
         client._session_creation_gate = asyncio.Semaphore(16)
         client.get_file_semaphore = asyncio.Semaphore(128)
         client.save_file_semaphore = asyncio.Semaphore(128)
     except Exception:
         pass
-    _patch_turbo_mtproto_engine(target_pool=24)
 
 
 # =========================================================================
@@ -866,20 +505,31 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
         pass
 
     if not duration or not width or not height:
-        try:
-            parser = createParser(final_upload_path)
-            if parser:
-                with parser:
-                    meta_info = extractMetadata(parser)
-                    if meta_info:
-                        if not duration and meta_info.has("duration"):
-                            duration = meta_info.get("duration").seconds
-                        if meta_info.has("width"):
-                            width = int(meta_info.get("width") or 1280)
-                        if meta_info.has("height"):
-                            height = int(meta_info.get("height") or 720)
-        except Exception:
-            pass
+        def _parse_hachoir_merge_metadata(probe_target_path: str) -> Tuple[int, int, int]:
+            dur, w, h = 0, 0, 0
+            try:
+                parser = createParser(probe_target_path)
+                if parser:
+                    with parser:
+                        meta_info = extractMetadata(parser)
+                        if meta_info:
+                            if meta_info.has("duration"):
+                                dur = meta_info.get("duration").seconds
+                            if meta_info.has("width"):
+                                w = int(meta_info.get("width") or 1280)
+                            if meta_info.has("height"):
+                                h = int(meta_info.get("height") or 720)
+            except Exception:
+                pass
+            return dur, w, h
+
+        h_dur, h_w, h_h = await asyncio.to_thread(_parse_hachoir_merge_metadata, final_upload_path)
+        if not duration and h_dur:
+            duration = h_dur
+        if h_w > 0:
+            width = h_w
+        if h_h > 0:
+            height = h_h
 
     # Step E: Thumbnail Generation
     video_cover = None
@@ -909,17 +559,18 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
 
     # Step F: Caption Construction
     final_size = os.path.getsize(final_upload_path)
+    auto_delete_notice = "\n\n<blockquote>🗑️ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b></blockquote>"
     if c_caption:
         try:
             caption = c_caption.format(
                 filename=f"<b>{new_filename}</b>",
                 filesize=humanbytes(final_size),
                 duration=convert(duration),
-            )
+            ) + auto_delete_notice
         except Exception:
-            caption = f"<b>{new_filename}</b>"
+            caption = f"<b>{new_filename}</b>" + auto_delete_notice
     else:
-        caption = f"<b>{new_filename}</b>"
+        caption = f"<b>{new_filename}</b>" + auto_delete_notice
 
     # Step G: Multi-Socket Turbo Upload
     ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴜxᴇᴅ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
@@ -946,7 +597,7 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
                 bin_caption = (
                     f"<blockquote>🎬 <b>{new_filename}</b></blockquote>\n"
                     f"╭─ 👤 <b>ᴜsᴇʀ :</b> {message.chat.first_name} (<code>{user_id}</code>)\n"
-                    f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{humanbytes(final_size)}</code>\n"
+                    f"├─ 📦 <b>sɪZsᴇ :</b> <code>{humanbytes(final_size)}</code>\n"
                     f"╰─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{convert(duration)}</code>"
                 )
                 await bot.copy_message(
@@ -970,11 +621,7 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
 
         await Mythicbotz.increase_rename_count(user_id)
 
-        deletion_msg = await sent_message.reply(
-            "<blockquote>🗑️ <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɴᴏᴛɪᴄᴇ</b></blockquote>\n"
-            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
-        )
-        asyncio.create_task(_delayed_delete(sent_message, deletion_msg, delay=1800.0))
+        asyncio.create_task(_delayed_delete(sent_message, delay=1800.0))
 
     except StopTransmission:
         clear_transfer_cancellation(user_id, ms.id)
@@ -992,6 +639,5 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
             shutil.rmtree(torrent_dir, ignore_errors=True)
         try:
             await ms.delete()
-            await reply_msg.delete()
         except Exception:
             pass

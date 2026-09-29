@@ -92,42 +92,29 @@ async def rename_start(client: Client, message: Message):
         )
 
     prompt_text = (
-        "<blockquote>⚡ <b>sᴇʟᴇᴄᴛ ꜰɪʟᴇ ᴀᴄᴛɪᴏɴ</b></blockquote>\n\n"
-        f"╭─ 📄 <b>ꜰɪʟᴇ :</b> <code>{filename}</code>\n"
+        "<blockquote>✏️ <b>ᴇɴᴛᴇʀ ɴᴇᴡ ꜰɪʟᴇ ɴᴀᴍᴇ</b></blockquote>\n\n"
+        f"╭─ 📄 <b>ᴏʟᴅ ɴᴀᴍᴇ :</b> <code>{filename}</code>\n"
         f"├─ 📦 <b>sɪᴢᴇ :</b> <code>{filesize}</code>\n"
-        "╰─ <i>Choose what you want to do with this file:</i>"
+        "╰─ <i>Reply to this message with your new filename:</i>"
     )
-
-    buttons = [
-        [InlineKeyboardButton("✏️ Rename File", callback_data=f"action_rename_{message.id}")],
-    ]
-
-    is_vid = is_video_file(filename, message.media, "video") or message.media == MessageMediaType.VIDEO
-    if is_vid or message.media == MessageMediaType.DOCUMENT:
-        buttons.append([InlineKeyboardButton("🎧 Extract Audio Track", callback_data=f"action_extaudio_{message.id}")])
-
-    buttons.append([InlineKeyboardButton("🎵 Merge Audio Track (/tmux)", callback_data=f"action_tmux_{message.id}")])
-    buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")])
-
-    keyboard = InlineKeyboardMarkup(buttons)
 
     try:
         prompt_msg = await message.reply_text(
             text=prompt_text,
             reply_to_message_id=message.id,
-            reply_markup=keyboard,
+            reply_markup=ForceReply(selective=True),
         )
     except FloodWait as e:
         await sleep(e.value)
         prompt_msg = await message.reply_text(
             text=prompt_text,
             reply_to_message_id=message.id,
-            reply_markup=keyboard,
+            reply_markup=ForceReply(selective=True),
         )
     except Exception as e:
         logger.error(f"Error in rename_start: {e}")
         return await message.reply_text(
-            "<blockquote>⚠️ <b>ᴇʀʀᴏʀ</b></blockquote>\n"
+            "<blockquote>⚠️ <b>ᴇʀʀᴏR</b></blockquote>\n"
             "╰─ <b>ᴘʟᴇᴀsᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴏʀ ᴄᴏɴᴛᴀᴄᴛ @CosmicBotz.</b>"
         )
 
@@ -179,14 +166,18 @@ async def action_rename_cb(client: Client, query):
         "╰─ <i>Reply to this message with your new filename.</i>"
     )
 
-    await _safe_edit_or_reply(
-        client,
-        query,
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    prompt_msg = await client.send_message(
+        chat_id=query.message.chat.id,
         text=prompt_text,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")]]
-        ),
+        reply_to_message_id=file_msg.id,
+        reply_markup=ForceReply(selective=True),
     )
+    asyncio.create_task(_delayed_delete(prompt_msg, delay=600.0))
 
 
 @Client.on_callback_query(filters.regex(r"^action_extaudio_(\d+)$"))
@@ -267,6 +258,9 @@ async def refunc(client, message):
     if file is None or getattr(file, "media", None) is None:
         msg = await client.get_messages(message.chat.id, reply_message.id)
         file = msg.reply_to_message
+
+    if file is None or getattr(file, "media", None) is None:
+        file = LAST_USER_MEDIA.get(message.from_user.id)
 
     if file is None or getattr(file, "media", None) is None:
         return await message.reply_text("<blockquote>⚠️ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇᴅɪᴀ ᴍᴇssᴀɢᴇ ᴄᴏᴜʟᴅ ɴᴏᴛ ʙᴇ ꜰᴏᴜɴᴅ.</b></blockquote>")
@@ -466,34 +460,46 @@ async def doc(bot, update):
             logger.debug(f"ffprobe/ffmpeg dimension probe skipped: {e}")
 
     if not duration or not width or not height:
-        try:
-            parser = createParser(probe_target)
-            if parser:
-                with parser:
-                    meta_info = extractMetadata(parser)
-                    if meta_info:
-                        if not duration and meta_info.has("duration"):
-                            duration = meta_info.get("duration").seconds
-                        if not width and meta_info.has("width"):
-                            width = int(meta_info.get("width") or 0)
-                        if not height and meta_info.has("height"):
-                            height = int(meta_info.get("height") or 0)
-        except Exception as e:
-            logger.debug(f"Media dimension/duration extraction skipped: {e}")
+        def _parse_hachoir_metadata(probe_target_path: str) -> Tuple[int, int, int]:
+            dur, w, h = 0, 0, 0
+            try:
+                parser = createParser(probe_target_path)
+                if parser:
+                    with parser:
+                        meta_info = extractMetadata(parser)
+                        if meta_info:
+                            if meta_info.has("duration"):
+                                dur = meta_info.get("duration").seconds
+                            if meta_info.has("width"):
+                                w = int(meta_info.get("width") or 0)
+                            if meta_info.has("height"):
+                                h = int(meta_info.get("height") or 0)
+            except Exception as e:
+                logger.debug(f"Media dimension/duration extraction skipped: {e}")
+            return dur, w, h
 
+        h_dur, h_w, h_h = await asyncio.to_thread(_parse_hachoir_metadata, probe_target)
+        if not duration and h_dur:
+            duration = h_dur
+        if not width and h_w:
+            width = h_w
+        if not height and h_h:
+            height = h_h
+
+    auto_delete_notice = "\n\n<blockquote>🗑️ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b></blockquote>"
     if c_caption:
         try:
             caption = c_caption.format(
                 filename=f"<b>{new_filename}</b>",
                 filesize=humanbytes(file_size),
                 duration=convert(duration),
-            )
+            ) + auto_delete_notice
         except Exception as e:
             logger.error(f"Caption formatting error: {e}")
             ram_workspace.cleanup_files(path, metadata_path)
             return await ms.edit(f"<blockquote>⚠️ <b>ᴄᴀᴘᴛɪᴏɴ ᴇʀʀᴏʀ</b></blockquote>\n╰─ <code>{e}</code>")
     else:
-        caption = f"<b>{new_filename}</b>"
+        caption = f"<b>{new_filename}</b>" + auto_delete_notice
 
     # Thumbnail & HD video_cover handling (NEVER uses source media.thumbs):
     # 1. If user saved a custom thumbnail (`c_thumb`), fetch from RAM cache or download once,
@@ -618,12 +624,6 @@ async def doc(bot, update):
         # Increment rename count (updates RAM cache & MongoDB)
         await Mythicbotz.increase_rename_count(user_id)
 
-        # Notify about auto-deletion
-        deletion_msg = await sent_message.reply(
-            "<blockquote>🗑️ <b>ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɴᴏᴛɪᴄᴇ</b></blockquote>\n"
-            "╰─ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b>"
-        )
-
     except StopTransmission:
         clear_transfer_cancellation(user_id, ms.id)
         return
@@ -646,4 +646,4 @@ async def doc(bot, update):
         pass
 
     # Schedule non-blocking auto-delete after 30 minutes
-    asyncio.create_task(_delayed_delete(sent_message, deletion_msg, delay=1800.0))
+    asyncio.create_task(_delayed_delete(sent_message, delay=1800.0))
