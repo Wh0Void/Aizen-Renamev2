@@ -133,16 +133,38 @@ async def rename_start(client: Client, message: Message):
     asyncio.create_task(_delayed_delete(prompt_msg, delay=600.0))
 
 
-@Client.on_callback_query(filters.regex(r"^action_rename_(\d+)$"))
-async def action_rename_cb(client: Client, query):
-    msg_id = int(query.matches[0].group(1))
+async def _safe_edit_or_reply(client: Client, query: CallbackQuery, text: str, reply_markup: Any = None):
+    user_id = query.from_user.id
+    try:
+        await query.message.edit(text=text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await client.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+        except Exception:
+            pass
+
+
+async def _resolve_action_file(client: Client, query: CallbackQuery, msg_id: int) -> Optional[Message]:
+    user_id = query.from_user.id
+    file_msg = None
     try:
         file_msg = await client.get_messages(query.message.chat.id, msg_id)
     except Exception:
-        file_msg = query.message.reply_to_message
+        pass
+    if not file_msg or not getattr(file_msg, "media", None):
+        file_msg = getattr(query.message, "reply_to_message", None)
+    if not file_msg or not getattr(file_msg, "media", None):
+        file_msg = LAST_USER_MEDIA.get(user_id)
+    return file_msg
+
+
+@Client.on_callback_query(filters.regex(r"^action_rename_(\d+)$"))
+async def action_rename_cb(client: Client, query):
+    msg_id = int(query.matches[0].group(1))
+    file_msg = await _resolve_action_file(client, query, msg_id)
 
     if not file_msg or not getattr(file_msg, "media", None):
-        return await query.message.edit("<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        return await _safe_edit_or_reply(client, query, "<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
 
     media = getattr(file_msg, file_msg.media.value)
     filename = getattr(media, "file_name", None) or "Unknown_File"
@@ -155,7 +177,9 @@ async def action_rename_cb(client: Client, query):
         "╰─ <i>Reply to this message with your new filename.</i>"
     )
 
-    await query.message.edit(
+    await _safe_edit_or_reply(
+        client,
+        query,
         text=prompt_text,
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")]]
@@ -166,13 +190,10 @@ async def action_rename_cb(client: Client, query):
 @Client.on_callback_query(filters.regex(r"^action_extaudio_(\d+)$"))
 async def action_extaudio_cb(client: Client, query):
     msg_id = int(query.matches[0].group(1))
-    try:
-        file_msg = await client.get_messages(query.message.chat.id, msg_id)
-    except Exception:
-        file_msg = query.message.reply_to_message
+    file_msg = await _resolve_action_file(client, query, msg_id)
 
     if not file_msg or not getattr(file_msg, "media", None):
-        return await query.message.edit("<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        return await _safe_edit_or_reply(client, query, "<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
 
     from plugins.extract_audio import show_extract_audio_menu
     await show_extract_audio_menu(client, query, file_msg)
@@ -181,13 +202,10 @@ async def action_extaudio_cb(client: Client, query):
 @Client.on_callback_query(filters.regex(r"^action_tmux_(\d+)$"))
 async def action_tmux_cb(client: Client, query):
     msg_id = int(query.matches[0].group(1))
-    try:
-        file_msg = await client.get_messages(query.message.chat.id, msg_id)
-    except Exception:
-        file_msg = query.message.reply_to_message
+    file_msg = await _resolve_action_file(client, query, msg_id)
 
     if not file_msg or not getattr(file_msg, "media", None):
-        return await query.message.edit("<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
+        return await _safe_edit_or_reply(client, query, "<blockquote>❌ <b>ᴏʀɪɢɪɴᴀʟ ᴍᴇssᴀɢᴇ ɴᴏᴛ ꜰᴏᴜɴᴅ.</b></blockquote>")
 
     media = getattr(file_msg, file_msg.media.value)
     filename = getattr(media, "file_name", None) or "Unknown_File"
@@ -198,7 +216,9 @@ async def action_tmux_cb(client: Client, query):
         "╰─ <i>Send a magnet link or <code>/tmux</code> command to merge audio tracks with this file.</i>"
     )
 
-    await query.message.edit(
+    await _safe_edit_or_reply(
+        client,
+        query,
         text=text,
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("✖️ Cancel", callback_data="cancel_rename_prompt")]]

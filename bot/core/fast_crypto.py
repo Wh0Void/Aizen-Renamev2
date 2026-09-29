@@ -1005,6 +1005,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             if not live_sessions:
                                 live_sessions = pool if pool else [session]
                         sess = live_sessions[(sess_idx + attempt) % len(live_sessions)]
+                        main_offset = getattr(getattr(self, "session", None), "time_offset", 0)
+                        if main_offset and hasattr(sess, "time_offset"):
+                            sess.time_offset = main_offset
                         try:
                             await sess.invoke(
                                 data, retries=2, timeout=8.0, sleep_threshold=5

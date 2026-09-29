@@ -177,12 +177,18 @@ async def show_extract_audio_menu(bot: Client, message_or_query: Any, target_msg
         "╰─ <i>Choose your preferred audio output format below:</i>"
     )
 
-    if hasattr(message_or_query, "edit_text"):
-        return await message_or_query.edit_text(text, reply_markup=keyboard)
-    elif hasattr(message_or_query, "message") and hasattr(message_or_query.message, "edit"):
-        return await message_or_query.message.edit(text, reply_markup=keyboard)
-    else:
-        return await message_or_query.reply_text(text, reply_to_message_id=target_msg.id, reply_markup=keyboard)
+    try:
+        if hasattr(message_or_query, "edit_text"):
+            return await message_or_query.edit_text(text, reply_markup=keyboard)
+        elif hasattr(message_or_query, "message") and hasattr(message_or_query.message, "edit"):
+            return await message_or_query.message.edit(text, reply_markup=keyboard)
+        else:
+            return await message_or_query.reply_text(text, reply_to_message_id=target_msg.id, reply_markup=keyboard)
+    except Exception:
+        try:
+            return await bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
+        except Exception:
+            pass
 
 
 @Client.on_message(
