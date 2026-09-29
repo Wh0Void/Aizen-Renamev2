@@ -488,7 +488,13 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     # The pool_task was fired BEFORE the first chunk fetch so session creation
                     # ran concurrently with that network RTT, minimising actual wait time.
                     if needs_pool and pool_task is not None:
-                        pool = await pool_task
+                        try:
+                            pool = await asyncio.wait_for(asyncio.shield(pool_task), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            pools_dict = getattr(self, "media_session_pools", {})
+                            pool = pools_dict.get(dc_id, []) if isinstance(pools_dict, dict) else []
+                            if not pool:
+                                pool = [session]
                     else:
                         pool = [session]
                     if not pool:
@@ -553,18 +559,22 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         break
 
                                     # Pick from currently active/started sessions in pool
+                                    _pools_dict = getattr(self, "media_session_pools", {})
+                                    active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
                                     live_sessions = [
-                                        s for s in pool
+                                        s for s in active_pool
                                         if getattr(s, "is_started", None) and s.is_started.is_set()
                                     ]
                                     if not live_sessions:
                                         await asyncio.sleep(0.2)
+                                        _pools_dict = getattr(self, "media_session_pools", {})
+                                        active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
                                         live_sessions = [
-                                            s for s in pool
+                                            s for s in active_pool
                                             if getattr(s, "is_started", None) and s.is_started.is_set()
                                         ]
                                         if not live_sessions:
-                                            live_sessions = pool if pool else [session]
+                                            live_sessions = active_pool if active_pool else [session]
                                     current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
 
                                     try:
