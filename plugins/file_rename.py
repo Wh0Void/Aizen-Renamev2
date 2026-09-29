@@ -1,3 +1,5 @@
+from typing import Any, Optional, Dict, List, Tuple
+
 from pyrogram import Client, filters, StopTransmission
 from pyrogram.enums import MessageMediaType
 from pyrogram.errors import FloodWait
