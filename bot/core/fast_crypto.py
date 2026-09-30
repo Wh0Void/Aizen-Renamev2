@@ -37,27 +37,24 @@ CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
 MIN_MEDIA_POOL_SIZE: int = 4
 MAX_MEDIA_POOL_SIZE: int = 48
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "12"))
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "24"))
 
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
     """
     Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency
     based on file size and transfer duration profiles:
-      - Bot Tokens: 8-10 dedicated sockets, 16-20 workers to prevent FLOOD_WAIT 1s rate caps.
-      - User/Premium Sessions: 16-24 dedicated sockets, 32-48 workers for maximum bandwidth.
+      - Downloads: Up to 16-24 dedicated sockets, 32-48 workers for sustained 35-50+ MB/s download throughput.
+      - Uploads: Up to 24 dedicated sockets, 48 workers for maximum upload part speed.
     """
     mb = file_size_bytes / (1024 * 1024)
-    if is_user_session:
-        max_pool = 24 if mb > 200 else 16
-    else:
-        max_pool = 10 if mb > 200 else 8
-
     if is_upload:
+        max_pool = 24 if mb > 200 else 16
         pool_size = max_pool
         workers = pool_size * 2
         part_size = CHUNK_SIZE_512KB
     else:
+        max_pool = 24 if (is_user_session or mb > 200) else 16
         pool_size = max_pool
         workers = pool_size * 2
         part_size = DOWNLOAD_CHUNK_1MB
@@ -491,8 +488,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     # ran concurrently with that network RTT, minimising actual wait time.
                     if needs_pool and pool_task is not None:
                         try:
-                            pool = await asyncio.wait_for(asyncio.shield(pool_task), timeout=0.25)
-                        except asyncio.TimeoutError:
+                            pool = await pool_task
+                        except Exception as e:
+                            logger.debug("Media session pool acquisition error: %s", e)
                             pools_dict = getattr(self, "media_session_pools", {})
                             pool = pools_dict.get(dc_id, []) if isinstance(pools_dict, dict) else []
                             if not pool:
@@ -876,7 +874,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         main_sess = getattr(self, "session", None) or media
                         time_offset = getattr(main_sess, "time_offset", 0) or getattr(media, "time_offset", 0)
 
-                        PORTS = [443, 80, 5222]
+                        PORTS = [443]
                         while needed > 0:
                             chunk = min(needed, 16)
                             gate = getattr(self, "_session_creation_gate", None)
@@ -990,21 +988,23 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 _acked = [0]
 
-                async def _send_part(worker_idx: int, data: Any) -> None:
+                async def _send_part(worker_idx: int, data: Any) -> bool:
                     sess_idx = worker_idx
-                    for attempt in range(8):
+                    for attempt in range(12):
+                        _pools_dict = getattr(self, "media_session_pools", {})
+                        active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
                         live_sessions = [
-                            s for s in pool
+                            s for s in active_pool
                             if getattr(s, "is_started", None) and s.is_started.is_set()
                         ]
                         if not live_sessions:
-                            await asyncio.sleep(0.2)
+                            await asyncio.sleep(0.15)
                             live_sessions = [
-                                s for s in pool
+                                s for s in active_pool
                                 if getattr(s, "is_started", None) and s.is_started.is_set()
                             ]
                             if not live_sessions:
-                                live_sessions = pool if pool else [session]
+                                live_sessions = active_pool if active_pool else [session]
                         sess = live_sessions[(sess_idx + attempt) % len(live_sessions)]
                         main_offset = getattr(getattr(self, "session", None), "time_offset", 0)
                         if main_offset and hasattr(sess, "time_offset"):
@@ -1013,7 +1013,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             await sess.invoke(
                                 data, retries=2, timeout=8.0, sleep_threshold=5
                             )
-                            return
+                            return True
                         except StopTransmission:
                             raise
                         except (FloodWait, FloodPremiumWait) as fw:
@@ -1024,25 +1024,35 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             logger.debug("Upload transient 503/server error (attempt %d): %s", attempt, err)
                             await asyncio.sleep(0.3 * (1.5 ** min(attempt, 3)))
                         except asyncio.CancelledError:
-                            return
+                            return False
                         except Exception as exc:
                             if hasattr(sess, "is_started") and not sess.is_started.is_set():
                                 utils.run_in_background(sess.restart(), self.loop)
-                            if attempt >= 7:
-                                raise
-                            await asyncio.sleep(0.05 * (2 ** min(attempt, 3)))
+                            await asyncio.sleep(0.05 * (1.5 ** min(attempt, 3)))
+                    return False
 
                 async def worker(worker_idx: int) -> None:
                     while True:
                         data = await queue.get()
                         if data is None:
                             return
+                        success = False
                         try:
-                            await _send_part(worker_idx, data)
-                            _acked[0] += 1
+                            success = await _send_part(worker_idx, data)
+                            if success:
+                                _acked[0] += 1
+                            else:
+                                await queue.put(data)
+                        except StopTransmission:
+                            raise
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as exc:
+                            logger.warning("Upload worker %d exception: %s", worker_idx, exc)
+                            await queue.put(data)
                         finally:
-                            data = None
-                            budget.release()
+                            if success:
+                                budget.release()
 
                 workers = [
                     self.loop.create_task(worker(i))
