@@ -36,28 +36,21 @@ if sys.platform == "win32":
 CHUNK_SIZE_512KB: int = 512 * 1024  # 512 KB per MTProto upload part
 DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
 MIN_MEDIA_POOL_SIZE: int = 4
-MAX_MEDIA_POOL_SIZE: int = 48
-DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "24"))
+MAX_MEDIA_POOL_SIZE: int = 16
+DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "16"))
 
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
     """
     Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency
     based on file size and transfer duration profiles:
-      - Downloads: Up to 16-24 dedicated sockets, 32-48 workers for sustained 35-50+ MB/s download throughput.
-      - Uploads: Up to 24 dedicated sockets, 48 workers for maximum upload part speed.
+      - Downloads: Up to 16 dedicated sockets, 32 workers for sustained 14-16+ MB/s download throughput.
+      - Uploads: Up to 16 dedicated sockets, 32 workers for peak 21-24+ MB/s upload part speed.
     """
-    mb = file_size_bytes / (1024 * 1024)
-    if is_upload:
-        max_pool = 24 if mb > 200 else 16
-        pool_size = max_pool
-        workers = pool_size * 2
-        part_size = CHUNK_SIZE_512KB
-    else:
-        max_pool = 24 if (is_user_session or mb > 200) else 16
-        pool_size = max_pool
-        workers = pool_size * 2
-        part_size = DOWNLOAD_CHUNK_1MB
+    max_pool = 16
+    pool_size = max_pool
+    workers = pool_size * 2
+    part_size = CHUNK_SIZE_512KB if is_upload else DOWNLOAD_CHUNK_1MB
 
     total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
     actual_pool = min(pool_size, total_parts)
@@ -572,15 +565,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if getattr(s, "is_started", None) and s.is_started.is_set()
                                     ]
                                     if not live_sessions:
-                                        await asyncio.sleep(0.2)
-                                        _pools_dict = getattr(self, "media_session_pools", {})
-                                        active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
-                                        live_sessions = [
-                                            s for s in active_pool
-                                            if getattr(s, "is_started", None) and s.is_started.is_set()
-                                        ]
-                                        if not live_sessions:
-                                            live_sessions = active_pool if active_pool else [session]
+                                        await asyncio.sleep(0.3)
+                                        continue
                                     current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
 
                                     try:
@@ -617,6 +603,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if (
                                             hasattr(current_sess, "is_started")
                                             and not current_sess.is_started.is_set()
+                                            and not getattr(current_sess, "is_restarting", False)
                                         ):
                                             utils.run_in_background(
                                                 current_sess.restart(), self.loop
@@ -1000,7 +987,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 async def _send_part(worker_idx: int, data: Any) -> bool:
                     sess_idx = worker_idx
-                    for attempt in range(12):
+                    for attempt in range(8):
                         _pools_dict = getattr(self, "media_session_pools", {})
                         active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
                         live_sessions = [
@@ -1008,13 +995,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                             if getattr(s, "is_started", None) and s.is_started.is_set()
                         ]
                         if not live_sessions:
-                            await asyncio.sleep(0.15)
-                            live_sessions = [
-                                s for s in active_pool
-                                if getattr(s, "is_started", None) and s.is_started.is_set()
-                            ]
-                            if not live_sessions:
-                                live_sessions = active_pool if active_pool else [session]
+                            await asyncio.sleep(0.3)
+                            continue
                         sess = live_sessions[(sess_idx + attempt) % len(live_sessions)]
                         main_offset = getattr(getattr(self, "session", None), "time_offset", 0)
                         if main_offset and hasattr(sess, "time_offset"):
@@ -1036,7 +1018,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         except asyncio.CancelledError:
                             return False
                         except Exception as exc:
-                            if hasattr(sess, "is_started") and not sess.is_started.is_set():
+                            if hasattr(sess, "is_started") and not sess.is_started.is_set() and not getattr(sess, "is_restarting", False):
                                 utils.run_in_background(sess.restart(), self.loop)
                             await asyncio.sleep(0.05 * (1.5 ** min(attempt, 3)))
                     return False
@@ -1265,13 +1247,17 @@ class MultiSessionMediaPool:
         release_memory()
 
     async def warm_up(self) -> int:
-        """Pre-warm parallel media sessions across all Telegram Data Centers (DC1-DC5) so bot is ready instantly."""
+        """Pre-warm parallel media sessions on primary DC and major media DC (DC2) so bot is ready instantly."""
         total_warmed = 0
         clients = getattr(self, "clients", [self.client] if self.client else [])
         for cl in clients:
             if cl is not None and getattr(cl, "is_connected", False):
                 try:
-                    for dc_id in [1, 2, 3, 4, 5]:
+                    primary_dc = await cl.storage.dc_id()
+                    target_dcs = [primary_dc]
+                    if primary_dc != 2:
+                        target_dcs.append(2)
+                    for dc_id in target_dcs:
                         try:
                             pool = await cl._get_media_session_pool(dc_id, self.pool_size)
                             total_warmed += len(pool)
