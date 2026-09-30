@@ -43,22 +43,12 @@ _MTPROTO_PATCHED: bool = False
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
     """
-    Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency.
-
-    Telegram DC5 enforces an undocumented per-auth-key concurrent connection limit of ~4.
-    Opening more than 4 simultaneous media sessions causes BrokenPipeError RSTs on the
-    excess connections, starving the pool to 1 session → KB/s death spiral.
-
-    Downloads: 4 sockets, 16 workers (4 pipelined GetFile per socket) → 14-16 MB/s.
-    Uploads:  16 sockets, 32 workers → 21-24 MB/s (upload sessions are managed differently).
+    Calculate optimal MTProto TCP media session pool size and worker concurrency matching dc5c84b:
+      - Downloads: 16 sockets, 32 workers for sustained 14-16+ MB/s download throughput.
+      - Uploads: 16 sockets, 32 workers for peak 21-24+ MB/s upload part speed.
     """
-    if is_upload:
-        max_pool = 16
-        workers = max_pool * 2
-    else:
-        max_pool = 4   # DC5 hard limit: >4 shared-auth-key sessions → BrokenPipeError
-        workers = max_pool * 4  # 4 pipelined workers per socket = same total parallelism
-
+    max_pool = 16
+    workers = 32
     part_size = CHUNK_SIZE_512KB if is_upload else DOWNLOAD_CHUNK_1MB
     total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else max_pool
     actual_pool = min(max_pool, total_parts)
@@ -585,20 +575,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     if offset_cur in written_offsets:
                                         break
 
-                                    # Pick from currently active/started sessions in pool
                                     _pools_dict = getattr(self, "media_session_pools", {})
                                     active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
-                                    live_sessions = [
-                                        s for s in active_pool
-                                        if getattr(s, "is_started", None) and s.is_started.is_set()
-                                    ]
-                                    if not live_sessions:
-                                        # Give session restart coroutines real CPU time.
-                                        # sleep(0) across 32 workers pegs CPU at 100% and
-                                        # starves the restart tasks that would fix the pool.
-                                        await asyncio.sleep(0.05 * (1.5 ** min(_retry, 5)))
-                                        continue
-                                    current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
+                                    current_sess = active_pool[(sess_idx + _retry) % len(active_pool)]
 
                                     try:
                                         r_res = await current_sess.invoke(
@@ -608,8 +587,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                                 limit=chunk_size,
                                             ),
                                             retries=2,
-                                            timeout=8.0,
-                                            sleep_threshold=5,
+                                            timeout=12.0,
+                                            sleep_threshold=10,
                                         )
                                         if isinstance(r_res, raw.types.upload.File):
                                             chunk_data = r_res.bytes
@@ -625,7 +604,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         await asyncio.sleep(fw_sec + jitter)
                                     except (ServiceUnavailable, InternalServerError, BadMsgNotification) as err:
                                         logger.debug("Download 503/transient server error: %s", err)
-                                        await asyncio.sleep(0.3 * (1.5 ** min(_retry, 3)))
+                                        await asyncio.sleep(0.15 * (1.5 ** min(_retry, 3)))
                                     except asyncio.CancelledError:
                                         if offset_cur not in written_offsets:
                                             work.put_nowait(offset_cur)
@@ -639,7 +618,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                             utils.run_in_background(
                                                 current_sess.restart(), self.loop
                                             )
-                                        await asyncio.sleep(min(0.15 * (1.5 ** _retry), 2.0))
+                                        await asyncio.sleep(0.05 * (1.5 ** min(_retry, 3)))
 
                                 if not chunk_data and offset_cur + chunk_size < file_size:
                                     # Never crash download on transient socket drop: re-queue offset and retry
@@ -903,14 +882,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         time_offset = getattr(main_sess, "time_offset", 0) or getattr(media, "time_offset", 0)
 
                         PORTS = [443]
-                        BATCH_SIZE = 2       # 2 simultaneous auth handshakes avoids DC rate limits.
-                        BATCH_DELAY = 1.0    # 1s gap between batches; total 4 sessions in ~1.5s.
-                        first_batch = True   # No delay before the very first batch.
                         while needed > 0:
-                            chunk = min(needed, BATCH_SIZE)
-                            if not first_batch:
-                                await asyncio.sleep(BATCH_DELAY)
-                            first_batch = False
+                            chunk = min(needed, 16)
                             gate = _get_client_semaphore(self, "_session_creation_gate", 16)
                             async with gate:
                                 start_idx = len(pool)
@@ -925,14 +898,11 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                 ], return_exceptions=True)
                                 for s in created:
                                     if isinstance(s, Exception):
-                                        logger.debug("Session creation error (batch): %s", s)
+                                        logger.debug("Session creation error: %s", s)
                                         continue
                                     if hasattr(s, "time_offset"):
                                         s.time_offset = time_offset
                                     pool.append(s)
-                            # Publish after every batch so download workers can pick up
-                            # new sessions immediately without waiting for the full pool.
-                            self.media_session_pools[dc_id] = list(pool)
                             needed -= chunk
                     self.media_session_pools[dc_id] = pool
                     return list(pool)
@@ -1287,36 +1257,22 @@ class MultiSessionMediaPool:
         release_memory()
 
     async def warm_up(self) -> int:
-        """Pre-warm a minimal set of media sessions after a startup delay.
+        """Pre-warm 16 parallel media sessions on primary DC after a 15-second startup delay.
 
-        We delay 30 seconds to give Pyrogram's update dispatcher, ping tasks, and
-        the Telegram long-poll connection time to fully establish before we acquire
-        any _media_sessions_locks. Holding those locks during the initial burst
-        starves the update loop for several minutes on Koyeb.
-
-        We warm only 4 sockets (enough to start transfers immediately) on the
-        primary DC and DC2.  Additional sockets are created on-demand during the
-        first real transfer without further blocking the dispatcher.
+        Delaying 15 seconds allows the bot's primary long-poll session and handlers
+        to fully initialize first, ensuring zero startup latency for user commands.
         """
-        await asyncio.sleep(30)   # let the bot fully initialize first
+        await asyncio.sleep(15.0)
         total_warmed = 0
-        WARM_SOCKETS = 4  # minimal — avoids long lock hold-time at startup
         clients = getattr(self, "clients", [self.client] if self.client else [])
         for cl in clients:
             if cl is not None and getattr(cl, "is_connected", False):
                 try:
                     primary_dc = await cl.storage.dc_id()
-                    target_dcs = [primary_dc]
-                    if primary_dc != 2:
-                        target_dcs.append(2)
-                    for dc_id in target_dcs:
-                        try:
-                            pool = await cl._get_media_session_pool(dc_id, WARM_SOCKETS)
-                            total_warmed += len(pool)
-                        except Exception as dce:
-                            logger.debug("DC %d pre-warm notice: %s", dc_id, dce)
+                    pool = await cl._get_media_session_pool(primary_dc, self.pool_size)
+                    total_warmed += len(pool)
                 except Exception as e:
-                    logger.debug("Media pool pre-warm error: %s", e)
+                    logger.debug("Media pool pre-warm notice: %s", e)
         return total_warmed
 
     def get_stats(self) -> Dict[str, Any]:
