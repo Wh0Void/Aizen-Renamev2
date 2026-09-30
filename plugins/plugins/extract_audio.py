@@ -1,4 +1,4 @@
-"""
+r'''
 import os
 import sys
 import time
@@ -563,3 +563,4 @@ async def run_audio_extraction_task(
             await ms.delete()
         except Exception:
             pass
+'''

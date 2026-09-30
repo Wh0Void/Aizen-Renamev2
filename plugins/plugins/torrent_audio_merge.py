@@ -1,4 +1,4 @@
-"""
+r'''
 import asyncio
 import ctypes
 import functools
@@ -745,4 +745,5 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
                 pass
 
     raise StopPropagation
+'''
 
