@@ -278,6 +278,16 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         if sock is not None:
                             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            if hasattr(socket, "SO_RCVBUF"):
+                                try:
+                                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+                                except OSError:
+                                    pass
+                            if hasattr(socket, "SO_SNDBUF"):
+                                try:
+                                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
+                                except OSError:
+                                    pass
                             if hasattr(socket, "TCP_KEEPIDLE"):
                                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
                             elif hasattr(socket, "TCP_KEEPALIVE"):
@@ -636,8 +646,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                                 chunk_len = len(chunk_data) if chunk_data else 0
                                 chunk_data = None
-                                # 1ms micro-yield to keep asyncio event loop 100% responsive for callbacks while achieving peak speed
-                                await asyncio.sleep(0.001)
+                                # Zero-yield to keep asyncio event loop 100% responsive for callbacks while achieving peak speed
+                                await asyncio.sleep(0)
                                 if chunk_len < chunk_size and (offset_cur + chunk_size >= file_size):
                                     return
                             except StopTransmission:
@@ -977,12 +987,12 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                 n_sessions = len(pool)
                 n_workers = min(dyn_ul_workers, min(n_sessions * 2, file_total_parts))
-                queue = asyncio.Queue(n_workers * 2)
+                queue = asyncio.Queue(n_workers * 4)
 
                 read_ahead_budget = getattr(self, "read_ahead_slots", None)
                 if not isinstance(read_ahead_budget, asyncio.Semaphore):
                     read_ahead_budget = asyncio.Semaphore(
-                        int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "256"))
+                        int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "384"))
                     )
                 budget = ReadAhead(read_ahead_budget)
 
@@ -1255,17 +1265,13 @@ class MultiSessionMediaPool:
         release_memory()
 
     async def warm_up(self) -> int:
-        """Pre-warm parallel media sessions on primary DC and major media DCs (DC2, DC4) so bot is ready instantly."""
+        """Pre-warm parallel media sessions across all Telegram Data Centers (DC1-DC5) so bot is ready instantly."""
         total_warmed = 0
         clients = getattr(self, "clients", [self.client] if self.client else [])
         for cl in clients:
             if cl is not None and getattr(cl, "is_connected", False):
                 try:
-                    primary_dc = await cl.storage.dc_id()
-                    target_dcs = [primary_dc]
-                    if primary_dc != 2:
-                        target_dcs.append(2)
-                    for dc_id in target_dcs:
+                    for dc_id in [1, 2, 3, 4, 5]:
                         try:
                             pool = await cl._get_media_session_pool(dc_id, self.pool_size)
                             total_warmed += len(pool)
