@@ -58,7 +58,16 @@ def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_
     return actual_pool, actual_workers
 
 
-_MTPROTO_PATCHED: bool = False
+def _get_client_semaphore(client: Any, attr_name: str, value: int = 128) -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    sem = getattr(client, attr_name, None)
+    if sem is None or (loop is not None and getattr(sem, "_loop", None) is not None and getattr(sem, "_loop") is not loop):
+        sem = asyncio.Semaphore(value)
+        setattr(client, attr_name, sem)
+    return sem
 
 
 def configure_wzgram_environment(
@@ -321,7 +330,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             progress_args: tuple = (),
             _write_file: Any = None,
         ):
-            async with getattr(self, "get_file_semaphore", asyncio.Semaphore(128)):
+            get_sem = _get_client_semaphore(self, "get_file_semaphore", 128)
+            async with get_sem:
                 if not isinstance(file_id, FileId):
                     file_id = FileId.decode(file_id)
 
@@ -483,15 +493,25 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
 
-                    # ── Pool acquisition: BLOCKING await — mirrors save_file exactly ──────────
-                    # save_file does:  pool = await self._get_media_session_pool(dc_id, 8)
-                    #                  n_workers = len(pool) * 2
-                    # We do the same. No timeout, no fallback — block until all sessions ready.
-                    # The pool_task was fired BEFORE the first chunk fetch so session creation
-                    # ran concurrently with that network RTT, minimising actual wait time.
+                    # ── Pool acquisition: non-blocking with short timeout ─────────────────
+                    # We fire pool_task in background so session creation runs in parallel
+                    # with the first sequential chunk fetch. After that fetch completes we
+                    # give the pool build 2 seconds to finish.  If it is still running we
+                    # start workers immediately with whatever sessions are already live
+                    # (workers refresh live_sessions on every chunk, so they adopt new
+                    # sessions as they come online without stalling).
                     if needs_pool and pool_task is not None:
                         try:
-                            pool = await pool_task
+                            pool = await asyncio.wait_for(
+                                asyncio.shield(pool_task), timeout=2.0
+                            )
+                        except asyncio.TimeoutError:
+                            # Pool still building — use whatever is live so far
+                            pools_dict = getattr(self, "media_session_pools", {})
+                            pool = pools_dict.get(dc_id, []) if isinstance(pools_dict, dict) else []
+                            if not pool:
+                                pool = [session]
+                            logger.debug("Pool still building after 2s, starting workers with %d live sessions", len(pool))
                         except Exception as e:
                             logger.debug("Media session pool acquisition error: %s", e)
                             pools_dict = getattr(self, "media_session_pools", {})
@@ -565,7 +585,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if getattr(s, "is_started", None) and s.is_started.is_set()
                                     ]
                                     if not live_sessions:
-                                        await asyncio.sleep(0.3)
+                                        # Yield to the event loop immediately so pool_task
+                                        # can make progress (asyncio.gather inside it needs
+                                        # turns). Only back off with real sleep after the
+                                        # first 3 zero-cost yields haven't found any sessions.
+                                        if _retry < 3:
+                                            await asyncio.sleep(0)
+                                        else:
+                                            await asyncio.sleep(0.05 * (1.5 ** (_retry - 3)))
                                         continue
                                     current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
 
@@ -615,7 +642,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     if offset_cur not in written_offsets:
                                         work.put_nowait(offset_cur)
                                     buffer_slots.release()
-                                    await asyncio.sleep(0.3)
+                                    await asyncio.sleep(0)  # yield event loop; another worker picks it up
                                     continue
 
                                 if offset_cur not in written_offsets:
@@ -874,10 +901,7 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         PORTS = [443]
                         while needed > 0:
                             chunk = min(needed, 16)
-                            gate = getattr(self, "_session_creation_gate", None)
-                            if gate is None:
-                                gate = asyncio.Semaphore(16)
-                                self._session_creation_gate = gate
+                            gate = _get_client_semaphore(self, "_session_creation_gate", 16)
                             async with gate:
                                 start_idx = len(pool)
                                 created = await asyncio.gather(*(
@@ -931,7 +955,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
             from pathlib import PurePath
             import io
 
-            async with getattr(self, "save_file_semaphore", asyncio.Semaphore(128)):
+            save_sem = _get_client_semaphore(self, "save_file_semaphore", 128)
+            async with save_sem:
                 if path is None:
                     return None
 
@@ -976,11 +1001,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                 n_workers = min(dyn_ul_workers, min(n_sessions * 2, file_total_parts))
                 queue = asyncio.Queue(n_workers * 4)
 
-                read_ahead_budget = getattr(self, "read_ahead_slots", None)
-                if not isinstance(read_ahead_budget, asyncio.Semaphore):
-                    read_ahead_budget = asyncio.Semaphore(
-                        int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "384"))
-                    )
+                read_ahead_budget = _get_client_semaphore(
+                    self, "read_ahead_slots", int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "384"))
+                )
                 budget = ReadAhead(read_ahead_budget)
 
                 _acked = [0]
@@ -1219,8 +1242,9 @@ class MultiSessionMediaPool:
             if self.client is None:
                 self.client = client
 
-            # Guard attributes so existing semaphores are never overwritten if already attached
-            if not getattr(client, "_fast_crypto_attached", False):
+            # Guard attributes so existing semaphores are never overwritten if already attached.
+            # Use `is True` (not truthiness) so MagicMock attributes don't accidentally trip the guard.
+            if getattr(client, "_fast_crypto_attached", None) is not True:
                 try:
                     gate = getattr(client, "_session_creation_gate", None)
                     if not (isinstance(gate, asyncio.Semaphore) and gate.locked()):
@@ -1247,8 +1271,20 @@ class MultiSessionMediaPool:
         release_memory()
 
     async def warm_up(self) -> int:
-        """Pre-warm parallel media sessions on primary DC and major media DC (DC2) so bot is ready instantly."""
+        """Pre-warm a minimal set of media sessions after a startup delay.
+
+        We delay 30 seconds to give Pyrogram's update dispatcher, ping tasks, and
+        the Telegram long-poll connection time to fully establish before we acquire
+        any _media_sessions_locks. Holding those locks during the initial burst
+        starves the update loop for several minutes on Koyeb.
+
+        We warm only 4 sockets (enough to start transfers immediately) on the
+        primary DC and DC2.  Additional sockets are created on-demand during the
+        first real transfer without further blocking the dispatcher.
+        """
+        await asyncio.sleep(30)   # let the bot fully initialize first
         total_warmed = 0
+        WARM_SOCKETS = 4  # minimal — avoids long lock hold-time at startup
         clients = getattr(self, "clients", [self.client] if self.client else [])
         for cl in clients:
             if cl is not None and getattr(cl, "is_connected", False):
@@ -1259,7 +1295,7 @@ class MultiSessionMediaPool:
                         target_dcs.append(2)
                     for dc_id in target_dcs:
                         try:
-                            pool = await cl._get_media_session_pool(dc_id, self.pool_size)
+                            pool = await cl._get_media_session_pool(dc_id, WARM_SOCKETS)
                             total_warmed += len(pool)
                         except Exception as dce:
                             logger.debug("DC %d pre-warm notice: %s", dc_id, dce)
