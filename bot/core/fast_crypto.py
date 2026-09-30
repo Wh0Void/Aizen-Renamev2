@@ -491,25 +491,13 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                     total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
 
-                    # ── Pool acquisition: non-blocking with short timeout ─────────────────
+                    # ── Pool acquisition: await pool build completely ───────────────────
                     # We fire pool_task in background so session creation runs in parallel
-                    # with the first sequential chunk fetch. After that fetch completes we
-                    # give the pool build 2 seconds to finish.  If it is still running we
-                    # start workers immediately with whatever sessions are already live
-                    # (workers refresh live_sessions on every chunk, so they adopt new
-                    # sessions as they come online without stalling).
+                    # with the first sequential chunk fetch. After that fetch completes, we
+                    # await pool_task to ensure all media sessions in the pool are ready.
                     if needs_pool and pool_task is not None:
                         try:
-                            pool = await asyncio.wait_for(
-                                asyncio.shield(pool_task), timeout=2.0
-                            )
-                        except asyncio.TimeoutError:
-                            # Pool still building — use whatever is live so far
-                            pools_dict = getattr(self, "media_session_pools", {})
-                            pool = pools_dict.get(dc_id, []) if isinstance(pools_dict, dict) else []
-                            if not pool:
-                                pool = [session]
-                            logger.debug("Pool still building after 2s, starting workers with %d live sessions", len(pool))
+                            pool = await pool_task
                         except Exception as e:
                             logger.debug("Media session pool acquisition error: %s", e)
                             pools_dict = getattr(self, "media_session_pools", {})
@@ -549,10 +537,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                     _total_chunks = chunks_needed
 
                     # ── Dedicated Pipelined Socket Workers (2:1 Ratio) ─────────────────────────
-                    # Each worker pair (2i, 2i+1) is dedicated to pool socket i with dynamic live failover.
+                    # Workers dynamically round-robin across all live active sessions by worker_idx.
                     async def _worker(worker_idx: int) -> None:
                         nonlocal _done_count
-                        sess_idx = worker_idx % len(pool) if pool else 0
 
                         while True:
                             try:
@@ -577,7 +564,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
 
                                     _pools_dict = getattr(self, "media_session_pools", {})
                                     active_pool = (_pools_dict.get(dc_id, pool) if isinstance(_pools_dict, dict) else pool) or pool
-                                    current_sess = active_pool[(sess_idx + _retry) % len(active_pool)]
+                                    live_sessions = [
+                                        s for s in active_pool
+                                        if getattr(s, "is_started", None) and s.is_started.is_set()
+                                    ]
+                                    if not live_sessions:
+                                        live_sessions = active_pool or [session]
+
+                                    current_sess = live_sessions[(worker_idx + _retry) % len(live_sessions)]
 
                                     try:
                                         r_res = await current_sess.invoke(
