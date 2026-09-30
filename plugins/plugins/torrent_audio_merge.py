@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import time
 from hashlib import md5, sha256
 from pathlib import PurePath
@@ -18,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
-from pyrogram import Client, StopTransmission, filters, raw, utils
+from pyrogram import Client, StopPropagation, StopTransmission, filters, raw, utils
 from pyrogram.connection.transport.tcp import TCP
 from pyrogram.enums import MessageMediaType
 from pyrogram.errors import CDNFileHashMismatch, FloodPremiumWait, FloodWait, VolumeLocNotFound
@@ -51,14 +52,9 @@ logger = logging.getLogger(__name__)
 # SECTION 1: CONCURRENCY CONFIGURE UTILS
 # =========================================================================
 
-def auto_boost_client(client: Client) -> None:
-    """Pre-configures client concurrency gates."""
-    try:
-        client._session_creation_gate = asyncio.Semaphore(16)
-        client.get_file_semaphore = asyncio.Semaphore(128)
-        client.save_file_semaphore = asyncio.Semaphore(128)
-    except Exception:
-        pass
+def auto_boost_client(client: Any = None) -> None:
+    """Safe no-op: Concurrency gates are managed by fast_crypto."""
+    pass
 
 
 # =========================================================================
@@ -120,6 +116,7 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
     """
     Downloads torrent with aria2c configured for maximum peer saturation.
     Displays dynamic speed, animated progress bar, seeds, and leechers.
+    Enforces a 300s seeder inactivity timeout and an overall 1800s execution timeout.
     """
     if not shutil.which("aria2c"):
         raise RuntimeError("`aria2c` binary not found in PATH.")
@@ -141,64 +138,94 @@ async def _download_torrent_aria2(torrent_source: str, download_dir: str, status
         "--bt-enable-lpd=true",
         "--bt-max-peers=128",
         "--bt-request-peer-speed-limit=100M",
+        "--bt-stop-timeout=300",
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
         torrent_source,
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
 
-    last_update = time.time()
-    frame_idx = 0
+        async def _stream_output() -> int:
+            last_update = time.time()
+            frame_idx = 0
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="ignore").strip()
 
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        decoded = line.decode("utf-8", errors="ignore").strip()
+                now = time.time()
+                # Throttled to 4.0s to completely avoid Telegram FloodWait
+                if now - last_update >= 4.0:
+                    pct_m = re.search(r"\((\d+(?:\.\d+)?)\%\)", decoded)
+                    dl_m = re.search(r"DL:([0-9.]+[A-Za-z]+)", decoded)
+                    eta_m = re.search(r"ETA:([0-9A-Za-z]+)", decoded)
+                    cn_m = re.search(r"CN:(\d+)", decoded)
+                    sd_m = re.search(r"SD:(\d+)", decoded)
 
-        now = time.time()
-        # Throttled to 4.0s to completely avoid Telegram FloodWait
-        if now - last_update >= 4.0:
-            pct_m = re.search(r"\((\d+(?:\.\d+)?)\%\)", decoded)
-            dl_m = re.search(r"DL:([0-9.]+[A-Za-z]+)", decoded)
-            eta_m = re.search(r"ETA:([0-9A-Za-z]+)", decoded)
-            cn_m = re.search(r"CN:(\d+)", decoded)
-            sd_m = re.search(r"SD:(\d+)", decoded)
+                    if pct_m and dl_m:
+                        pct = float(pct_m.group(1))
+                        speed = dl_m.group(1)
+                        eta = eta_m.group(1) if eta_m else "N/A"
+                        leechers = cn_m.group(1) if cn_m else "0"
+                        seeds = sd_m.group(1) if sd_m else "0"
 
-            if pct_m and dl_m:
-                pct = float(pct_m.group(1))
-                speed = dl_m.group(1)
-                eta = eta_m.group(1) if eta_m else "N/A"
-                leechers = cn_m.group(1) if cn_m else "0"
-                seeds = sd_m.group(1) if sd_m else "0"
+                        bar = render_animated_bar(pct, length=10, frame_idx=frame_idx)
+                        frame_idx += 1
 
-                bar = render_animated_bar(pct, length=10, frame_idx=frame_idx)
-                frame_idx += 1
+                        progress_text = (
+                            "<blockquote>⚡ <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ...</b></blockquote>\n"
+                            f"╭─ 📊 <b>ᴘʀᴏɢʀᴇss :</b> <code>{bar} {pct:.1f}%</code>\n"
+                            f"├─ 🚀 <b>sᴘᴇᴇᴅ :</b> <code>{speed}/s</code>\n"
+                            f"├─ ⏱️ <b>ᴇᴛᴀ :</b> <code>{eta}</code>\n"
+                            f"╰─ 👥 <b>sᴇᴇᴅs :</b> <code>{seeds}</code> | <b>ʟᴇᴇᴄʜᴇʀs :</b> <code>{leechers}</code>"
+                        )
+                        try:
+                            await status_msg.edit(progress_text)
+                            last_update = now
+                        except FloodWait as fw:
+                            await asyncio.sleep(fw.value)
+                        except Exception:
+                            pass
 
-                progress_text = (
-                    "<blockquote>⚡ <b>ᴛᴏʀʀᴇɴᴛ ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ...</b></blockquote>\n"
-                    f"╭─ 📊 <b>ᴘʀᴏɢʀᴇss :</b> <code>{bar} {pct:.1f}%</code>\n"
-                    f"├─ 🚀 <b>sᴘᴇᴇᴅ :</b> <code>{speed}/s</code>\n"
-                    f"├─ ⏱️ <b>ᴇᴛᴀ :</b> <code>{eta}</code>\n"
-                    f"╰─ 👥 <b>sᴇᴇᴅs :</b> <code>{seeds}</code> | <b>ʟᴇᴇᴄʜᴇʀs :</b> <code>{leechers}</code>"
-                )
-                try:
-                    await status_msg.edit(progress_text)
-                    last_update = now
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value)
-                except Exception:
-                    pass
+                await asyncio.sleep(0.02)
+            return await process.wait()
 
-        await asyncio.sleep(0.02)
+        return_code = await asyncio.wait_for(_stream_output(), timeout=1800.0)
+        return return_code == 0
 
-    return_code = await process.wait()
-    return return_code == 0
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if isinstance(exc, asyncio.TimeoutError):
+            logger.error("Aria2 download timed out after 1800.0s")
+        else:
+            logger.warning("Aria2 download was cancelled")
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            await process.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return False
+    finally:
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            await process.wait()
 
 
 async def _mux_audio_stream_copy(
@@ -210,6 +237,7 @@ async def _mux_audio_stream_copy(
     """
     Stream-copy muxing with FFmpeg using ZERO re-encoding to preserve CPU.
     Trims audio at video duration if audio is longer than video.
+    Enforces a 300.0s execution timeout and robust child process cleanup.
     """
     dur_args = ["-t", str(max_duration)] if max_duration > 0 else []
     cmd = [
@@ -229,12 +257,41 @@ async def _mux_audio_stream_copy(
         output_path,
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
+    process = None
+    stderr = b""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=300.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        if isinstance(exc, asyncio.TimeoutError):
+            logger.error("FFmpeg stream-copy timed out after 300.0s")
+        else:
+            logger.warning("FFmpeg stream-copy was cancelled")
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            await process.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return False
+    finally:
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            await process.wait()
+
     await asyncio.sleep(0.5)
 
     if process.returncode != 0:
@@ -255,7 +312,6 @@ async def _mux_audio_stream_copy(
     )
 )
 async def torrent_start(client: Client, message: Message):
-    auto_boost_client(client)
     user_id = int(message.from_user.id)
 
     if await Mythicbotz.is_banned(user_id):
@@ -284,6 +340,9 @@ async def torrent_start(client: Client, message: Message):
 
     old_task = ACTIVE_TORRENT_TASKS.pop(user_id, None)
     if old_task:
+        old_abort_task = old_task.get("auto_abort_task")
+        if old_abort_task and not old_abort_task.done():
+            old_abort_task.cancel()
         ram_workspace.cleanup_files(old_task.get("torrent_video"))
         if os.path.exists(old_task.get("torrent_dir", "")):
             shutil.rmtree(old_task.get("torrent_dir"), ignore_errors=True)
@@ -293,8 +352,7 @@ async def torrent_start(client: Client, message: Message):
         reply_to_message_id=message.id,
     )
 
-    work_dir = os.path.join("/tmp", f"torrent_{user_id}_{int(time.time())}")
-    os.makedirs(work_dir, exist_ok=True)
+    work_dir = tempfile.mkdtemp(prefix=f"torrent_{user_id}_{int(time.time())}_")
 
     try:
         success = await _download_torrent_aria2(torrent_source, work_dir, status_msg)
@@ -337,7 +395,10 @@ async def torrent_start(client: Client, message: Message):
         pass
 
     async def _auto_abort():
-        await asyncio.sleep(900)
+        try:
+            await asyncio.sleep(900)
+        except asyncio.CancelledError:
+            return
         task = ACTIVE_TORRENT_TASKS.get(user_id)
         if task and task.get("prompt_id") == prompt.id:
             ACTIVE_TORRENT_TASKS.pop(user_id, None)
@@ -348,7 +409,8 @@ async def torrent_start(client: Client, message: Message):
             except Exception:
                 pass
 
-    asyncio.create_task(_auto_abort())
+    abort_task = asyncio.create_task(_auto_abort())
+    ACTIVE_TORRENT_TASKS[user_id]["auto_abort_task"] = abort_task
 
 
 @Client.on_callback_query(filters.regex(r"^cancel_tmux_(\d+)$"))
@@ -359,6 +421,9 @@ async def cancel_tmux_callback(bot: Client, query: CallbackQuery):
 
     task = ACTIVE_TORRENT_TASKS.pop(target_user_id, None)
     if task:
+        abort_task = task.get("auto_abort_task")
+        if abort_task and not abort_task.done():
+            abort_task.cancel()
         torrent_dir = task.get("torrent_dir")
         if torrent_dir and os.path.exists(torrent_dir):
             shutil.rmtree(torrent_dir, ignore_errors=True)
@@ -375,19 +440,16 @@ async def cancel_tmux_callback(bot: Client, query: CallbackQuery):
 
 @Client.on_message(filters.private & (filters.audio | filters.video | filters.document), group=-2)
 async def handle_mux_incoming_file(bot: Client, message: Message):
-    auto_boost_client(bot)
+    # Fast-path check: immediately return if update is not from a user with an active torrent mux task
+    if not message.from_user:
+        return
     user_id = int(message.from_user.id)
+    if user_id not in ACTIVE_TORRENT_TASKS:
+        return
 
     task = ACTIVE_TORRENT_TASKS.get(user_id)
     if not task:
         return
-
-    prompt_id = task.get("prompt_id")
-    if prompt_id:
-        try:
-            await bot.delete_messages(chat_id=user_id, message_ids=prompt_id)
-        except Exception:
-            pass
 
     media = getattr(message, message.media.value) if message.media else None
     if not media:
@@ -403,10 +465,25 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
     if not is_valid_media:
         return await message.reply_text("<blockquote>⚠️ <b>ᴛʜɪs ꜰɪʟᴇ ᴅᴏᴇs ɴᴏᴛ ᴄᴏɴᴛᴀɪɴ ᴀ ʀᴇᴄᴏɢɴɪᴢᴇᴅ ᴀᴜᴅɪᴏ/ᴠɪᴅᴇᴏ sᴛʀᴇᴀᴍ.</b></blockquote>")
 
-    ACTIVE_TORRENT_TASKS.pop(user_id, None)
+    # User provided valid media matching active task: claim task and cancel background auto_abort timer
+    task = ACTIVE_TORRENT_TASKS.pop(user_id, None)
+    if not task:
+        return
+
+    abort_task = task.get("auto_abort_task")
+    if abort_task and not abort_task.done():
+        abort_task.cancel()
+
+    prompt_id = task.get("prompt_id")
+    if prompt_id:
+        try:
+            await bot.delete_messages(chat_id=user_id, message_ids=prompt_id)
+        except Exception:
+            pass
+
     try:
         message.stop_propagation()
-    except Exception:
+    except (StopPropagation, Exception):
         pass
 
     torrent_video = task["torrent_video"]
@@ -431,213 +508,238 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
     user_media_path = os.path.join(torrent_dir, f"input_audio_{media.file_id[:8]}")
     muxed_output_path = os.path.join(torrent_dir, f"muxed_{new_filename}")
     meta_output_path, ph_path, cover_path = None, None, None
+    ms = None
+    is_success = False
 
-    # Step A: Download Audio/Video Replacement Track
-    dl_header = "<blockquote>📥 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ʏᴏᴜʀ ᴀᴜᴅɪᴏ...</b> ⚡</blockquote>"
-    ms, dl_start = await init_progress_message(message, dl_header, getattr(media, "file_size", 0) or 0)
-
-    dl_client = getattr(bot, "helper_client", None) or getattr(bot, "premium_client", None) or bot
-    auto_boost_client(dl_client)
+    # Top-level try...finally wraps the entire processing workflow (download, mux, metadata, thumb, upload)
+    # to guarantee temp workspace cleanup on success, error, or cancellation.
     try:
-        user_media_path = await dl_client.download_media(
-            message=message,
-            file_name=user_media_path,
-            progress=progress_for_pyrogram,
-            progress_args=(dl_header, ms, dl_start),
-        )
-    except Exception as e:
-        clear_transfer_cancellation(user_id, ms.id)
-        shutil.rmtree(torrent_dir, ignore_errors=True)
-        return await ms.edit(f"<blockquote>❌ <b>ᴀᴜᴅɪᴏ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+        # Step A: Download Audio/Video Replacement Track
+        dl_header = "<blockquote>📥 <b>ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ ʏᴏᴜʀ ᴀᴜᴅɪᴏ...</b> ⚡</blockquote>"
+        ms, dl_start = await init_progress_message(message, dl_header, getattr(media, "file_size", 0) or 0)
 
-    # Step B: Zero-encoding Stream Copy Muxing & Audio Trimming
-    _, _, video_dur = await probe_video_dimensions_and_duration(torrent_video)
-    _, _, audio_dur = await probe_video_dimensions_and_duration(user_media_path)
-    target_dur = video_dur or audio_dur
-    dur_str = convert(target_dur) if target_dur > 0 else "N/A"
-    trim_notice = " (audio trimmed to video length)" if (video_dur > 0 and audio_dur > video_dur) else ""
-
-    await ms.edit(
-        "<blockquote>⚙️ <b>ᴍᴜxɪɴɢ ᴀᴜᴅɪᴏ sᴛʀᴇᴀᴍ...</b> ⚡</blockquote>\n"
-        f"╭─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{dur_str}</code>{trim_notice}\n"
-        "╰─ <i>Lossless stream-copy in progress (zero re-encoding)...</i>"
-    )
-    await asyncio.sleep(0.5)
-
-    success_mux = await _mux_audio_stream_copy(
-        torrent_video, user_media_path, muxed_output_path, max_duration=video_dur
-    )
-    if not success_mux:
-        shutil.rmtree(torrent_dir, ignore_errors=True)
-        return await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴀᴜᴅɪᴏ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ.</b></blockquote>")
-
-    final_upload_path = muxed_output_path
-
-    # Step C: Metadata Application
-    if _bool_metadata:
+        dl_client = getattr(bot, "helper_client", None) or getattr(bot, "premium_client", None) or bot
         try:
-            await ms.edit(
-                "<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b> ⚡</blockquote>\n"
-                "╰─ <i>Writing metadata tags...</i>"
+            user_media_path = await dl_client.download_media(
+                message=message,
+                file_name=user_media_path,
+                progress=progress_for_pyrogram,
+                progress_args=(dl_header, ms, dl_start),
             )
-            meta_dir = os.path.join(torrent_dir, "meta_out")
-            os.makedirs(meta_dir, exist_ok=True)
-            meta_output_path = os.path.join(meta_dir, new_filename)
-
-            res_meta = await add_metadata(muxed_output_path, meta_output_path, user_metadata_code, ms)
-            if res_meta and os.path.exists(meta_output_path):
-                final_upload_path = meta_output_path
         except Exception as e:
-            logger.error("Metadata application failed: %s", e)
-            final_upload_path = muxed_output_path
+            if ms:
+                clear_transfer_cancellation(user_id, ms.id)
+                await ms.edit(f"<blockquote>❌ <b>ᴀᴜᴅɪᴏ ᴅᴏᴡɴʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+            raise StopPropagation
 
-    # Step D: Media Probing (Duration, Width, Height)
-    duration, width, height = 0, 1280, 720
-    try:
-        p_w, p_h, p_dur = await probe_video_dimensions_and_duration(final_upload_path)
-        if p_w > 0:
-            width = int(p_w)
-        if p_h > 0:
-            height = int(p_h)
-        if p_dur > 0:
-            duration = int(p_dur)
-    except Exception:
-        pass
+        # Step B: Zero-encoding Stream Copy Muxing & Audio Trimming
+        _, _, video_dur = await probe_video_dimensions_and_duration(torrent_video)
+        _, _, audio_dur = await probe_video_dimensions_and_duration(user_media_path)
+        target_dur = video_dur or audio_dur
+        dur_str = convert(target_dur) if target_dur > 0 else "N/A"
+        trim_notice = " (audio trimmed to video length)" if (video_dur > 0 and audio_dur > video_dur) else ""
 
-    if not duration or not width or not height:
-        def _parse_hachoir_merge_metadata(probe_target_path: str) -> Tuple[int, int, int]:
-            dur, w, h = 0, 0, 0
-            try:
-                parser = createParser(probe_target_path)
-                if parser:
-                    with parser:
-                        meta_info = extractMetadata(parser)
-                        if meta_info:
-                            if meta_info.has("duration"):
-                                dur = meta_info.get("duration").seconds
-                            if meta_info.has("width"):
-                                w = int(meta_info.get("width") or 1280)
-                            if meta_info.has("height"):
-                                h = int(meta_info.get("height") or 720)
-            except Exception:
-                pass
-            return dur, w, h
-
-        h_dur, h_w, h_h = await asyncio.to_thread(_parse_hachoir_merge_metadata, final_upload_path)
-        if not duration and h_dur:
-            duration = h_dur
-        if h_w > 0:
-            width = h_w
-        if h_h > 0:
-            height = h_h
-
-    # Step E: Thumbnail Generation
-    video_cover = None
-    try:
-        if c_thumb:
-            _, _, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
-            video_cover = c_thumb or ph_path
-        else:
-            frame_w, frame_h, ph_path = await extract_auto_thumbnail(
-                bot=bot,
-                video_path=final_upload_path,
-                media=media,
-                duration=duration,
-                user_id=user_id,
-                filename=new_filename,
-                media_type=MessageMediaType.VIDEO,
-                upload_type="video",
+        if ms:
+            await ms.edit(
+                "<blockquote>⚙️ <b>ᴍᴜxɪɴɢ ᴀᴜᴅɪᴏ sᴛʀᴇᴀᴍ...</b> ⚡</blockquote>\n"
+                f"╭─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{dur_str}</code>{trim_notice}\n"
+                "╰─ <i>Lossless stream-copy in progress (zero re-encoding)...</i>"
             )
-            cover_path = get_hd_cover_path(ph_path)
-            video_cover = cover_path or ph_path
-            if not width and frame_w:
-                width = int(frame_w)
-            if not height and frame_h:
-                height = int(frame_h)
-    except Exception as e:
-        logger.warning("Thumbnail extraction skipped: %s", e)
+        await asyncio.sleep(0.5)
 
-    # Step F: Caption Construction
-    final_size = os.path.getsize(final_upload_path)
-    auto_delete_notice = "\n\n<blockquote>🗑️ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b></blockquote>"
-    if c_caption:
-        try:
-            caption = c_caption.format(
-                filename=f"<b>{new_filename}</b>",
-                filesize=humanbytes(final_size),
-                duration=convert(duration),
-            ) + auto_delete_notice
-        except Exception:
-            caption = f"<b>{new_filename}</b>" + auto_delete_notice
-    else:
-        caption = f"<b>{new_filename}</b>" + auto_delete_notice
-
-    # Step G: Multi-Socket Turbo Upload
-    ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴜxᴇᴅ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
-    ms, ul_start = await init_progress_message(ms, ul_header, final_size)
-
-    try:
-        sent_message = await bot.send_video(
-            chat_id=user_id,
-            video=final_upload_path,
-            file_name=new_filename,
-            caption=caption,
-            duration=duration,
-            width=width,
-            height=height,
-            supports_streaming=True,
-            thumb=ph_path,
-            video_cover=video_cover,
-            progress=progress_for_pyrogram,
-            progress_args=(ul_header, ms, ul_start),
+        success_mux = await _mux_audio_stream_copy(
+            torrent_video, user_media_path, muxed_output_path, max_duration=video_dur
         )
+        if not success_mux:
+            if ms:
+                await ms.edit("<blockquote>❌ <b>ꜰꜰᴍᴘᴇɢ ᴍᴜxɪɴɢ ꜰᴀɪʟᴇᴅ. ᴄʜᴇᴄᴋ ᴀᴜᴅɪᴏ ᴄᴏᴍᴘᴀᴛɪʙɪʟɪᴛʏ.</b></blockquote>")
+            raise StopPropagation
 
-        if Config.BIN_CHANNEL:
+        final_upload_path = muxed_output_path
+
+        # Step C: Metadata Application
+        if _bool_metadata:
             try:
-                bin_caption = (
-                    f"<blockquote>🎬 <b>{new_filename}</b></blockquote>\n"
-                    f"╭─ 👤 <b>ᴜsᴇʀ :</b> {message.chat.first_name} (<code>{user_id}</code>)\n"
-                    f"├─ 📦 <b>sɪZsᴇ :</b> <code>{humanbytes(final_size)}</code>\n"
-                    f"╰─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{convert(duration)}</code>"
-                )
-                await bot.copy_message(
-                    chat_id=Config.BIN_CHANNEL,
-                    from_chat_id=user_id,
-                    message_id=sent_message.id,
-                    caption=bin_caption,
-                )
+                if ms:
+                    await ms.edit(
+                        "<blockquote>🏷️ <b>ᴀᴘᴘʟʏɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</b> ⚡</blockquote>\n"
+                        "╰─ <i>Writing metadata tags...</i>"
+                    )
+                meta_dir = os.path.join(torrent_dir, "meta_out")
+                os.makedirs(meta_dir, exist_ok=True)
+                meta_output_path = os.path.join(meta_dir, new_filename)
+
+                res_meta = await add_metadata(muxed_output_path, meta_output_path, user_metadata_code, ms)
+                if res_meta and os.path.exists(meta_output_path):
+                    final_upload_path = meta_output_path
             except Exception as e:
-                logger.error("Failed copying to BIN_CHANNEL: %s", e)
+                logger.error("Metadata application failed: %s", e)
+                final_upload_path = muxed_output_path
 
-        if dest_channel:
-            try:
-                await bot.copy_message(
-                    chat_id=int(dest_channel),
-                    from_chat_id=user_id,
-                    message_id=sent_message.id,
-                )
-            except Exception as e:
-                logger.error("Failed copying to dest_channel: %s", e)
-
-        await Mythicbotz.increase_rename_count(user_id)
-
-        asyncio.create_task(_delayed_delete(sent_message, delay=1800.0))
-
-    except StopTransmission:
-        clear_transfer_cancellation(user_id, ms.id)
-        return
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return
-    except Exception as e:
-        logger.error("Upload failed: %s", e)
-        clear_transfer_cancellation(user_id, ms.id)
-        return await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
-    finally:
-        ram_workspace.cleanup_files(ph_path, cover_path, meta_output_path)
-        if os.path.exists(torrent_dir):
-            shutil.rmtree(torrent_dir, ignore_errors=True)
+        # Step D: Media Probing (Duration, Width, Height)
+        duration, width, height = 0, 1280, 720
         try:
-            await ms.delete()
+            p_w, p_h, p_dur = await probe_video_dimensions_and_duration(final_upload_path)
+            if p_w > 0:
+                width = int(p_w)
+            if p_h > 0:
+                height = int(p_h)
+            if p_dur > 0:
+                duration = int(p_dur)
         except Exception:
             pass
+
+        if not duration or not width or not height:
+            def _parse_hachoir_merge_metadata(probe_target_path: str) -> Tuple[int, int, int]:
+                dur, w, h = 0, 0, 0
+                try:
+                    parser = createParser(probe_target_path)
+                    if parser:
+                        with parser:
+                            meta_info = extractMetadata(parser)
+                            if meta_info:
+                                if meta_info.has("duration"):
+                                    dur = meta_info.get("duration").seconds
+                                if meta_info.has("width"):
+                                    w = int(meta_info.get("width") or 1280)
+                                if meta_info.has("height"):
+                                    h = int(meta_info.get("height") or 720)
+                except Exception:
+                    pass
+                return dur, w, h
+
+            h_dur, h_w, h_h = await asyncio.to_thread(_parse_hachoir_merge_metadata, final_upload_path)
+            if not duration and h_dur:
+                duration = h_dur
+            if h_w > 0:
+                width = h_w
+            if h_h > 0:
+                height = h_h
+
+        # Step E: Thumbnail Generation
+        video_cover = None
+        try:
+            if c_thumb:
+                _, _, ph_path = await get_cached_user_thumb(bot, c_thumb, user_id)
+                video_cover = c_thumb or ph_path
+            else:
+                frame_w, frame_h, ph_path = await extract_auto_thumbnail(
+                    bot=bot,
+                    video_path=final_upload_path,
+                    media=media,
+                    duration=duration,
+                    user_id=user_id,
+                    filename=new_filename,
+                    media_type=MessageMediaType.VIDEO,
+                    upload_type="video",
+                )
+                cover_path = get_hd_cover_path(ph_path)
+                video_cover = cover_path or ph_path
+                if not width and frame_w:
+                    width = int(frame_w)
+                if not height and frame_h:
+                    height = int(frame_h)
+        except Exception as e:
+            logger.warning("Thumbnail extraction skipped: %s", e)
+
+        # Step F: Caption Construction
+        final_size = os.path.getsize(final_upload_path)
+        auto_delete_notice = "\n\n<blockquote>🗑️ <b>ᴛʜɪs ꜰɪʟᴇ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ <code>30 ᴍɪɴᴜᴛᴇs</code>. ꜰᴏʀᴡᴀʀᴅ / sᴀᴠᴇ ɪᴛ ɴᴏᴡ!</b></blockquote>"
+        if c_caption:
+            try:
+                caption = c_caption.format(
+                    filename=f"<b>{new_filename}</b>",
+                    filesize=humanbytes(final_size),
+                    duration=convert(duration),
+                ) + auto_delete_notice
+            except Exception:
+                caption = f"<b>{new_filename}</b>" + auto_delete_notice
+        else:
+            caption = f"<b>{new_filename}</b>" + auto_delete_notice
+
+        # Step G: Multi-Socket Turbo Upload
+        ul_header = "<blockquote>💠 <b>ᴜᴘʟᴏᴀᴅɪɴɢ ᴍᴜxᴇᴅ ᴍᴇᴅɪᴀ...</b> ⚡</blockquote>"
+        ms, ul_start = await init_progress_message(ms, ul_header, final_size)
+
+        try:
+            sent_message = await bot.send_video(
+                chat_id=user_id,
+                video=final_upload_path,
+                file_name=new_filename,
+                caption=caption,
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                thumb=ph_path,
+                video_cover=video_cover,
+                progress=progress_for_pyrogram,
+                progress_args=(ul_header, ms, ul_start),
+            )
+
+            if Config.BIN_CHANNEL:
+                try:
+                    bin_caption = (
+                        f"<blockquote>🎬 <b>{new_filename}</b></blockquote>\n"
+                        f"╭─ 👤 <b>ᴜsᴇʀ :</b> {message.chat.first_name} (<code>{user_id}</code>)\n"
+                        f"├─ 📦 <b>sɪZsᴇ :</b> <code>{humanbytes(final_size)}</code>\n"
+                        f"╰─ ⏱️ <b>ᴅᴜʀᴀᴛɪᴏɴ :</b> <code>{convert(duration)}</code>"
+                    )
+                    await bot.copy_message(
+                        chat_id=Config.BIN_CHANNEL,
+                        from_chat_id=user_id,
+                        message_id=sent_message.id,
+                        caption=bin_caption,
+                    )
+                except Exception as e:
+                    logger.error("Failed copying to BIN_CHANNEL: %s", e)
+
+            if dest_channel:
+                try:
+                    await bot.copy_message(
+                        chat_id=int(dest_channel),
+                        from_chat_id=user_id,
+                        message_id=sent_message.id,
+                    )
+                except Exception as e:
+                    logger.error("Failed copying to dest_channel: %s", e)
+
+            await Mythicbotz.increase_rename_count(user_id)
+            asyncio.create_task(_delayed_delete(sent_message, delay=1800.0))
+            is_success = True
+
+        except StopTransmission:
+            if ms:
+                clear_transfer_cancellation(user_id, ms.id)
+            raise StopPropagation
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            raise StopPropagation
+        except Exception as e:
+            logger.error("Upload failed: %s", e)
+            if ms:
+                clear_transfer_cancellation(user_id, ms.id)
+                await ms.edit(f"<blockquote>❌ <b>ᴜᴘʟᴏᴀᴅ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+            raise StopPropagation
+
+    except StopPropagation:
+        raise
+    except Exception as e:
+        logger.error("Torrent mux processing unexpected failure: %s", e)
+        if ms:
+            try:
+                await ms.edit(f"<blockquote>❌ <b>ᴘʀᴏᴄᴇssɪɴɢ ꜰᴀɪʟᴇᴅ :</b> <code>{e}</code></blockquote>")
+            except Exception:
+                pass
+        raise StopPropagation
+    finally:
+        ram_workspace.cleanup_files(ph_path, cover_path, meta_output_path)
+        if torrent_dir and os.path.exists(torrent_dir):
+            shutil.rmtree(torrent_dir, ignore_errors=True)
+        if is_success and ms:
+            try:
+                await ms.delete()
+            except Exception:
+                pass
+
+    raise StopPropagation

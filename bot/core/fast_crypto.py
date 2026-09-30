@@ -19,6 +19,7 @@ import inspect
 import logging
 import math
 import os
+import random
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -39,27 +40,26 @@ MAX_MEDIA_POOL_SIZE: int = 48
 DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "12"))
 
 
-def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False) -> Tuple[int, int]:
+def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
     """
     Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency
     based on file size and transfer duration profiles:
-      - Download (All sizes): 16 dedicated sockets, 32 pipelined workers (2 per socket) with 1 MiB chunks.
-        Strict 2-in-flight per socket guarantees sustained 35-50+ MB/s with ZERO DC -503 timeouts.
-      - Upload (All sizes): 24 dedicated sockets, 48 pipelined workers (2 per socket) with 512 KiB parts.
-        Continuous async producer stream guarantees sustained 30-40+ MB/s upload throughput.
+      - Bot Tokens: 8-10 dedicated sockets, 16-20 workers to prevent FLOOD_WAIT 1s rate caps.
+      - User/Premium Sessions: 16-24 dedicated sockets, 32-48 workers for maximum bandwidth.
     """
     mb = file_size_bytes / (1024 * 1024)
+    if is_user_session:
+        max_pool = 24 if mb > 200 else 16
+    else:
+        max_pool = 10 if mb > 200 else 8
+
     if is_upload:
-        if mb <= 200:
-            pool_size = 16
-            workers = 32
-        else:
-            pool_size = 24
-            workers = 48
+        pool_size = max_pool
+        workers = pool_size * 2
         part_size = CHUNK_SIZE_512KB
     else:
-        pool_size = 16
-        workers = 32
+        pool_size = max_pool
+        workers = pool_size * 2
         part_size = DOWNLOAD_CHUNK_1MB
 
     total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
@@ -595,8 +595,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     except StopTransmission:
                                         raise
                                     except (FloodWait, FloodPremiumWait) as fw:
-                                        fw_sec = min(getattr(fw, "value", 1) or 1, 10)
-                                        await asyncio.sleep(fw_sec)
+                                        fw_sec = min(getattr(fw, "value", 1) or 1, 5)
+                                        jitter = random.uniform(0.05, 0.25)
+                                        await asyncio.sleep(fw_sec + jitter)
                                     except (ServiceUnavailable, InternalServerError, BadMsgNotification) as err:
                                         logger.debug("Download 503/transient server error: %s", err)
                                         await asyncio.sleep(0.3 * (1.5 ** min(_retry, 3)))
@@ -1016,8 +1017,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         except StopTransmission:
                             raise
                         except (FloodWait, FloodPremiumWait) as fw:
-                            fw_sec = min(getattr(fw, "value", 1) or 1, 10)
-                            await asyncio.sleep(fw_sec)
+                            fw_sec = min(getattr(fw, "value", 1) or 1, 5)
+                            jitter = random.uniform(0.05, 0.25)
+                            await asyncio.sleep(fw_sec + jitter)
                         except (ServiceUnavailable, InternalServerError, BadMsgNotification) as err:
                             logger.debug("Upload transient 503/server error (attempt %d): %s", attempt, err)
                             await asyncio.sleep(0.3 * (1.5 ** min(attempt, 3)))
@@ -1208,19 +1210,31 @@ class MultiSessionMediaPool:
 
     def attach(self, client: Any) -> "MultiSessionMediaPool":
         if client is not None:
-            # Upgrade session creation gate to 16 for high-speed multi-file concurrency
-            try:
-                client._session_creation_gate = asyncio.Semaphore(16)
-                client.get_file_semaphore = asyncio.Semaphore(128)
-                client.save_file_semaphore = asyncio.Semaphore(128)
-            except Exception:
-                pass
-            if self.client is None:
-                self.client = client
             if not hasattr(self, "clients"):
                 self.clients = []
             if client not in self.clients:
                 self.clients.append(client)
+            if self.client is None:
+                self.client = client
+
+            # Guard attributes so existing semaphores are never overwritten if already attached
+            if not getattr(client, "_fast_crypto_attached", False):
+                try:
+                    gate = getattr(client, "_session_creation_gate", None)
+                    if not (isinstance(gate, asyncio.Semaphore) and gate.locked()):
+                        client._session_creation_gate = asyncio.Semaphore(16)
+
+                    get_sem = getattr(client, "get_file_semaphore", None)
+                    if not (isinstance(get_sem, asyncio.Semaphore) and get_sem.locked()):
+                        client.get_file_semaphore = asyncio.Semaphore(128)
+
+                    save_sem = getattr(client, "save_file_semaphore", None)
+                    if not (isinstance(save_sem, asyncio.Semaphore) and save_sem.locked()):
+                        client.save_file_semaphore = asyncio.Semaphore(128)
+
+                    client._fast_crypto_attached = True
+                except Exception:
+                    pass
         _patch_wzgram_turbo_mtproto_engine(self.pool_size)
         return self
 
