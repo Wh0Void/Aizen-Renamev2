@@ -68,7 +68,7 @@ def _get_client_semaphore(client: Any, attr_name: str, value: int = 128) -> asyn
     if sem is None or (loop is not None and getattr(sem, "_loop", None) is not None and getattr(sem, "_loop") is not loop):
         sem = asyncio.Semaphore(value)
         setattr(client, attr_name, sem)
-    return sem
+    return sem 
 
 
 def configure_wzgram_environment(
@@ -586,14 +586,10 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         if getattr(s, "is_started", None) and s.is_started.is_set()
                                     ]
                                     if not live_sessions:
-                                        # Yield to the event loop immediately so pool_task
-                                        # can make progress (asyncio.gather inside it needs
-                                        # turns). Only back off with real sleep after the
-                                        # first 3 zero-cost yields haven't found any sessions.
-                                        if _retry < 3:
-                                            await asyncio.sleep(0)
-                                        else:
-                                            await asyncio.sleep(0.05 * (1.5 ** (_retry - 3)))
+                                        # Give session restart coroutines real CPU time.
+                                        # sleep(0) across 32 workers pegs CPU at 100% and
+                                        # starves the restart tasks that would fix the pool.
+                                        await asyncio.sleep(0.05 * (1.5 ** min(_retry, 5)))
                                         continue
                                     current_sess = live_sessions[(sess_idx + _retry) % len(live_sessions)]
 
@@ -900,12 +896,18 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         time_offset = getattr(main_sess, "time_offset", 0) or getattr(media, "time_offset", 0)
 
                         PORTS = [443]
+                        BATCH_SIZE = 4       # Open 4 sessions at a time to avoid Telegram's
+                        BATCH_DELAY = 0.75   # undocumented auth-initiation rate limit per DC.
+                        first_batch = True   # No delay before the very first batch.
                         while needed > 0:
-                            chunk = min(needed, 16)
+                            chunk = min(needed, BATCH_SIZE)
+                            if not first_batch:
+                                await asyncio.sleep(BATCH_DELAY)
+                            first_batch = False
                             gate = _get_client_semaphore(self, "_session_creation_gate", 16)
                             async with gate:
                                 start_idx = len(pool)
-                                created = await asyncio.gather(*(
+                                created = await asyncio.gather(*[
                                     self._make_media_session(
                                         dc_id,
                                         media.auth_key,
@@ -913,11 +915,14 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                         PORTS[(start_idx + i) % len(PORTS)],
                                     )
                                     for i in range(chunk)
-                                ))
+                                ], return_exceptions=True)
                                 for s in created:
+                                    if isinstance(s, Exception):
+                                        logger.debug("Session creation error (batch): %s", s)
+                                        continue
                                     if hasattr(s, "time_offset"):
                                         s.time_offset = time_offset
-                                pool.extend(created)
+                                    pool.append(s)
                             needed -= chunk
                     self.media_session_pools[dc_id] = pool
                     return list(pool)
