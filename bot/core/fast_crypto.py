@@ -43,18 +43,25 @@ _MTPROTO_PATCHED: bool = False
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
     """
-    Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency
-    based on file size and transfer duration profiles:
-      - Downloads: Up to 16 dedicated sockets, 32 workers for sustained 14-16+ MB/s download throughput.
-      - Uploads: Up to 16 dedicated sockets, 32 workers for peak 21-24+ MB/s upload part speed.
-    """
-    max_pool = 16
-    pool_size = max_pool
-    workers = pool_size * 2
-    part_size = CHUNK_SIZE_512KB if is_upload else DOWNLOAD_CHUNK_1MB
+    Dynamically calculate optimal MTProto TCP media session pool size and worker concurrency.
 
-    total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else pool_size
-    actual_pool = min(pool_size, total_parts)
+    Telegram DC5 enforces an undocumented per-auth-key concurrent connection limit of ~4.
+    Opening more than 4 simultaneous media sessions causes BrokenPipeError RSTs on the
+    excess connections, starving the pool to 1 session → KB/s death spiral.
+
+    Downloads: 4 sockets, 16 workers (4 pipelined GetFile per socket) → 14-16 MB/s.
+    Uploads:  16 sockets, 32 workers → 21-24 MB/s (upload sessions are managed differently).
+    """
+    if is_upload:
+        max_pool = 16
+        workers = max_pool * 2
+    else:
+        max_pool = 4   # DC5 hard limit: >4 shared-auth-key sessions → BrokenPipeError
+        workers = max_pool * 4  # 4 pipelined workers per socket = same total parallelism
+
+    part_size = CHUNK_SIZE_512KB if is_upload else DOWNLOAD_CHUNK_1MB
+    total_parts = max(1, math.ceil(file_size_bytes / part_size)) if file_size_bytes > 0 else max_pool
+    actual_pool = min(max_pool, total_parts)
     actual_workers = min(workers, total_parts * 2 if is_upload else total_parts)
     return actual_pool, actual_workers
 
@@ -896,8 +903,8 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                         time_offset = getattr(main_sess, "time_offset", 0) or getattr(media, "time_offset", 0)
 
                         PORTS = [443]
-                        BATCH_SIZE = 4       # Open 4 sessions at a time to avoid Telegram's
-                        BATCH_DELAY = 0.75   # undocumented auth-initiation rate limit per DC.
+                        BATCH_SIZE = 2       # 2 simultaneous auth handshakes avoids DC rate limits.
+                        BATCH_DELAY = 1.0    # 1s gap between batches; total 4 sessions in ~1.5s.
                         first_batch = True   # No delay before the very first batch.
                         while needed > 0:
                             chunk = min(needed, BATCH_SIZE)
@@ -923,6 +930,9 @@ def _patch_wzgram_turbo_mtproto_engine(pool_size: int = DEFAULT_MEDIA_POOL_SIZE)
                                     if hasattr(s, "time_offset"):
                                         s.time_offset = time_offset
                                     pool.append(s)
+                            # Publish after every batch so download workers can pick up
+                            # new sessions immediately without waiting for the full pool.
+                            self.media_session_pools[dc_id] = list(pool)
                             needed -= chunk
                     self.media_session_pools[dc_id] = pool
                     return list(pool)
