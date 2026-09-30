@@ -38,6 +38,7 @@ DOWNLOAD_CHUNK_1MB: int = 1024 * 1024  # 1 MiB per MTProto download chunk
 MIN_MEDIA_POOL_SIZE: int = 4
 MAX_MEDIA_POOL_SIZE: int = 16
 DEFAULT_MEDIA_POOL_SIZE: int = int(os.environ.get("MEDIA_POOL_SIZE", "16"))
+_MTPROTO_PATCHED: bool = False
 
 
 def compute_dynamic_pool_size(file_size_bytes: int, is_upload: bool = False, is_user_session: bool = False) -> Tuple[int, int]:
