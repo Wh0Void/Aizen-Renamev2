@@ -1,3 +1,4 @@
+"""
 import asyncio
 import ctypes
 import functools
@@ -53,7 +54,8 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 
 def auto_boost_client(client: Any = None) -> None:
-    """Safe no-op: Concurrency gates are managed by fast_crypto."""
+    """#Safe no-op: Concurrency gates are managed by fast_crypto.
+    """
     pass
 
 
@@ -65,7 +67,8 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 
 
 def render_animated_bar(percentage: float, length: int = 10, frame_idx: int = 0) -> str:
-    """Renders a smooth animated progress bar with rotating indicator pulses."""
+    """#Renders a smooth animated progress bar with rotating indicator pulses.
+    """
     clamped_pct = max(0.0, min(100.0, percentage))
     filled_len = int(round((clamped_pct / 100.0) * length))
     spinner = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
@@ -114,9 +117,9 @@ def _find_primary_video(target_dir: str) -> Optional[str]:
 
 async def _download_torrent_aria2(torrent_source: str, download_dir: str, status_msg: Message) -> bool:
     """
-    Downloads torrent with aria2c configured for maximum peer saturation.
-    Displays dynamic speed, animated progress bar, seeds, and leechers.
-    Enforces a 300s seeder inactivity timeout and an overall 1800s execution timeout.
+  #  Downloads torrent with aria2c configured for maximum peer saturation.
+   # Displays dynamic speed, animated progress bar, seeds, and leechers.
+    #Enforces a 300s seeder inactivity timeout and an overall 1800s execution timeout.
     """
     if not shutil.which("aria2c"):
         raise RuntimeError("`aria2c` binary not found in PATH.")
@@ -235,9 +238,8 @@ async def _mux_audio_stream_copy(
     max_duration: int = 0,
 ) -> bool:
     """
-    Stream-copy muxing with FFmpeg using ZERO re-encoding to preserve CPU.
-    Trims audio at video duration if audio is longer than video.
-    Enforces a 300.0s execution timeout and robust child process cleanup.
+   #Trims audio at video duration if audio is longer than video.
+    #Enforces a 300.0s execution timeout and robust child process cleanup.
     """
     dur_args = ["-t", str(max_duration)] if max_duration > 0 else []
     cmd = [
@@ -743,3 +745,4 @@ async def handle_mux_incoming_file(bot: Client, message: Message):
                 pass
 
     raise StopPropagation
+

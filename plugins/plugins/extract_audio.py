@@ -1,3 +1,4 @@
+"""
 import os
 import sys
 import time
@@ -47,8 +48,8 @@ async def extract_audio_from_video(
     codec_option: str = "copy",
 ) -> bool:
     """
-    Extracts audio stream from input video file using FFmpeg.
-    Supports lossless stream copy ('copy') or re-encoding ('mp3', 'aac', 'opus').
+  #  Extracts audio stream from input video file using FFmpeg.
+   # Supports lossless stream copy ('copy') or re-encoding ('mp3', 'aac', 'opus').
     """
     if codec_option == "copy":
         cmd = [
