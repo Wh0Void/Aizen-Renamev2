@@ -24,7 +24,18 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from bot.core.fast_crypto import release_memory
+def release_memory() -> None:
+    """Force Python garbage collection and invoke glibc malloc_trim(0) on Linux."""
+    import gc
+    import ctypes
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+
 
 logger = logging.getLogger(__name__)
 

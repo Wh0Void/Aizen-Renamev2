@@ -39,7 +39,7 @@ class Config(object):
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
 
     # ⚡ High-Speed Multi-Session Pool & Smart RAM Cache Configs (Auto-Rename High Performance Profile)
-    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "24"))  # 24 parallel TCP media sessions for maximum 35-50+ MB/s throughput
+    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "16"))  # 16 parallel TCP media sessions for maximum 14-16 MB/s DL & 21-24 MB/s UL throughput within Telegram server limits
     RAM_CACHE_MAX_MB = int(os.environ.get("RAM_CACHE_MAX_MB", "128"))  # Max file size (MB) routed through /dev/shm when free RAM allows
     USER_CACHE_TTL = int(os.environ.get("USER_CACHE_TTL", "1800"))  # In-memory user DB cache TTL in seconds
     WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "384"))  # 384 read-ahead slots for smooth pipelined streaming

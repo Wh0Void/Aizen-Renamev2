@@ -14,19 +14,31 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 from config import Config
-from bot.core.fast_crypto import (
-    MultiSessionMediaPool,
-    configure_wzgram_environment,
-    install_fast_event_loop,
-    release_memory,
-)
 
-# 1. Configure Wzgram environment knobs & uvloop BEFORE importing wzgram/pyrogram
-configure_wzgram_environment(
-    pool_size=Config.MEDIA_POOL_SIZE,
-    max_read_ahead=Config.WZGRAM_MAX_READ_AHEAD,
-)
-EVENT_LOOP_BACKEND = install_fast_event_loop()
+# Configure WZGram native runtime environment variables before importing wzgram/pyrogram
+os.environ.setdefault("WZGRAM_WORKERS", "512")
+os.environ.setdefault("WZGRAM_MEDIA_POOL_SIZE", str(getattr(Config, "MEDIA_POOL_SIZE", 16)))
+os.environ.setdefault("WZGRAM_MAX_READ_AHEAD", str(getattr(Config, "WZGRAM_MAX_READ_AHEAD", 384)))
+os.environ.setdefault("WZGRAM_SOCKET_BUFFER", "0")
+
+# Install high-performance event loop (uvloop on Linux, winloop on Windows if available)
+EVENT_LOOP_BACKEND = "asyncio"
+if sys.platform != "win32":
+    try:
+        import uvloop  # type: ignore
+        uvloop.install()
+        asyncio.set_event_loop(uvloop.new_event_loop())
+        EVENT_LOOP_BACKEND = "uvloop"
+    except ImportError:
+        pass
+else:
+    try:
+        import winloop  # type: ignore
+        winloop.install()
+        asyncio.set_event_loop(winloop.new_event_loop())
+        EVENT_LOOP_BACKEND = "winloop"
+    except ImportError:
+        pass
 
 # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
 try:
@@ -43,11 +55,18 @@ from route import web_server  # noqa: E402
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
 
+# Detect Crypto Engine
+try:
+    import warpcrypto  # type: ignore
+    CRYPTO_BACKEND = "warpcrypto (Rust AES-NI)"
+except ImportError:
+    CRYPTO_BACKEND = "pycryptodome / fallback"
+
 
 class Bot(Client):
     """
-    High-Speed Wzgram Bot Client with Multi-Session Media Connection Pool (24 TCP sockets),
-    Hardware AES-NI Crypto (`WarpCrypto`), and Low-RAM In-Memory Session Storage.
+    High-Speed WZGram Bot Client with Native MTProto Connection Pooling,
+    Hardware AES-NI Crypto (`warpcrypto`), and Low-RAM Session Storage.
     """
 
     def __init__(self):
@@ -63,7 +82,7 @@ class Bot(Client):
             "sleep_threshold": 15,
         }
 
-        # Apply low-memory Wzgram client options when supported by Client.__init__
+        # Apply low-memory WZGram client options when supported by Client.__init__
         sig_params = inspect.signature(Client.__init__).parameters
         optional_low_ram_kwargs = {
             "fetch_topics": False,
@@ -103,17 +122,6 @@ class Bot(Client):
                 max_concurrent_transmissions=128,
             )
 
-        # Attach Multi-Session Connection Pool (16-24 parallel TCP media sessions + AES-NI)
-        self.fast_pool = MultiSessionMediaPool(
-            client=self,
-            pool_size=Config.MEDIA_POOL_SIZE,
-        ).attach(self)
-
-        if self.premium_client:
-            self.fast_pool.attach(self.premium_client)
-        if self.helper_client:
-            self.fast_pool.attach(self.helper_client)
-
     async def start(self):
         await super().start()
 
@@ -124,9 +132,6 @@ class Bot(Client):
         if self.helper_client:
             await self.helper_client.start()
             print("⚡ Helper Client Started (HELPER_SESSION)")
-
-        await self.fast_pool.start_background_reaper()
-        asyncio.create_task(self.fast_pool.warm_up())
 
         me = await self.get_me()
         self.mention = me.mention
@@ -143,10 +148,11 @@ class Bot(Client):
         except Exception as e:
             print(f"Webserver start notice: {e}")
 
+        pool_size = getattr(Config, "MEDIA_POOL_SIZE", 16)
         print(
-            f"⚡ {me.first_name} Started | Wzgram v{__version__} | "
-            f"Loop: {EVENT_LOOP_BACKEND} | Media Pool: {self.fast_pool.pool_size} TCP sockets | "
-            f"Crypto: {self.fast_pool.crypto.backend_name}"
+            f"⚡ {me.first_name} Started | WZGram v{__version__} | "
+            f"Loop: {EVENT_LOOP_BACKEND} | Media Pool: {pool_size} TCP sockets | "
+            f"Crypto: {CRYPTO_BACKEND}"
         )
 
         # Send startup message to admins
@@ -156,8 +162,8 @@ class Bot(Client):
                     admin_id,
                     f"<blockquote>⚡ <b>{me.first_name} ɪs ᴏɴʟɪɴᴇ!</b></blockquote>\n"
                     f"╭─▸ 🚀 <b>ᴇɴɢɪɴᴇ :</b> <code>ᴡᴢɢʀᴀᴍ ᴠ{__version__}</code>\n"
-                    f"├─▸ 🔌 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{self.fast_pool.pool_size} ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
-                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{self.fast_pool.crypto.backend_name}</code>",
+                    f"├─▸ 🔌 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size} ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{CRYPTO_BACKEND}</code>",
                 )
             except Exception as e:
                 print(f"Error sending message to admin {admin_id}: {e}")
@@ -176,17 +182,14 @@ class Bot(Client):
                     f"╭─▸ 📅 <b>ᴅᴀᴛᴇ :</b> <code>{date_str}</code>\n"
                     f"├─▸ ⏰ <b>ᴛɪᴍᴇ :</b> <code>{time_str}</code>\n"
                     f"├─▸ 🌐 <b>ᴛɪᴍᴇᴢᴏɴᴇ :</b> <code>Asia/Kolkata</code>\n"
-                    f"├─▸ ⚡ <b>ᴇɴɢɪɴᴇ :</b> <code>Wzgram v{__version__} (Layer {layer})</code>\n"
-                    f"├─▸ 🚀 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{self.fast_pool.pool_size} ᴘᴀʀᴀʟʟᴇʟ ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
-                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{self.fast_pool.crypto.backend_name}</code>",
+                    f"├─▸ ⚡ <b>ᴇɴɢɪɴᴇ :</b> <code>WZGram v{__version__} (Layer {layer})</code>\n"
+                    f"├─▸ 🚀 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size} ᴘᴀʀᴀʟʟᴇʟ ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{CRYPTO_BACKEND}</code>",
                 )
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
 
-        release_memory()
-
     async def stop(self, *args):
-        await self.fast_pool.stop()
         if self.helper_client and getattr(self.helper_client, "is_connected", False):
             try:
                 await self.helper_client.stop()
