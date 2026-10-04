@@ -72,7 +72,8 @@ def _compute_stable_speed(state: dict, current_clamped: int, now: float, start: 
     state["last_speed_sample_ts"] = now
     samples = state.setdefault("samples", [(effective_start, 0)])
     samples.append((now, current_clamped))
-    cutoff = now - 3.5
+    cutoff_window = max(6.5, float(getattr(Config, "PROGRESS_UPDATE_INTERVAL", 6.0)) + 0.5)
+    cutoff = now - cutoff_window
     while len(samples) > 2 and samples[1][0] <= cutoff:
         samples.pop(0)
 
