@@ -1,4 +1,5 @@
-﻿pyromod
+https://github.com/Yahiko5679/wzgram/archive/refs/heads/dev.tar.gz
+warpcrypto>=2.0.7
 motor
 dnspython
 hachoir
@@ -7,9 +8,10 @@ aiohttp
 pytz
 Flask
 gunicorn
-pyrogram
 pymongo
 requests
 python-dotenv
 pycryptodome
-# TgCrypto
+psutil
+uvloop
+

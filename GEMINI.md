@@ -1,8 +1,7 @@
-﻿# Workspace Instructions & Project Rules
+# Workspace Instructions & Project Rules
 
-## 1. File Persistence & Anti-Discard Safety
-- Direct disk writes and Git commits are used to prevent editor buffer discard issues.
-- Never leave files in a truncated or 0-byte state.
+## 1. File Persistence & Integrity
+- Standard editor file tools are used; ensure files are never left in a truncated or 0-byte state.
 
 ## 2. Environment Variables & Security
 - Keep `.env` ignored in `.gitignore` to prevent leaking API credentials.

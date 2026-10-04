@@ -1,80 +1,478 @@
-import time
-import os
 import asyncio
-from PIL import Image
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
-from pyrogram.types import Message
+import json
+import os
+import random
+import re
+import shutil
+import time
+from typing import Any, Optional, Tuple
+from PIL import Image, ImageStat
+from bot.core.cache import cache_manager, ram_workspace
+
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".flv",
+    ".m4v",
+    ".ts",
+    ".wmv",
+    ".3gp",
+    ".mpg",
+    ".mpeg",
+}
 
 
-async def fix_thumb(thumb):
+def is_video_file(
+    filename: Optional[str] = None,
+    media_type: Any = None,
+    upload_type: Optional[str] = None,
+) -> bool:
+    """
+    Detect whether the file being renamed is a video (regardless of whether
+    it was sent as a Telegram Document or Video, and regardless of metadata setting).
+    """
+    if upload_type and str(upload_type).lower() == "video":
+        return True
+    if media_type and "video" in str(media_type).lower():
+        return True
+    if filename:
+        ext = os.path.splitext(str(filename))[1].lower()
+        if ext in VIDEO_EXTENSIONS:
+            return True
+    return False
+
+
+async def probe_video_dimensions_and_duration(
+    video_path: Optional[str],
+) -> Tuple[int, int, int]:
+    """
+    Probe the actual video stream `width`, `height`, and `duration` (in seconds)
+    directly from `video_path` using `ffprobe` (with `ffmpeg -i` stderr fallback).
+    Accounts for 90°/270° display rotation metadata so Telegram's video player
+    always receives true dimensions and displays the landscape/portrait rotate button.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return 0, 0, 0
+
+    width, height, duration = 0, 0, 0
+
+    if shutil.which("ffprobe"):
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration:stream_tags=rotate:side_data=rotation:format=duration",
+            "-of",
+            "json",
+            video_path,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            if stdout:
+                data = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+                streams = data.get("streams") or []
+                if streams:
+                    s0 = streams[0]
+                    width = int(s0.get("width") or 0)
+                    height = int(s0.get("height") or 0)
+                    s_dur = s0.get("duration")
+                    if s_dur is not None:
+                        try:
+                            duration = max(0, int(float(s_dur)))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Check rotation metadata (90° or 270° swaps display width & height)
+                    rot = 0
+                    tags = s0.get("tags") or {}
+                    if "rotate" in tags:
+                        try:
+                            rot = abs(int(float(tags["rotate"]))) % 360
+                        except (ValueError, TypeError):
+                            pass
+                    if not rot:
+                        for sd in s0.get("side_data_list") or []:
+                            if "rotation" in sd:
+                                try:
+                                    rot = abs(int(float(sd["rotation"]))) % 360
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    if rot in (90, 270) and width > 0 and height > 0:
+                        width, height = height, width
+
+                if duration <= 0:
+                    fmt = data.get("format") or {}
+                    f_dur = fmt.get("duration")
+                    if f_dur is not None:
+                        try:
+                            duration = max(0, int(float(f_dur)))
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+    if (width <= 0 or height <= 0 or duration <= 0) and shutil.which("ffmpeg"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                video_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            info = (stderr or b"").decode("utf-8", errors="ignore")
+            if width <= 0 or height <= 0:
+                m_dim = re.search(r"Stream #.*Video:.*?,\s*(\d{2,5})x(\d{2,5})\b", info)
+                if m_dim:
+                    width = int(m_dim.group(1))
+                    height = int(m_dim.group(2))
+            if duration <= 0:
+                m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
+                if m_dur:
+                    h_v, m_v, s_v = (
+                        int(m_dur.group(1)),
+                        int(m_dur.group(2)),
+                        float(m_dur.group(3)),
+                    )
+                    duration = int(h_v * 3600 + m_v * 60 + s_v)
+        except Exception:
+            pass
+
+    return width, height, duration
+
+
+
+def _is_blank_or_dark_frame(image_path: str) -> bool:
+    """
+    Check if an extracted video frame is nearly pure black, pure white, or a solid blank screen.
+    Returns True if the frame looks blank/black so the caller can try another timestamp.
+    """
+    try:
+        with Image.open(image_path) as img:
+            gray = img.convert("L")
+            stat = ImageStat.Stat(gray)
+            mean_luma = stat.mean[0]
+            stddev_luma = stat.stddev[0]
+            # Nearly black (< 12/255), nearly white (> 245/255), or flat solid color (stddev < 3.5)
+            if mean_luma < 12.0 or mean_luma > 245.0 or stddev_luma < 3.5:
+                return True
+            return False
+    except Exception:
+        return True
+
+
+def _build_seek_candidates(duration: int = 0, preferred_ttl: int = 30) -> list[int]:
+    """
+    Build an ordered list of seek timestamps (in seconds) prioritizing ~30s
+    so intro black frames are skipped, with graceful fallbacks for shorter clips.
+    """
+    candidates: list[int] = []
+    if duration and duration > 35:
+        candidates.extend([
+            max(30, preferred_ttl),
+            min(duration - 2, max(45, duration // 3)),
+            min(duration - 2, max(60, duration // 2)),
+            15,
+            5,
+            1,
+            0,
+        ])
+    elif duration and duration >= 10:
+        candidates.extend([
+            max(5, int(duration * 0.5)),
+            max(3, int(duration * 0.3)),
+            min(duration - 1, 10),
+            2,
+            0,
+        ])
+    elif duration and duration > 0:
+        candidates.extend([max(1, duration // 2), 1, 0])
+    else:
+        # Unknown duration (e.g., video sent as Document without duration attribute):
+        # Try 30s first; if video is shorter than 30s, FFmpeg falls back to 15s -> 5s -> 1s -> 0s
+        candidates.extend([max(30, preferred_ttl), 45, 15, 5, 1, 0])
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered = []
+    for sec in candidates:
+        sec_int = max(0, int(sec))
+        if sec_int not in seen:
+            seen.add(sec_int)
+            ordered.append(sec_int)
+    return ordered
+
+
+def _fix_thumb_sync(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
     width = 0
     height = 0
     try:
-        if thumb != None:
-            parser = createParser(thumb)
-            metadata = extractMetadata(parser)
-            if metadata.has("width"):
-                width = metadata.get("width")
-            if metadata.has("height"):
-                height = metadata.get("height")
-                
-            # Open the image file
+        if thumb is not None and os.path.exists(thumb):
             with Image.open(thumb) as img:
-                # Convert the image to RGB format and save it back to the same file
-                img.convert("RGB").save(thumb)
-            
-                # Resize the image
-                resized_img = img.resize((width, height))
-                
-                # Save the resized image in JPEG format
-                resized_img.save(thumb, "JPEG")
-            parser.close()
+                rgb_img = img.convert("RGB")
+                rgb_img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                width, height = rgb_img.size
+                rgb_img.save(thumb, "JPEG", quality=88, optimize=True)
     except Exception as e:
-        print(e)
-        thumb = None 
-       
+        print(f"fix_thumb error: {e}")
+        thumb = None
+
     return width, height, thumb
-    
-async def take_screen_shot(video_file, output_directory, ttl):
-    out_put_file_name = f"{output_directory}/{time.time()}.jpg"
-    file_genertor_command = [
-        "ffmpeg",
-        "-ss",
-        str(ttl),
-        "-i",
-        video_file,
-        "-vframes",
-        "1",
-        out_put_file_name
-    ]
-    process = await asyncio.create_subprocess_exec(
-        *file_genertor_command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+
+
+async def fix_thumb(thumb: Optional[str]) -> Tuple[int, int, Optional[str]]:
+    """
+    Normalize a thumbnail image to RGB JPEG (<= 320x320) suitable for Telegram uploads.
+    """
+    return await asyncio.to_thread(_fix_thumb_sync, thumb)
+
+
+async def get_cached_user_thumb(
+    bot, c_thumb: str, user_id: int
+) -> Tuple[int, int, Optional[str]]:
+    """
+    Retrieve a user's custom thumbnail from the in-memory `thumb_cache` if cached,
+    or download + normalize once and store the JPEG bytes in RAM for subsequent renames.
+    """
+    cached_entry = cache_manager.thumb_cache.get(c_thumb)
+    if cached_entry is not None:
+        width, height, jpeg_bytes = cached_entry
+        out_path = ram_workspace.resolve_thumb_path(
+            f"thumb_{user_id}_{int(time.time() * 1000)}.jpg"
+        )
+        with open(out_path, "wb") as f:
+            f.write(jpeg_bytes)
+        return width, height, out_path
+
+    raw_dest = ram_workspace.resolve_thumb_path(
+        f"raw_thumb_{user_id}_{int(time.time() * 1000)}.jpg"
     )
-    stdout, stderr = await process.communicate()
-    e_response = stderr.decode().strip()
-    t_response = stdout.decode().strip()
-    if os.path.lexists(out_put_file_name):
-        return out_put_file_name
-    return None
-    
-    
-async def add_metadata(input_path, output_path, metadata, ms):
-    try:
-        await ms.edit("<i>I Found Metadata, Adding Into Your File ⚡</i>")
-        command = [
-            'ffmpeg', '-y', '-i', input_path, '-map', '0', '-c:s', 'copy', '-c:a', 'copy', '-c:v', 'copy',
-            '-metadata', f'title={metadata}',  # Set Title Metadata
-            '-metadata', f'author={metadata}',  # Set Author Metadata
-            '-metadata:s:s', f'title={metadata}',  # Set Subtitle Metadata
-            '-metadata:s:a', f'title={metadata}',  # Set Audio Metadata
-            '-metadata:s:v', f'title={metadata}',  # Set Video Metadata
-            '-metadata', f'artist={metadata}',  # Set Artist Metadata
-            output_path
+    downloaded = await bot.download_media(c_thumb, file_name=raw_dest)
+    width, height, fixed_path = await fix_thumb(downloaded)
+    if fixed_path and os.path.exists(fixed_path):
+        try:
+            with open(fixed_path, "rb") as f:
+                jpeg_bytes = f.read()
+            cache_manager.thumb_cache.set(c_thumb, (width, height, jpeg_bytes))
+        except Exception:
+            pass
+    return width, height, fixed_path
+
+
+async def take_screen_shot(
+    video_file: str, output_directory: str, ttl: int = 30, duration: int = 0
+) -> Optional[str]:
+    """
+    Extract a non-blank video frame starting around `ttl` seconds (default 30s) using FFmpeg.
+    Automatically skips black/blank intro frames by probing multiple seek offsets and
+    verifying frame luminance/variance via Pillow.
+    """
+    if not shutil.which("ffmpeg"):
+        return None
+
+    os.makedirs(output_directory, exist_ok=True)
+    out_put_file_name = os.path.join(
+        output_directory, f"shot_{int(time.time() * 1000)}_{random.randint(100, 999)}.jpg"
+    )
+    fallback_file_name = os.path.join(
+        output_directory, f"shot_fb_{int(time.time() * 1000)}_{random.randint(100, 999)}.jpg"
+    )
+
+    seek_candidates = _build_seek_candidates(duration=duration, preferred_ttl=ttl)
+
+    for seek_sec in seek_candidates:
+        try:
+            if os.path.lexists(out_put_file_name):
+                os.remove(out_put_file_name)
+        except Exception:
+            pass
+
+        file_genertor_command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "2",
+            "-ss",
+            str(max(0, int(seek_sec))),
+            "-i",
+            video_file,
+            "-vf",
+            "thumbnail=15",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            out_put_file_name,
         ]
-        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *file_genertor_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await process.communicate()
+            if os.path.lexists(out_put_file_name) and os.path.getsize(out_put_file_name) > 0:
+                is_dark = await asyncio.to_thread(_is_blank_or_dark_frame, out_put_file_name)
+                if not is_dark:
+                    # Clean up any saved fallback frame and return this rich frame
+                    if os.path.lexists(fallback_file_name):
+                        try:
+                            os.remove(fallback_file_name)
+                        except Exception:
+                            pass
+                    return out_put_file_name
+                # Save the first valid decoded frame as fallback in case the entire clip is dark
+                if not os.path.lexists(fallback_file_name):
+                    try:
+                        shutil.copyfile(out_put_file_name, fallback_file_name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if os.path.lexists(fallback_file_name) and os.path.getsize(fallback_file_name) > 0:
+        try:
+            shutil.move(fallback_file_name, out_put_file_name)
+            return out_put_file_name
+        except Exception:
+            return fallback_file_name
+
+    return None
+
+
+def get_hd_cover_path(thumb_path: Optional[str]) -> Optional[str]:
+    """
+    Return the full-resolution HD video cover JPEG path paired with `thumb_path`
+    if available on disk, falling back to `thumb_path`.
+    """
+    if not thumb_path:
+        return None
+    base, ext = os.path.splitext(thumb_path)
+    cover_candidate = f"{base}_cover{ext or '.jpg'}"
+    if os.path.exists(cover_candidate) and os.path.getsize(cover_candidate) > 0:
+        return cover_candidate
+    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        return thumb_path
+    return None
+
+
+async def extract_auto_thumbnail(
+    bot,
+    video_path: str,
+    media: Any,
+    duration: int = 0,
+    user_id: int = 0,
+    filename: Optional[str] = None,
+    media_type: Any = None,
+    upload_type: Optional[str] = None,
+) -> Tuple[int, int, Optional[str]]:
+    """
+    Automatically obtain a thumbnail when the user has not set a custom thumbnail
+    (works completely independently of whether user metadata is ON or OFF):
+      - Extracts a non-blank video frame via FFmpeg (`take_screen_shot`, seeking ~30s in
+        to skip black intros) if the file is a video.
+      - Saves a full-resolution HD copy (`*_cover.jpg`) for `send_video(..., video_cover=...)`
+        before normalizing the 320p `thumb`, and returns the native video `(width, height, ph_path)`.
+      - Never uses the source file's embedded Telegram thumbnail (`media.thumbs`).
+    """
+    thumb_dir = (
+        ram_workspace.shm_dir
+        if ram_workspace.shm_available
+        else os.path.dirname(os.path.abspath(video_path))
+    )
+
+    # Extract frame directly from video file (seeking to ~30s first to avoid black start frames)
+    if video_path and os.path.exists(video_path) and is_video_file(filename, media_type, upload_type):
+        preferred_ttl = 30 if (not duration or duration > 35) else max(1, int(duration * 0.4))
+        shot_path = await take_screen_shot(
+            video_path, thumb_dir, ttl=preferred_ttl, duration=duration or 0
+        )
+        if shot_path and os.path.exists(shot_path):
+            def _create_cover_sync(s_path):
+                orig_w, orig_h = 0, 0
+                try:
+                    base, ext = os.path.splitext(s_path)
+                    cover_path = f"{base}_cover{ext or '.jpg'}"
+                    with Image.open(s_path) as img:
+                        rgb_cover = img.convert("RGB")
+                        orig_w, orig_h = rgb_cover.size
+                        rgb_cover.thumbnail((1920, 1080), Image.Resampling.LANCZOS)
+                        rgb_cover.save(cover_path, "JPEG", quality=92, optimize=True)
+                except Exception:
+                    pass
+                return orig_w, orig_h
+
+            orig_w, orig_h = await asyncio.to_thread(_create_cover_sync, shot_path)
+
+            w, h, fixed = await fix_thumb(shot_path)
+            if fixed:
+                return (orig_w or w), (orig_h or h), fixed
+
+    return 0, 0, None
+
+
+async def add_metadata(
+    input_path: str, output_path: str, metadata: str, ms
+) -> Optional[str]:
+    try:
+        try:
+            await ms.edit(
+                "<blockquote>⚙️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                "╭─ <b>sᴛᴀᴛᴜs :</b> <code>ɪɴᴊᴇᴄᴛɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ...</code> ⚡\n"
+                f"╰─ <b>ᴛᴀɢ :</b> <code>{metadata}</code>"
+            )
+        except Exception:
+            pass
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "2",
+            "-i",
+            input_path,
+            "-map",
+            "0",
+            "-c:s",
+            "copy",
+            "-c:a",
+            "copy",
+            "-c:v",
+            "copy",
+            "-metadata",
+            f"title={metadata}",
+            "-metadata",
+            f"author={metadata}",
+            "-metadata:s:s",
+            f"title={metadata}",
+            "-metadata:s:a",
+            f"title={metadata}",
+            "-metadata:s:v",
+            f"title={metadata}",
+            "-metadata",
+            f"artist={metadata}",
+            output_path,
+        ]
+
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -83,27 +481,33 @@ async def add_metadata(input_path, output_path, metadata, ms):
         stdout, stderr = await process.communicate()
         e_response = stderr.decode().strip()
         t_response = stdout.decode().strip()
-        print(e_response)
-        print(t_response)
+        if e_response:
+            print(e_response)
+        if t_response:
+            print(t_response)
 
-        
         if os.path.exists(output_path):
-            await ms.edit("<i>Metadata Has Been Successfully Added To Your File ✅</i>")
             return output_path
         else:
-            await ms.edit("<i>Failed To Add Metadata To Your File ❌</i>")
+            try:
+                await ms.edit(
+                    "<blockquote>❌ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                    "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ꜰᴀɪʟᴇᴅ ᴛᴏ ɪɴᴊᴇᴄᴛ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
+                )
+            except Exception:
+                pass
             return None
     except Exception as e:
         print(f"Error occurred while adding metadata: {str(e)}")
-        await ms.edit("<i>An Error Occurred While Adding Metadata To Your File ❌</i>")
+        try:
+            await ms.edit(
+                "<blockquote>⚠️ <b>ᴍᴇᴛᴀᴅᴀᴛᴀ ᴇɴɢɪɴᴇ</b></blockquote>\n"
+                "╰─ <b>sᴛᴀᴛᴜs :</b> <code>ᴇʀʀᴏʀ ᴡʜɪʟᴇ ᴀᴅᴅɪɴɢ ᴍᴇᴛᴀᴅᴀᴛᴀ</code>"
+            )
+        except Exception:
+            pass
         return None
 
 
-
-
-
-
-# Jishu Developer 
-# Don't Remove Credit 🥺
-# Telegram Channel @Mythicbotz & @Madflix_Bots
-# Developer @JishuDeveloper
+# Developer @CosmicBotz
+# Telegram Channel @CosmicBotz

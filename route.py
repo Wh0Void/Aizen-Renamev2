@@ -2,9 +2,10 @@ from aiohttp import web
 
 routes = web.RouteTableDef()
 
+
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
-    return web.json_response("Mythicbotz")
+    return web.json_response("CosmicBotz")
 
 
 async def web_server():
@@ -13,11 +14,5 @@ async def web_server():
     return web_app
 
 
-
-
-
-
-# Jishu Developer 
-# Don't Remove Credit 🥺
-# Telegram Channel @Mythicbotz
-# Developer @JishuDeveloper
+# Developer @CosmicBotz
+# Telegram Channel @CosmicBotz

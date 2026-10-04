@@ -1,12 +1,12 @@
 services:
   - type: web
     plan: free
-    name: Rename Bot 2GB
+    name: CosmicBotz-Rename-2GB
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: python bot.py
-    repo: https://github.com/TechifyBots/Rename-Bot-2GB
-    branch: main
+    repo: https://github.com/CosmicBotz/Rename-2gb-bot
+    branch: master
     autoDeploy: false
     envVars:
       - key: BOT_TOKEN
@@ -19,6 +19,8 @@ services:
         sync: false
       - key: LOG_CHANNEL
         sync: false
+      - key: BIN_CHANNEL
+        sync: false
       - key: DB_NAME
         sync: false
       - key: DB_URL
@@ -28,4 +30,12 @@ services:
       - key: ADMIN
         sync: false
       - key: WEBHOOK
-        sync: false
+        value: "True"
+      - key: MEDIA_POOL_SIZE
+        value: "6"
+      - key: RAM_CACHE_MAX_MB
+        value: "40"
+      - key: WZGRAM_MAX_READ_AHEAD
+        value: "24"
+      - key: MALLOC_ARENA_MAX
+        value: "2"

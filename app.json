@@ -2,8 +2,8 @@
     "name": "Renamer Bot 2GB",
     "description": "Telegram File Renamer Bot 2GB",
     "logo": "https://graph.org/file/2c62c5c158d42b0dc8deb.jpg",
-    "keywords": ["Renamer Bot 2GB", "Mongo DB"],    
-    "repository": "https://github.com/TechifyBots/Rename-Bot-2GB",
+    "keywords": ["Renamer Bot 2GB", "Mongo DB", "CosmicBotz", "Wzgram"],    
+    "repository": "https://github.com/CosmicBotz/Rename-2gb-bot",
     "env": {
         "API_ID": {
             "description": "Your APP ID From my.telegram.org ",
@@ -22,7 +22,7 @@
         },
         "FORCE_SUB": {
             "description": "Your force sub channel user name without [@] ",
-            "value": "",
+            "value": "CosmicBotz",
             "required": false 
         },
         "BOT_TOKEN": {
@@ -47,7 +47,7 @@
         },
         "DB_NAME":{ 
             "description":"Your Mongo DB Database Name ",
-            "value": "jishu-botz",
+            "value": "CosmicBotz",
             "required": false
         },
         "START_PIC": {
