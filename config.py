@@ -39,10 +39,13 @@ class Config(object):
     SHORTLINK_DOMAIN = "http://seturl.in"  # 🌐 Shortener base URL
 
     # ⚡ High-Speed Multi-Session Pool & Smart RAM Cache Configs (Auto-Rename High Performance Profile)
-    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "16"))  # 16 parallel TCP media sessions for maximum 14-16 MB/s DL & 21-24 MB/s UL throughput within Telegram server limits
+    PROGRESS_UPDATE_INTERVAL = float(os.environ.get("PROGRESS_UPDATE_INTERVAL", "6.0"))  # Progress bar update interval in seconds (6s throttle keeps worker loop focused on max network I/O)
+    MEDIA_POOL_SIZE = int(os.environ.get("MEDIA_POOL_SIZE", "32"))  # 32 parallel TCP media sessions for maximum 30-50+ MB/s DL & UL throughput
+    MEDIA_POOL_MAX = int(os.environ.get("MEDIA_POOL_MAX", "48"))  # Upper cap for dynamic multi-socket MTProto media scaling
     RAM_CACHE_MAX_MB = int(os.environ.get("RAM_CACHE_MAX_MB", "128"))  # Max file size (MB) routed through /dev/shm when free RAM allows
     USER_CACHE_TTL = int(os.environ.get("USER_CACHE_TTL", "1800"))  # In-memory user DB cache TTL in seconds
     WZGRAM_MAX_READ_AHEAD = int(os.environ.get("WZGRAM_MAX_READ_AHEAD", "384"))  # 384 read-ahead slots for smooth pipelined streaming
+    WZGRAM_SOCKET_BUFFER = int(os.environ.get("WZGRAM_SOCKET_BUFFER", "0"))  # 0 enables OS dynamic TCP window autotuning
 
 
 

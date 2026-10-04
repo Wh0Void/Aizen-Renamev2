@@ -157,6 +157,7 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
         wait_s = float(getattr(e, "value", getattr(e, "x", 3)) or 3)
         msg_key = _get_msg_key(edited_msg)
         ts = time.time()
+        default_interval = float(getattr(Config, "PROGRESS_UPDATE_INTERVAL", 6.0))
         _PROGRESS_STATE[msg_key] = {
             "last_edit": ts,
             "synced_legacy_last": ts,
@@ -170,7 +171,7 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
             "last_sample_time": ts,
             "ema_speed": 0.0,
             "frame_idx": 1,
-            "min_interval": 2.2,
+            "min_interval": max(default_interval, 6.0),
             "cooldown_until": ts + wait_s + 0.5,
             "in_flight": False,
             "last_text": text,
@@ -182,6 +183,7 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
 
     edit_done = time.time()
     msg_key = _get_msg_key(edited_msg)
+    default_interval = float(getattr(Config, "PROGRESS_UPDATE_INTERVAL", 6.0))
     _PROGRESS_STATE[msg_key] = {
         "last_edit": edit_done,
         "synced_legacy_last": edit_done,
@@ -195,7 +197,7 @@ async def init_progress_message(message, ud_type: str, total: int, edit_target=N
         "last_sample_time": edit_done,
         "ema_speed": 0.0,
         "frame_idx": 1,
-        "min_interval": 1.6,
+        "min_interval": default_interval,
         "cooldown_until": 0.0,
         "in_flight": False,
         "last_text": text,
@@ -217,6 +219,7 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     total_safe = max(int(total or 0), 1)
     current_clamped = max(0, min(int(current or 0), total_safe))
 
+    default_interval = float(getattr(Config, "PROGRESS_UPDATE_INTERVAL", 6.0))
     state = _PROGRESS_STATE.get(msg_key)
     legacy_last = _PROGRESS_LAST_EDIT.get(msg_key)
     if state is None:
@@ -234,7 +237,7 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
             "last_sample_time": start,
             "ema_speed": 0.0,
             "frame_idx": 0,
-            "min_interval": 1.6,
+            "min_interval": default_interval,
             "cooldown_until": 0.0,
             "in_flight": False,
             "last_text": "",
@@ -263,14 +266,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     percentage = current_clamped * 100.0 / total_safe
 
     elapsed_since_edit = now - state.get("last_edit", 0.0)
-    pct_jump = abs(percentage - state.get("last_pct", 0.0))
-    min_interval = state.get("min_interval", 1.6)
+    min_interval = state.get("min_interval", default_interval)
     is_complete = current_clamped >= total_safe
 
+    # Strict interval enforcement (default 6s) so media workers focus exclusively on network I/O;
+    # triggers edit immediately when transfer completes 100%.
     should_edit = (
         elapsed_since_edit >= min_interval
-        or (pct_jump >= 8.0 and elapsed_since_edit >= 0.9)
-        or (is_complete and state.get("last_pct", 0.0) < 100.0 and elapsed_since_edit >= 0.6)
+        or (is_complete and state.get("last_pct", 0.0) < 100.0)
     )
     if not should_edit:
         return
@@ -315,7 +318,7 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
         state["cooldown_until"] = cooldown_ts
         state["last_edit"] = cooldown_ts
         state["synced_legacy_last"] = cooldown_ts
-        state["min_interval"] = min(4.0, state.get("min_interval", 1.6) + 0.6)
+        state["min_interval"] = min(12.0, state.get("min_interval", default_interval) + 1.0)
         _PROGRESS_LAST_EDIT[msg_key] = cooldown_ts
     except Exception:
         pass

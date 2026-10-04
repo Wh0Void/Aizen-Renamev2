@@ -15,11 +15,17 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from config import Config
 
+from bot.core.fast_crypto import (
+    FastCryptoEngine,
+    MultiSessionMediaPool,
+    configure_wzgram_environment,
+)
+
 # Configure WZGram native runtime environment variables before importing wzgram/pyrogram
-os.environ.setdefault("WZGRAM_WORKERS", "512")
-os.environ.setdefault("WZGRAM_MEDIA_POOL_SIZE", str(getattr(Config, "MEDIA_POOL_SIZE", 16)))
-os.environ.setdefault("WZGRAM_MAX_READ_AHEAD", str(getattr(Config, "WZGRAM_MAX_READ_AHEAD", 384)))
-os.environ.setdefault("WZGRAM_SOCKET_BUFFER", "0")
+configure_wzgram_environment(
+    pool_size=getattr(Config, "MEDIA_POOL_SIZE", 32),
+    max_read_ahead=getattr(Config, "WZGRAM_MAX_READ_AHEAD", 384),
+)
 
 # Install high-performance event loop (uvloop on Linux, winloop on Windows if available)
 EVENT_LOOP_BACKEND = "asyncio"
@@ -52,8 +58,6 @@ from wzgram import Client, __version__  # noqa: E402
 import pyrogram.utils  # noqa: E402
 from route import web_server  # noqa: E402
 
-pyrogram.utils.MIN_CHAT_ID = -999999999999
-pyrogram.utils.MIN_CHANNEL_ID = -1009999999999
 
 # Detect Crypto Engine
 try:
@@ -122,6 +126,18 @@ class Bot(Client):
                 max_concurrent_transmissions=128,
             )
 
+        # Attach MultiSessionMediaPool to all active MTProto clients
+        self.media_pool = MultiSessionMediaPool(
+            client=self,
+            pool_size=getattr(Config, "MEDIA_POOL_SIZE", 32),
+        ).attach(self)
+
+        if self.premium_client:
+            self.media_pool.attach(self.premium_client)
+
+        if self.helper_client:
+            self.media_pool.attach(self.helper_client)
+
     async def start(self):
         await super().start()
 
@@ -132,6 +148,9 @@ class Bot(Client):
         if self.helper_client:
             await self.helper_client.start()
             print("⚡ Helper Client Started (HELPER_SESSION)")
+
+        # Pre-warm media sessions sequentially in the background so bot is hot and ready instantly
+        asyncio.create_task(self.media_pool.warm_up())
 
         me = await self.get_me()
         self.mention = me.mention
@@ -148,11 +167,13 @@ class Bot(Client):
         except Exception as e:
             print(f"Webserver start notice: {e}")
 
-        pool_size = getattr(Config, "MEDIA_POOL_SIZE", 16)
+        pool_size = getattr(Config, "MEDIA_POOL_SIZE", 32)
+        max_pool = getattr(Config, "MEDIA_POOL_MAX", 48)
+        progress_interval = getattr(Config, "PROGRESS_UPDATE_INTERVAL", 6.0)
         print(
             f"⚡ {me.first_name} Started | WZGram v{__version__} | "
-            f"Loop: {EVENT_LOOP_BACKEND} | Media Pool: {pool_size} TCP sockets | "
-            f"Crypto: {CRYPTO_BACKEND}"
+            f"Loop: {EVENT_LOOP_BACKEND} | Media Pool: {pool_size}-{max_pool} TCP sockets (Sequential Auth) | "
+            f"Progress Throttle: {progress_interval}s | Crypto: {CRYPTO_BACKEND}"
         )
 
         # Send startup message to admins
@@ -162,7 +183,8 @@ class Bot(Client):
                     admin_id,
                     f"<blockquote>⚡ <b>{me.first_name} ɪs ᴏɴʟɪɴᴇ!</b></blockquote>\n"
                     f"╭─▸ 🚀 <b>ᴇɴɢɪɴᴇ :</b> <code>ᴡᴢɢʀᴀᴍ ᴠ{__version__}</code>\n"
-                    f"├─▸ 🔌 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size} ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"├─▸ 🔌 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size}-{max_pool} ᴛᴄᴘ sᴛʀᴇᴀᴍs (sᴇǫᴜᴇɴᴛɪᴀʟ ᴀᴜᴛʜ)</code>\n"
+                    f"├─▸ ⏱️ <b>ᴘʀᴏɢʀᴇss ʀᴀᴛᴇ :</b> <code>{progress_interval}s ᴛʜʀᴏᴛᴛʟᴇ (ᴍᴀx ɪ/ᴏ)</code>\n"
                     f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{CRYPTO_BACKEND}</code>",
                 )
             except Exception as e:
@@ -183,13 +205,19 @@ class Bot(Client):
                     f"├─▸ ⏰ <b>ᴛɪᴍᴇ :</b> <code>{time_str}</code>\n"
                     f"├─▸ 🌐 <b>ᴛɪᴍᴇᴢᴏɴᴇ :</b> <code>Asia/Kolkata</code>\n"
                     f"├─▸ ⚡ <b>ᴇɴɢɪɴᴇ :</b> <code>WZGram v{__version__} (Layer {layer})</code>\n"
-                    f"├─▸ 🚀 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size} ᴘᴀʀᴀʟʟᴇʟ ᴛᴄᴘ sᴛʀᴇᴀᴍs</code>\n"
+                    f"├─▸ 🚀 <b>ᴍᴇᴅɪᴀ ᴘᴏᴏʟ :</b> <code>{pool_size}-{max_pool} ᴘᴀʀᴀʟʟᴇʟ ᴛᴄᴘ sᴛʀᴇᴀᴍs (sᴇǫᴜᴇɴᴛɪᴀʟ)</code>\n"
+                    f"├─▸ ⏱️ <b>ᴘʀᴏɢʀᴇss ʀᴀᴛᴇ :</b> <code>{progress_interval}s ᴛʜʀᴏᴛᴛʟᴇ</code>\n"
                     f"╰─▸ 🔐 <b>ᴄʀʏᴘᴛᴏ :</b> <code>{CRYPTO_BACKEND}</code>",
                 )
             except Exception as e:
                 print(f"Error sending message to LOG_CHANNEL: {e}")
 
     async def stop(self, *args):
+        if hasattr(self, "media_pool"):
+            try:
+                await self.media_pool.stop()
+            except Exception:
+                pass
         if self.helper_client and getattr(self.helper_client, "is_connected", False):
             try:
                 await self.helper_client.stop()
